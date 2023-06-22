@@ -4,7 +4,9 @@ use crate::ArtificialField;
 use crate::Overlap;
 use crate::{AccessDepth, Deep, Shallow};
 use rustc_hir as hir;
-use rustc_middle::mir::{Body, BorrowKind, Local, Place, PlaceElem, PlaceRef, ProjectionElem};
+use rustc_middle::mir::{
+    Body, BorrowKind, Local, MutBorrowKind, Place, PlaceElem, PlaceRef, ProjectionElem,
+};
 use rustc_middle::ty::{self, TyCtxt};
 use std::cmp::max;
 use std::iter;
@@ -16,7 +18,7 @@ use std::iter;
 /// being run in the calling context, the conservative choice is to assume the compared indices
 /// are disjoint (and therefore, do not overlap).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum PlaceConflictBias {
+pub enum PlaceConflictBias {
     Overlap,
     NoOverlap,
 }
@@ -24,7 +26,7 @@ pub(crate) enum PlaceConflictBias {
 /// Helper function for checking if places conflict with a mutable borrow and deep access depth.
 /// This is used to check for places conflicting outside of the borrow checking code (such as in
 /// dataflow).
-pub(crate) fn places_conflict<'tcx>(
+pub fn places_conflict<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     borrow_place: Place<'tcx>,
@@ -35,7 +37,7 @@ pub(crate) fn places_conflict<'tcx>(
         tcx,
         body,
         borrow_place,
-        BorrowKind::Mut { allow_two_phase_borrow: true },
+        BorrowKind::Mut { kind: MutBorrowKind::TwoPhaseBorrow },
         access_place.as_ref(),
         AccessDepth::Deep,
         bias,
@@ -209,7 +211,7 @@ fn place_components_conflict<'tcx>(
             match (elem, &base_ty.kind(), access) {
                 (_, _, Shallow(Some(ArtificialField::ArrayLength)))
                 | (_, _, Shallow(Some(ArtificialField::ShallowBorrow))) => {
-                    // The array length is like  additional fields on the
+                    // The array length is like additional fields on the
                     // type; it does not overlap any existing data there.
                     // Furthermore, if cannot actually be a prefix of any
                     // borrowed place (at least in MIR as it is currently.)

@@ -2,6 +2,7 @@
 	--main-background-color: white;
 	--main-color: black;
 	--settings-input-color: #2196f3;
+	--settings-input-border-color: #717171;
 	--settings-button-color: #000;
 	--settings-button-border-focus: #717171;
 	--sidebar-background-color: #F5F5F5;
@@ -38,9 +39,14 @@
 	--search-result-link-focus-background-color: #ccc;
 	--search-result-border-color: #aaa3;
 	--search-color: #000;
+	--search-error-code-background-color: #d0cccc;
 	--search-results-alias-color: #000;
 	--search-results-grey-color: #999;
 	--search-tab-title-count-color: #888;
+	--search-tab-button-not-selected-border-top-color: #e6e6e6;
+	--search-tab-button-not-selected-background: #e6e6e6;
+	--search-tab-button-selected-border-top-color: #0089ff;
+	--search-tab-button-selected-background: #ffffff;
 	--stab-background-color: #fff5d6;
 	--stab-code-color: #000;
 	--code-highlight-kw-color: #8959a8;
@@ -65,8 +71,6 @@
 	--test-arrow-hover-background-color: #4e8bca;
 	--target-background-color: #fdffd3;
 	--target-border-color: #ad7c37;
-	--tooltip-background-color: #000;
-	--tooltip-color: #fff;
 	--kbd-color: #000;
 	--kbd-background: #fafbfc;
 	--kbd-box-shadow-color: #c6cbd1;
@@ -89,21 +93,6 @@
 	--scrape-example-help-color: #333;
 	--scrape-example-help-hover-border-color: #000;
 	--scrape-example-help-hover-color: #000;
-}
-
-#search-tabs > button:not(.selected) {
-	background-color: #e6e6e6;
-	border-top-color: #e6e6e6;
-}
-
-#search-tabs > button:hover, #search-tabs > button.selected {
-	background-color: #ffffff;
-	border-top-color: #0089ff;
-}
-
-.scraped-example:not(.expanded) .code-wrapper::before {
-	background: linear-gradient(to bottom, rgba(255, 255, 255, 1), rgba(255, 255, 255, 0));
-}
-.scraped-example:not(.expanded) .code-wrapper::after {
-	background: linear-gradient(to top, rgba(255, 255, 255, 1), rgba(255, 255, 255, 0));
+	--scrape-example-code-wrapper-background-start: rgba(255, 255, 255, 1);
+	--scrape-example-code-wrapper-background-end: rgba(255, 255, 255, 0);
 }

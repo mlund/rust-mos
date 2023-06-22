@@ -1,6 +1,6 @@
 //! lint on enum variants that are prefixed or suffixed by the same characters
 
-use clippy_utils::diagnostics::{span_lint, span_lint_and_help};
+use clippy_utils::diagnostics::{span_lint, span_lint_and_help, span_lint_hir};
 use clippy_utils::source::is_present_in_source;
 use clippy_utils::str_utils::{camel_case_split, count_match_end, count_match_start};
 use rustc_hir::{EnumDef, Item, ItemKind, Variant};
@@ -135,9 +135,10 @@ fn check_enum_start(cx: &LateContext<'_>, item_name: &str, variant: &Variant<'_>
         && name.chars().nth(item_name_chars).map_or(false, |c| !c.is_lowercase())
         && name.chars().nth(item_name_chars + 1).map_or(false, |c| !c.is_numeric())
     {
-        span_lint(
+        span_lint_hir(
             cx,
             ENUM_VARIANT_NAMES,
+            variant.hir_id,
             variant.span,
             "variant name starts with the enum's name",
         );
@@ -149,9 +150,10 @@ fn check_enum_end(cx: &LateContext<'_>, item_name: &str, variant: &Variant<'_>) 
     let item_name_chars = item_name.chars().count();
 
     if count_match_end(item_name, name).char_count == item_name_chars {
-        span_lint(
+        span_lint_hir(
             cx,
             ENUM_VARIANT_NAMES,
+            variant.hir_id,
             variant.span,
             "variant name ends with the enum's name",
         );
@@ -277,7 +279,7 @@ impl LateLintPass<'_> for EnumVariantNames {
                                 Some(c) if is_word_beginning(c) => span_lint(
                                     cx,
                                     MODULE_NAME_REPETITIONS,
-                                    item.span,
+                                    item.ident.span,
                                     "item name starts with its containing module's name",
                                 ),
                                 _ => (),
@@ -287,7 +289,7 @@ impl LateLintPass<'_> for EnumVariantNames {
                             span_lint(
                                 cx,
                                 MODULE_NAME_REPETITIONS,
-                                item.span,
+                                item.ident.span,
                                 "item name ends with its containing module's name",
                             );
                         }

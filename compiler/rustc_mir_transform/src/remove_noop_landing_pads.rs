@@ -33,8 +33,10 @@ impl RemoveNoopLandingPads {
                 StatementKind::FakeRead(..)
                 | StatementKind::StorageLive(_)
                 | StatementKind::StorageDead(_)
+                | StatementKind::PlaceMention(..)
                 | StatementKind::AscribeUserType(..)
                 | StatementKind::Coverage(..)
+                | StatementKind::ConstEvalCounter
                 | StatementKind::Nop => {
                     // These are all noops in a landing pad
                 }
@@ -70,11 +72,10 @@ impl RemoveNoopLandingPads {
             TerminatorKind::GeneratorDrop
             | TerminatorKind::Yield { .. }
             | TerminatorKind::Return
-            | TerminatorKind::Abort
+            | TerminatorKind::Terminate
             | TerminatorKind::Unreachable
             | TerminatorKind::Call { .. }
             | TerminatorKind::Assert { .. }
-            | TerminatorKind::DropAndReplace { .. }
             | TerminatorKind::Drop { .. }
             | TerminatorKind::InlineAsm { .. } => false,
         }
@@ -102,11 +103,11 @@ impl RemoveNoopLandingPads {
         for bb in postorder {
             debug!("  processing {:?}", bb);
             if let Some(unwind) = body[bb].terminator_mut().unwind_mut() {
-                if let Some(unwind_bb) = *unwind {
+                if let UnwindAction::Cleanup(unwind_bb) = *unwind {
                     if nop_landing_pads.contains(unwind_bb) {
                         debug!("    removing noop landing pad");
                         landing_pads_removed += 1;
-                        *unwind = None;
+                        *unwind = UnwindAction::Continue;
                     }
                 }
             }

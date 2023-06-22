@@ -4,12 +4,12 @@
 //! but are not declared in one single location (unlike lang features), which means we need to
 //! collect them instead.
 
-use rustc_ast::{Attribute, MetaItemKind};
+use rustc_ast::Attribute;
 use rustc_attr::{rust_version_symbol, VERSION_PLACEHOLDER};
 use rustc_hir::intravisit::Visitor;
 use rustc_middle::hir::nested_filter;
 use rustc_middle::middle::lib_features::LibFeatures;
-use rustc_middle::ty::query::Providers;
+use rustc_middle::query::Providers;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::symbol::Symbol;
 use rustc_span::{sym, Span};
@@ -42,8 +42,7 @@ impl<'tcx> LibFeatureCollector<'tcx> {
         // Find a stability attribute: one of #[stable(…)], #[unstable(…)],
         // #[rustc_const_stable(…)], #[rustc_const_unstable(…)] or #[rustc_default_body_unstable].
         if let Some(stab_attr) = stab_attrs.iter().find(|stab_attr| attr.has_name(**stab_attr)) {
-            let meta_kind = attr.meta_kind();
-            if let Some(MetaItemKind::List(ref metas)) = meta_kind {
+            if let Some(metas) = attr.meta_item_list() {
                 let mut feature = None;
                 let mut since = None;
                 for meta in metas {
@@ -137,6 +136,12 @@ impl<'tcx> Visitor<'tcx> for LibFeatureCollector<'tcx> {
 }
 
 fn lib_features(tcx: TyCtxt<'_>, (): ()) -> LibFeatures {
+    // If `staged_api` is not enabled then we aren't allowed to define lib
+    // features; there is no point collecting them.
+    if !tcx.features().staged_api {
+        return new_lib_features();
+    }
+
     let mut collector = LibFeatureCollector::new(tcx);
     tcx.hir().walk_attributes(&mut collector);
     collector.lib_features

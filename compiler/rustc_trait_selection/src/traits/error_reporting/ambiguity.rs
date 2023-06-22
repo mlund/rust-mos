@@ -1,6 +1,6 @@
 use rustc_hir::def_id::DefId;
 use rustc_infer::infer::{InferCtxt, LateBoundRegionConversionTime};
-use rustc_infer::traits::util::elaborate_predicates_with_span;
+use rustc_infer::traits::util::elaborate;
 use rustc_infer::traits::{Obligation, ObligationCause, TraitObligation};
 use rustc_middle::ty;
 use rustc_span::{Span, DUMMY_SP};
@@ -22,12 +22,12 @@ pub fn recompute_applicable_impls<'tcx>(
     let impl_may_apply = |impl_def_id| {
         let ocx = ObligationCtxt::new_in_snapshot(infcx);
         let placeholder_obligation =
-            infcx.replace_bound_vars_with_placeholders(obligation.predicate);
+            infcx.instantiate_binder_with_placeholders(obligation.predicate);
         let obligation_trait_ref =
             ocx.normalize(&ObligationCause::dummy(), param_env, placeholder_obligation.trait_ref);
 
         let impl_substs = infcx.fresh_substs_for_item(DUMMY_SP, impl_def_id);
-        let impl_trait_ref = tcx.bound_impl_trait_ref(impl_def_id).unwrap().subst(tcx, impl_substs);
+        let impl_trait_ref = tcx.impl_trait_ref(impl_def_id).unwrap().subst(tcx, impl_substs);
         let impl_trait_ref = ocx.normalize(&ObligationCause::dummy(), param_env, impl_trait_ref);
 
         if let Err(_) =
@@ -47,11 +47,11 @@ pub fn recompute_applicable_impls<'tcx>(
     let param_env_candidate_may_apply = |poly_trait_predicate: ty::PolyTraitPredicate<'tcx>| {
         let ocx = ObligationCtxt::new_in_snapshot(infcx);
         let placeholder_obligation =
-            infcx.replace_bound_vars_with_placeholders(obligation.predicate);
+            infcx.instantiate_binder_with_placeholders(obligation.predicate);
         let obligation_trait_ref =
             ocx.normalize(&ObligationCause::dummy(), param_env, placeholder_obligation.trait_ref);
 
-        let param_env_predicate = infcx.replace_bound_vars_with_fresh_vars(
+        let param_env_predicate = infcx.instantiate_binder_with_fresh_vars(
             DUMMY_SP,
             LateBoundRegionConversionTime::HigherRankedType,
             poly_trait_predicate,
@@ -81,18 +81,16 @@ pub fn recompute_applicable_impls<'tcx>(
     );
 
     let predicates =
-        tcx.predicates_of(obligation.cause.body_id.owner.to_def_id()).instantiate_identity(tcx);
-    for obligation in
-        elaborate_predicates_with_span(tcx, std::iter::zip(predicates.predicates, predicates.spans))
-    {
-        let kind = obligation.predicate.kind();
-        if let ty::PredicateKind::Clause(ty::Clause::Trait(trait_pred)) = kind.skip_binder()
+        tcx.predicates_of(obligation.cause.body_id.to_def_id()).instantiate_identity(tcx);
+    for (pred, span) in elaborate(tcx, predicates.into_iter()) {
+        let kind = pred.kind();
+        if let ty::PredicateKind::Clause(ty::ClauseKind::Trait(trait_pred)) = kind.skip_binder()
             && param_env_candidate_may_apply(kind.rebind(trait_pred))
         {
-            if kind.rebind(trait_pred.trait_ref) == ty::TraitRef::identity(tcx, trait_pred.def_id()) {
+            if kind.rebind(trait_pred.trait_ref) == ty::Binder::dummy(ty::TraitRef::identity(tcx, trait_pred.def_id())) {
                 ambiguities.push(Ambiguity::ParamEnv(tcx.def_span(trait_pred.def_id())))
             } else {
-                ambiguities.push(Ambiguity::ParamEnv(obligation.cause.span))
+                ambiguities.push(Ambiguity::ParamEnv(span))
             }
         }
     }

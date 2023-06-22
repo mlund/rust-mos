@@ -6,6 +6,11 @@ use rustc_ast::token;
 use rustc_ast::util::literal::escape_byte_str_symbol;
 use rustc_ast::util::parser::{self, AssocOp, Fixity};
 use rustc_ast::{self as ast, BlockCheckMode};
+use rustc_ast::{
+    FormatAlignment, FormatArgPosition, FormatArgsPiece, FormatCount, FormatDebugHex, FormatSign,
+    FormatTrait,
+};
+use std::fmt::Write;
 
 impl<'a> State<'a> {
     fn print_else(&mut self, els: Option<&ast::Expr>) {
@@ -239,6 +244,10 @@ impl<'a> State<'a> {
             (&ast::ExprKind::Let { .. }, _) if !parser::needs_par_as_let_scrutinee(prec) => {
                 parser::PREC_FORCE_PAREN
             }
+            // For a binary expression like `(match () { _ => a }) OP b`, the parens are required
+            // otherwise the parser would interpret `match () { _ => a }` as a statement,
+            // with the remaining `OP b` not making sense. So we force parens.
+            (&ast::ExprKind::Match(..), _) => parser::PREC_FORCE_PAREN,
             _ => left_prec,
         };
 
@@ -287,10 +296,6 @@ impl<'a> State<'a> {
         self.ibox(INDENT_UNIT);
         self.ann.pre(self, AnnNode::Expr(expr));
         match &expr.kind {
-            ast::ExprKind::Box(expr) => {
-                self.word_space("box");
-                self.print_expr_maybe_paren(expr, parser::PREC_PREFIX);
-            }
             ast::ExprKind::Array(exprs) => {
                 self.print_expr_vec(exprs);
             }
@@ -336,10 +341,16 @@ impl<'a> State<'a> {
                 self.print_type(ty);
             }
             ast::ExprKind::Type(expr, ty) => {
-                let prec = AssocOp::Colon.precedence() as i8;
-                self.print_expr_maybe_paren(expr, prec);
-                self.word_space(":");
+                self.word("type_ascribe!(");
+                self.ibox(0);
+                self.print_expr(expr);
+
+                self.word(",");
+                self.space_if_not_bol();
                 self.print_type(ty);
+
+                self.end();
+                self.word(")");
             }
             ast::ExprKind::Let(pat, scrutinee, _) => {
                 self.print_let(pat, scrutinee);
@@ -399,6 +410,7 @@ impl<'a> State<'a> {
             ast::ExprKind::Closure(box ast::Closure {
                 binder,
                 capture_clause,
+                constness,
                 asyncness,
                 movability,
                 fn_decl,
@@ -407,6 +419,7 @@ impl<'a> State<'a> {
                 fn_arg_span: _,
             }) => {
                 self.print_closure_binder(binder);
+                self.print_constness(*constness);
                 self.print_movability(*movability);
                 self.print_asyncness(*asyncness);
                 self.print_capture_clause(*capture_clause);
@@ -432,7 +445,7 @@ impl<'a> State<'a> {
                 self.ibox(0);
                 self.print_block_with_attrs(blk, attrs);
             }
-            ast::ExprKind::Async(capture_clause, _, blk) => {
+            ast::ExprKind::Async(capture_clause, blk) => {
                 self.word_nbsp("async");
                 self.print_capture_clause(*capture_clause);
                 // cbox/ibox in analogy to the `ExprKind::Block` arm above
@@ -440,7 +453,7 @@ impl<'a> State<'a> {
                 self.ibox(0);
                 self.print_block_with_attrs(blk, attrs);
             }
-            ast::ExprKind::Await(expr) => {
+            ast::ExprKind::Await(expr, _) => {
                 self.print_expr_maybe_paren(expr, parser::PREC_POSTFIX);
                 self.word(".await");
             }
@@ -471,10 +484,10 @@ impl<'a> State<'a> {
                 self.word("]");
             }
             ast::ExprKind::Range(start, end, limits) => {
-                // Special case for `Range`.  `AssocOp` claims that `Range` has higher precedence
+                // Special case for `Range`. `AssocOp` claims that `Range` has higher precedence
                 // than `Assign`, but `x .. x = x` gives a parse error instead of `x .. (x = x)`.
                 // Here we use a fake precedence value so that any child with lower precedence than
-                // a "normal" binop gets parenthesized.  (`LOr` is the lowest-precedence binop.)
+                // a "normal" binop gets parenthesized. (`LOr` is the lowest-precedence binop.)
                 let fake_prec = AssocOp::LOr.precedence() as i8;
                 if let Some(e) = start {
                     self.print_expr_maybe_paren(e, fake_prec);
@@ -524,9 +537,47 @@ impl<'a> State<'a> {
                     self.print_expr_maybe_paren(expr, parser::PREC_JUMP);
                 }
             }
+            ast::ExprKind::Become(result) => {
+                self.word("become");
+                self.word(" ");
+                self.print_expr_maybe_paren(result, parser::PREC_JUMP);
+            }
             ast::ExprKind::InlineAsm(a) => {
+                // FIXME: This should have its own syntax, distinct from a macro invocation.
                 self.word("asm!");
                 self.print_inline_asm(a);
+            }
+            ast::ExprKind::FormatArgs(fmt) => {
+                // FIXME: This should have its own syntax, distinct from a macro invocation.
+                self.word("format_args!");
+                self.popen();
+                self.rbox(0, Inconsistent);
+                self.word(reconstruct_format_args_template_string(&fmt.template));
+                for arg in fmt.arguments.all_args() {
+                    self.word_space(",");
+                    self.print_expr(&arg.expr);
+                }
+                self.end();
+                self.pclose();
+            }
+            ast::ExprKind::OffsetOf(container, fields) => {
+                self.word("builtin # offset_of");
+                self.popen();
+                self.rbox(0, Inconsistent);
+                self.print_type(container);
+                self.word(",");
+                self.space();
+
+                if let Some((&first, rest)) = fields.split_first() {
+                    self.print_ident(first);
+
+                    for &field in rest {
+                        self.word(".");
+                        self.print_ident(field);
+                    }
+                }
+                self.pclose();
+                self.end();
             }
             ast::ExprKind::MacCall(m) => self.print_mac(m),
             ast::ExprKind::Paren(e) => {
@@ -626,4 +677,89 @@ impl<'a> State<'a> {
             ast::CaptureBy::Ref => {}
         }
     }
+}
+
+pub fn reconstruct_format_args_template_string(pieces: &[FormatArgsPiece]) -> String {
+    let mut template = "\"".to_string();
+    for piece in pieces {
+        match piece {
+            FormatArgsPiece::Literal(s) => {
+                for c in s.as_str().escape_debug() {
+                    template.push(c);
+                    if let '{' | '}' = c {
+                        template.push(c);
+                    }
+                }
+            }
+            FormatArgsPiece::Placeholder(p) => {
+                template.push('{');
+                let (Ok(n) | Err(n)) = p.argument.index;
+                write!(template, "{n}").unwrap();
+                if p.format_options != Default::default() || p.format_trait != FormatTrait::Display
+                {
+                    template.push_str(":");
+                }
+                if let Some(fill) = p.format_options.fill {
+                    template.push(fill);
+                }
+                match p.format_options.alignment {
+                    Some(FormatAlignment::Left) => template.push_str("<"),
+                    Some(FormatAlignment::Right) => template.push_str(">"),
+                    Some(FormatAlignment::Center) => template.push_str("^"),
+                    None => {}
+                }
+                match p.format_options.sign {
+                    Some(FormatSign::Plus) => template.push('+'),
+                    Some(FormatSign::Minus) => template.push('-'),
+                    None => {}
+                }
+                if p.format_options.alternate {
+                    template.push('#');
+                }
+                if p.format_options.zero_pad {
+                    template.push('0');
+                }
+                if let Some(width) = &p.format_options.width {
+                    match width {
+                        FormatCount::Literal(n) => write!(template, "{n}").unwrap(),
+                        FormatCount::Argument(FormatArgPosition {
+                            index: Ok(n) | Err(n), ..
+                        }) => {
+                            write!(template, "{n}$").unwrap();
+                        }
+                    }
+                }
+                if let Some(precision) = &p.format_options.precision {
+                    template.push('.');
+                    match precision {
+                        FormatCount::Literal(n) => write!(template, "{n}").unwrap(),
+                        FormatCount::Argument(FormatArgPosition {
+                            index: Ok(n) | Err(n), ..
+                        }) => {
+                            write!(template, "{n}$").unwrap();
+                        }
+                    }
+                }
+                match p.format_options.debug_hex {
+                    Some(FormatDebugHex::Lower) => template.push('x'),
+                    Some(FormatDebugHex::Upper) => template.push('X'),
+                    None => {}
+                }
+                template.push_str(match p.format_trait {
+                    FormatTrait::Display => "",
+                    FormatTrait::Debug => "?",
+                    FormatTrait::LowerExp => "e",
+                    FormatTrait::UpperExp => "E",
+                    FormatTrait::Octal => "o",
+                    FormatTrait::Pointer => "p",
+                    FormatTrait::Binary => "b",
+                    FormatTrait::LowerHex => "x",
+                    FormatTrait::UpperHex => "X",
+                });
+                template.push('}');
+            }
+        }
+    }
+    template.push('"');
+    template
 }

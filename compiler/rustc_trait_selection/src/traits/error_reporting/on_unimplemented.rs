@@ -37,6 +37,21 @@ pub trait TypeErrCtxtExt<'tcx> {
     ) -> OnUnimplementedNote;
 }
 
+/// The symbols which are always allowed in a format string
+static ALLOWED_FORMAT_SYMBOLS: &[Symbol] = &[
+    kw::SelfUpper,
+    sym::ItemContext,
+    sym::from_method,
+    sym::from_desugaring,
+    sym::direct,
+    sym::cause,
+    sym::integral,
+    sym::integer_,
+    sym::float,
+    sym::_Self,
+    sym::crate_local,
+];
+
 impl<'tcx> TypeErrCtxtExt<'tcx> for TypeErrCtxt<'_, 'tcx> {
     fn impl_similar_to(
         &self,
@@ -45,7 +60,7 @@ impl<'tcx> TypeErrCtxtExt<'tcx> for TypeErrCtxt<'_, 'tcx> {
     ) -> Option<(DefId, SubstsRef<'tcx>)> {
         let tcx = self.tcx;
         let param_env = obligation.param_env;
-        let trait_ref = tcx.erase_late_bound_regions(trait_ref);
+        let trait_ref = self.instantiate_binder_with_placeholders(trait_ref);
         let trait_self_ty = trait_ref.self_ty();
 
         let mut self_match_impls = vec![];
@@ -53,11 +68,11 @@ impl<'tcx> TypeErrCtxtExt<'tcx> for TypeErrCtxt<'_, 'tcx> {
 
         self.tcx.for_each_relevant_impl(trait_ref.def_id, trait_self_ty, |def_id| {
             let impl_substs = self.fresh_substs_for_item(obligation.cause.span, def_id);
-            let impl_trait_ref = tcx.bound_impl_trait_ref(def_id).unwrap().subst(tcx, impl_substs);
+            let impl_trait_ref = tcx.impl_trait_ref(def_id).unwrap().subst(tcx, impl_substs);
 
             let impl_self_ty = impl_trait_ref.self_ty();
 
-            if let Ok(..) = self.can_eq(param_env, trait_self_ty, impl_self_ty) {
+            if self.can_eq(param_env, trait_self_ty, impl_self_ty) {
                 self_match_impls.push((def_id, impl_substs));
 
                 if iter::zip(
@@ -117,7 +132,7 @@ impl<'tcx> TypeErrCtxtExt<'tcx> for TypeErrCtxt<'_, 'tcx> {
                 Some(if movability.is_some() { "an async closure" } else { "a closure" })
             }),
             hir::Node::Expr(hir::Expr { .. }) => {
-                let parent_hid = hir.get_parent_node(hir_id);
+                let parent_hid = hir.parent_id(hir_id);
                 if parent_hid != hir_id { self.describe_enclosure(parent_hid) } else { None }
             }
             _ => None,
@@ -134,10 +149,17 @@ impl<'tcx> TypeErrCtxtExt<'tcx> for TypeErrCtxt<'_, 'tcx> {
             .unwrap_or_else(|| (trait_ref.def_id(), trait_ref.skip_binder().substs));
         let trait_ref = trait_ref.skip_binder();
 
-        let mut flags = vec![(
-            sym::ItemContext,
-            self.describe_enclosure(obligation.cause.body_id).map(|s| s.to_owned()),
-        )];
+        let mut flags = vec![];
+        // FIXME(-Zlower-impl-trait-in-trait-to-assoc-ty): HIR is not present for RPITITs,
+        // but I guess we could synthesize one here. We don't see any errors that rely on
+        // that yet, though.
+        let enclosure =
+            if let Some(body_hir) = self.tcx.opt_local_def_id_to_hir_id(obligation.cause.body_id) {
+                self.describe_enclosure(body_hir).map(|s| s.to_owned())
+            } else {
+                None
+            };
+        flags.push((sym::ItemContext, enclosure));
 
         match obligation.cause.code() {
             ObligationCauseCode::BuiltinDerivedObligation(..)
@@ -186,7 +208,10 @@ impl<'tcx> TypeErrCtxtExt<'tcx> for TypeErrCtxt<'_, 'tcx> {
             if let Some(def) = self_ty.ty_adt_def() {
                 // We also want to be able to select self's original
                 // signature with no type arguments resolved
-                flags.push((sym::_Self, Some(self.tcx.type_of(def.did()).to_string())));
+                flags.push((
+                    sym::_Self,
+                    Some(self.tcx.type_of(def.did()).subst_identity().to_string()),
+                ));
             }
 
             for param in generics.params.iter() {
@@ -204,7 +229,10 @@ impl<'tcx> TypeErrCtxtExt<'tcx> for TypeErrCtxt<'_, 'tcx> {
                     if let Some(def) = param_ty.ty_adt_def() {
                         // We also want to be able to select the parameter's
                         // original signature with no type arguments resolved
-                        flags.push((name, Some(self.tcx.type_of(def.did()).to_string())));
+                        flags.push((
+                            name,
+                            Some(self.tcx.type_of(def.did()).subst_identity().to_string()),
+                        ));
                     }
                 }
             }
@@ -237,7 +265,10 @@ impl<'tcx> TypeErrCtxtExt<'tcx> for TypeErrCtxt<'_, 'tcx> {
                 if let Some(def) = aty.ty_adt_def() {
                     // We also want to be able to select the slice's type's original
                     // signature with no type arguments resolved
-                    flags.push((sym::_Self, Some(format!("[{}]", self.tcx.type_of(def.did())))));
+                    flags.push((
+                        sym::_Self,
+                        Some(format!("[{}]", self.tcx.type_of(def.did()).subst_identity())),
+                    ));
                 }
                 if aty.is_integral() {
                     flags.push((sym::_Self, Some("[{integral}]".to_string())));
@@ -247,7 +278,7 @@ impl<'tcx> TypeErrCtxtExt<'tcx> for TypeErrCtxt<'_, 'tcx> {
             // Arrays give us `[]`, `[{ty}; _]` and `[{ty}; N]`
             if let ty::Array(aty, len) = self_ty.kind() {
                 flags.push((sym::_Self, Some("[]".to_string())));
-                let len = len.kind().try_to_value().and_then(|v| v.try_to_machine_usize(self.tcx));
+                let len = len.kind().try_to_value().and_then(|v| v.try_to_target_usize(self.tcx));
                 flags.push((sym::_Self, Some(format!("[{}; _]", aty))));
                 if let Some(n) = len {
                     flags.push((sym::_Self, Some(format!("[{}; {}]", aty, n))));
@@ -255,7 +286,7 @@ impl<'tcx> TypeErrCtxtExt<'tcx> for TypeErrCtxt<'_, 'tcx> {
                 if let Some(def) = aty.ty_adt_def() {
                     // We also want to be able to select the array's type's original
                     // signature with no type arguments resolved
-                    let def_ty = self.tcx.type_of(def.did());
+                    let def_ty = self.tcx.type_of(def.did()).subst_identity();
                     flags.push((sym::_Self, Some(format!("[{def_ty}; _]"))));
                     if let Some(n) = len {
                         flags.push((sym::_Self, Some(format!("[{def_ty}; {n}]"))));
@@ -274,6 +305,14 @@ impl<'tcx> TypeErrCtxtExt<'tcx> for TypeErrCtxt<'_, 'tcx> {
                         flags.push((sym::_Self, Some(self.tcx.def_path_str(trait_ref.def_id))))
                     }
                 }
+            }
+
+            // `&[{integral}]` - `FromIterator` needs that.
+            if let ty::Ref(_, ref_ty, rustc_ast::Mutability::Not) = self_ty.kind()
+                && let ty::Slice(sty) = ref_ty.kind()
+                && sty.is_integral()
+            {
+                flags.push((sym::_Self, Some("&[{integral}]".to_owned())));
             }
         });
 
@@ -296,7 +335,7 @@ pub struct OnUnimplementedDirective {
     pub label: Option<OnUnimplementedFormatString>,
     pub note: Option<OnUnimplementedFormatString>,
     pub parent_label: Option<OnUnimplementedFormatString>,
-    pub append_const_msg: Option<Option<Symbol>>,
+    pub append_const_msg: Option<AppendConstMessage>,
 }
 
 /// For the `#[rustc_on_unimplemented]` attribute
@@ -306,11 +345,21 @@ pub struct OnUnimplementedNote {
     pub label: Option<String>,
     pub note: Option<String>,
     pub parent_label: Option<String>,
-    /// Append a message for `~const Trait` errors. `None` means not requested and
-    /// should fallback to a generic message, `Some(None)` suggests using the default
-    /// appended message, `Some(Some(s))` suggests use the `s` message instead of the
-    /// default one..
-    pub append_const_msg: Option<Option<Symbol>>,
+    // If none, should fall back to a generic message
+    pub append_const_msg: Option<AppendConstMessage>,
+}
+
+/// Append a message for `~const Trait` errors.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AppendConstMessage {
+    Default,
+    Custom(Symbol),
+}
+
+impl Default for AppendConstMessage {
+    fn default() -> Self {
+        AppendConstMessage::Default
+    }
 }
 
 impl<'tcx> OnUnimplementedDirective {
@@ -388,10 +437,10 @@ impl<'tcx> OnUnimplementedDirective {
                 }
             } else if item.has_name(sym::append_const_msg) && append_const_msg.is_none() {
                 if let Some(msg) = item.value_str() {
-                    append_const_msg = Some(Some(msg));
+                    append_const_msg = Some(AppendConstMessage::Custom(msg));
                     continue;
                 } else if item.is_word() {
-                    append_const_msg = Some(None);
+                    append_const_msg = Some(AppendConstMessage::Default);
                     continue;
                 }
             }
@@ -543,38 +592,26 @@ impl<'tcx> OnUnimplementedFormatString {
                 Piece::NextArgument(a) => match a.position {
                     Position::ArgumentNamed(s) => {
                         match Symbol::intern(s) {
-                            // `{Self}` is allowed
-                            kw::SelfUpper => (),
                             // `{ThisTraitsName}` is allowed
                             s if s == trait_name => (),
-                            // `{from_method}` is allowed
-                            sym::from_method => (),
-                            // `{from_desugaring}` is allowed
-                            sym::from_desugaring => (),
-                            // `{ItemContext}` is allowed
-                            sym::ItemContext => (),
-                            // `{integral}` and `{integer}` and `{float}` are allowed
-                            sym::integral | sym::integer_ | sym::float => (),
+                            s if ALLOWED_FORMAT_SYMBOLS.contains(&s) => (),
                             // So is `{A}` if A is a type parameter
-                            s => match generics.params.iter().find(|param| param.name == s) {
-                                Some(_) => (),
-                                None => {
-                                    let reported = struct_span_err!(
-                                        tcx.sess,
-                                        span,
-                                        E0230,
-                                        "there is no parameter `{}` on {}",
-                                        s,
-                                        if trait_def_id == item_def_id {
-                                            format!("trait `{}`", trait_name)
-                                        } else {
-                                            "impl".to_string()
-                                        }
-                                    )
-                                    .emit();
-                                    result = Err(reported);
-                                }
-                            },
+                            s if generics.params.iter().any(|param| param.name == s) => (),
+                            s => {
+                                result = Err(struct_span_err!(
+                                    tcx.sess,
+                                    span,
+                                    E0230,
+                                    "there is no parameter `{}` on {}",
+                                    s,
+                                    if trait_def_id == item_def_id {
+                                        format!("trait `{}`", trait_name)
+                                    } else {
+                                        "impl".to_string()
+                                    }
+                                )
+                                .emit());
+                            }
                         }
                     }
                     // `{:1}` and `{}` are not to be used

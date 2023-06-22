@@ -9,8 +9,9 @@
 //! * All unstable lang features have tests to ensure they are actually unstable.
 //! * Language features in a group are sorted by feature name.
 
-use crate::walk::{filter_dirs, walk, walk_many};
+use crate::walk::{filter_dirs, filter_not_rust, walk, walk_many};
 use std::collections::hash_map::{Entry, HashMap};
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::num::NonZeroU32;
@@ -82,6 +83,7 @@ pub fn collect_lib_features(base_src_path: &Path) -> Features {
 
 pub fn check(
     src_path: &Path,
+    tests_path: &Path,
     compiler_path: &Path,
     lib_path: &Path,
     bad: &mut bool,
@@ -95,22 +97,20 @@ pub fn check(
 
     walk_many(
         &[
-            &src_path.join("test/ui"),
-            &src_path.join("test/ui-fulldeps"),
-            &src_path.join("test/rustdoc-ui"),
-            &src_path.join("test/rustdoc"),
+            &tests_path.join("ui"),
+            &tests_path.join("ui-fulldeps"),
+            &tests_path.join("rustdoc-ui"),
+            &tests_path.join("rustdoc"),
         ],
-        &mut filter_dirs,
+        |path, _is_dir| {
+            filter_dirs(path)
+                || filter_not_rust(path)
+                || path.file_name() == Some(OsStr::new("features.rs"))
+                || path.file_name() == Some(OsStr::new("diagnostic_list.rs"))
+        },
         &mut |entry, contents| {
             let file = entry.path();
             let filename = file.file_name().unwrap().to_string_lossy();
-            if !filename.ends_with(".rs")
-                || filename == "features.rs"
-                || filename == "diagnostic_list.rs"
-            {
-                return;
-            }
-
             let filen_underscore = filename.replace('-', "_").replace(".rs", "");
             let filename_is_gate_test = test_filen_gate(&filen_underscore, &mut features);
 
@@ -218,8 +218,6 @@ pub fn check(
         for line in lines {
             println!("* {line}");
         }
-    } else {
-        println!("* {} features", features.len());
     }
 
     CollectedFeatures { lib: lib_features, lang: features }
@@ -476,11 +474,11 @@ fn get_and_check_lib_features(
 
 fn map_lib_features(
     base_src_path: &Path,
-    mf: &mut dyn FnMut(Result<(&str, Feature), &str>, &Path, usize),
+    mf: &mut (dyn Send + Sync + FnMut(Result<(&str, Feature), &str>, &Path, usize)),
 ) {
     walk(
         base_src_path,
-        &mut |path| filter_dirs(path) || path.ends_with("src/test"),
+        |path, _is_dir| filter_dirs(path) || path.ends_with("tests"),
         &mut |entry, contents| {
             let file = entry.path();
             let filename = file.file_name().unwrap().to_string_lossy();

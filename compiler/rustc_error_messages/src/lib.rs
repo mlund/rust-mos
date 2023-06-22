@@ -1,5 +1,5 @@
 #![feature(let_chains)]
-#![feature(once_cell)]
+#![feature(lazy_cell)]
 #![feature(rustc_attrs)]
 #![feature(type_alias_impl_trait)]
 #![deny(rustc::untranslatable_diagnostic)]
@@ -11,8 +11,9 @@ extern crate tracing;
 use fluent_bundle::FluentResource;
 use fluent_syntax::parser::ParserError;
 use icu_provider_adapters::fallback::{LocaleFallbackProvider, LocaleFallbacker};
-use rustc_data_structures::sync::Lrc;
-use rustc_macros::{fluent_messages, Decodable, Encodable};
+use rustc_data_structures::sync::{IntoDynSyncSend, Lrc};
+use rustc_fluent_macro::fluent_messages;
+use rustc_macros::{Decodable, Encodable};
 use rustc_span::Span;
 use std::borrow::Cow;
 use std::error::Error;
@@ -34,58 +35,19 @@ use intl_memoizer::IntlLangMemoizer;
 pub use fluent_bundle::{self, types::FluentType, FluentArgs, FluentError, FluentValue};
 pub use unic_langid::{langid, LanguageIdentifier};
 
-// Generates `DEFAULT_LOCALE_RESOURCES` static and `fluent_generated` module.
-fluent_messages! {
-    // tidy-alphabetical-start
-    ast_lowering => "../locales/en-US/ast_lowering.ftl",
-    ast_passes => "../locales/en-US/ast_passes.ftl",
-    attr => "../locales/en-US/attr.ftl",
-    borrowck => "../locales/en-US/borrowck.ftl",
-    builtin_macros => "../locales/en-US/builtin_macros.ftl",
-    codegen_gcc => "../locales/en-US/codegen_gcc.ftl",
-    codegen_llvm => "../locales/en-US/codegen_llvm.ftl",
-    codegen_ssa => "../locales/en-US/codegen_ssa.ftl",
-    compiletest => "../locales/en-US/compiletest.ftl",
-    const_eval => "../locales/en-US/const_eval.ftl",
-    driver => "../locales/en-US/driver.ftl",
-    errors => "../locales/en-US/errors.ftl",
-    expand => "../locales/en-US/expand.ftl",
-    hir_analysis => "../locales/en-US/hir_analysis.ftl",
-    hir_typeck => "../locales/en-US/hir_typeck.ftl",
-    infer => "../locales/en-US/infer.ftl",
-    interface => "../locales/en-US/interface.ftl",
-    lint => "../locales/en-US/lint.ftl",
-    metadata => "../locales/en-US/metadata.ftl",
-    middle => "../locales/en-US/middle.ftl",
-    mir_build => "../locales/en-US/mir_build.ftl",
-    mir_dataflow => "../locales/en-US/mir_dataflow.ftl",
-    monomorphize => "../locales/en-US/monomorphize.ftl",
-    parse => "../locales/en-US/parse.ftl",
-    passes => "../locales/en-US/passes.ftl",
-    plugin_impl => "../locales/en-US/plugin_impl.ftl",
-    privacy => "../locales/en-US/privacy.ftl",
-    query_system => "../locales/en-US/query_system.ftl",
-    resolve => "../locales/en-US/resolve.ftl",
-    save_analysis => "../locales/en-US/save_analysis.ftl",
-    session => "../locales/en-US/session.ftl",
-    symbol_mangling => "../locales/en-US/symbol_mangling.ftl",
-    trait_selection => "../locales/en-US/trait_selection.ftl",
-    ty_utils => "../locales/en-US/ty_utils.ftl",
-    // tidy-alphabetical-end
-}
+fluent_messages! { "../messages.ftl" }
 
-pub use fluent_generated::{self as fluent, DEFAULT_LOCALE_RESOURCES};
-
-pub type FluentBundle = fluent_bundle::bundle::FluentBundle<FluentResource, IntlLangMemoizer>;
-
-#[cfg(parallel_compiler)]
-fn new_bundle(locales: Vec<LanguageIdentifier>) -> FluentBundle {
-    FluentBundle::new_concurrent(locales)
-}
+pub type FluentBundle =
+    IntoDynSyncSend<fluent_bundle::bundle::FluentBundle<FluentResource, IntlLangMemoizer>>;
 
 #[cfg(not(parallel_compiler))]
 fn new_bundle(locales: Vec<LanguageIdentifier>) -> FluentBundle {
-    FluentBundle::new(locales)
+    IntoDynSyncSend(fluent_bundle::bundle::FluentBundle::new(locales))
+}
+
+#[cfg(parallel_compiler)]
+fn new_bundle(locales: Vec<LanguageIdentifier>) -> FluentBundle {
+    IntoDynSyncSend(fluent_bundle::bundle::FluentBundle::new_concurrent(locales))
 }
 
 #[derive(Debug)]
@@ -175,12 +137,18 @@ pub fn fluent_bundle(
 
     let fallback_locale = langid!("en-US");
     let requested_fallback_locale = requested_locale.as_ref() == Some(&fallback_locale);
-
+    trace!(?requested_fallback_locale);
+    if requested_fallback_locale && additional_ftl_path.is_none() {
+        return Ok(None);
+    }
     // If there is only `-Z additional-ftl-path`, assume locale is "en-US", otherwise use user
     // provided locale.
     let locale = requested_locale.clone().unwrap_or(fallback_locale);
     trace!(?locale);
     let mut bundle = new_bundle(vec![locale]);
+
+    // Add convenience functions available to ftl authors.
+    register_functions(&mut bundle);
 
     // Fluent diagnostics can insert directionality isolation markers around interpolated variables
     // indicating that there may be a shift from right-to-left to left-to-right text (or
@@ -190,7 +158,7 @@ pub fn fluent_bundle(
     bundle.set_use_isolating(with_directionality_markers);
 
     // If the user requests the default locale then don't try to load anything.
-    if !requested_fallback_locale && let Some(requested_locale) = requested_locale {
+    if let Some(requested_locale) = requested_locale {
         let mut found_resources = false;
         for sysroot in user_provided_sysroot.iter_mut().chain(sysroot_candidates.iter_mut()) {
             sysroot.push("share");
@@ -244,6 +212,15 @@ pub fn fluent_bundle(
     Ok(Some(bundle))
 }
 
+fn register_functions(bundle: &mut FluentBundle) {
+    bundle
+        .add_function("STREQ", |positional, _named| match positional {
+            [FluentValue::String(a), FluentValue::String(b)] => format!("{}", (a == b)).into(),
+            _ => FluentValue::Error,
+        })
+        .expect("Failed to add a function to the bundle.");
+}
+
 /// Type alias for the result of `fallback_fluent_bundle` - a reference-counted pointer to a lazily
 /// evaluated fluent bundle.
 pub type LazyFallbackBundle = Lrc<Lazy<FluentBundle, impl FnOnce() -> FluentBundle>>;
@@ -251,11 +228,14 @@ pub type LazyFallbackBundle = Lrc<Lazy<FluentBundle, impl FnOnce() -> FluentBund
 /// Return the default `FluentBundle` with standard "en-US" diagnostic messages.
 #[instrument(level = "trace")]
 pub fn fallback_fluent_bundle(
-    resources: &'static [&'static str],
+    resources: Vec<&'static str>,
     with_directionality_markers: bool,
 ) -> LazyFallbackBundle {
     Lrc::new(Lazy::new(move || {
         let mut fallback_bundle = new_bundle(vec![langid!("en-US")]);
+
+        register_functions(&mut fallback_bundle);
+
         // See comment in `fluent_bundle`.
         fallback_bundle.set_use_isolating(with_directionality_markers);
 
@@ -283,8 +263,7 @@ type FluentId = Cow<'static, str>;
 #[rustc_diagnostic_item = "SubdiagnosticMessage"]
 pub enum SubdiagnosticMessage {
     /// Non-translatable diagnostic message.
-    // FIXME(davidtwco): can a `Cow<'static, str>` be used here?
-    Str(String),
+    Str(Cow<'static, str>),
     /// Translatable message which has already been translated eagerly.
     ///
     /// Some diagnostics have repeated subdiagnostics where the same interpolated variables would
@@ -295,8 +274,7 @@ pub enum SubdiagnosticMessage {
     /// incorrect diagnostics. Eager translation results in translation for a subdiagnostic
     /// happening immediately after the subdiagnostic derive's logic has been run. This variant
     /// stores messages which have been translated eagerly.
-    // FIXME(#100717): can a `Cow<'static, str>` be used here?
-    Eager(String),
+    Eager(Cow<'static, str>),
     /// Identifier of a Fluent message. Instances of this variant are generated by the
     /// `Subdiagnostic` derive.
     FluentIdentifier(FluentId),
@@ -308,11 +286,19 @@ pub enum SubdiagnosticMessage {
     FluentAttr(FluentId),
 }
 
-/// `From` impl that enables existing diagnostic calls to functions which now take
-/// `impl Into<SubdiagnosticMessage>` to continue to work as before.
-impl<S: Into<String>> From<S> for SubdiagnosticMessage {
-    fn from(s: S) -> Self {
-        SubdiagnosticMessage::Str(s.into())
+impl From<String> for SubdiagnosticMessage {
+    fn from(s: String) -> Self {
+        SubdiagnosticMessage::Str(Cow::Owned(s))
+    }
+}
+impl From<&'static str> for SubdiagnosticMessage {
+    fn from(s: &'static str) -> Self {
+        SubdiagnosticMessage::Str(Cow::Borrowed(s))
+    }
+}
+impl From<Cow<'static, str>> for SubdiagnosticMessage {
+    fn from(s: Cow<'static, str>) -> Self {
+        SubdiagnosticMessage::Str(s)
     }
 }
 
@@ -324,8 +310,7 @@ impl<S: Into<String>> From<S> for SubdiagnosticMessage {
 #[rustc_diagnostic_item = "DiagnosticMessage"]
 pub enum DiagnosticMessage {
     /// Non-translatable diagnostic message.
-    // FIXME(#100717): can a `Cow<'static, str>` be used here?
-    Str(String),
+    Str(Cow<'static, str>),
     /// Translatable message which has already been translated eagerly.
     ///
     /// Some diagnostics have repeated subdiagnostics where the same interpolated variables would
@@ -336,8 +321,7 @@ pub enum DiagnosticMessage {
     /// incorrect diagnostics. Eager translation results in translation for a subdiagnostic
     /// happening immediately after the subdiagnostic derive's logic has been run. This variant
     /// stores messages which have been translated eagerly.
-    // FIXME(#100717): can a `Cow<'static, str>` be used here?
-    Eager(String),
+    Eager(Cow<'static, str>),
     /// Identifier for a Fluent message (with optional attribute) corresponding to the diagnostic
     /// message.
     ///
@@ -373,11 +357,19 @@ impl DiagnosticMessage {
     }
 }
 
-/// `From` impl that enables existing diagnostic calls to functions which now take
-/// `impl Into<DiagnosticMessage>` to continue to work as before.
-impl<S: Into<String>> From<S> for DiagnosticMessage {
-    fn from(s: S) -> Self {
-        DiagnosticMessage::Str(s.into())
+impl From<String> for DiagnosticMessage {
+    fn from(s: String) -> Self {
+        DiagnosticMessage::Str(Cow::Owned(s))
+    }
+}
+impl From<&'static str> for DiagnosticMessage {
+    fn from(s: &'static str) -> Self {
+        DiagnosticMessage::Str(Cow::Borrowed(s))
+    }
+}
+impl From<Cow<'static, str>> for DiagnosticMessage {
+    fn from(s: Cow<'static, str>) -> Self {
+        DiagnosticMessage::Str(s)
     }
 }
 
@@ -498,6 +490,10 @@ impl MultiSpan {
             }
         }
         replacements_occurred
+    }
+
+    pub fn pop_span_label(&mut self) -> Option<(Span, DiagnosticMessage)> {
+        self.span_labels.pop()
     }
 
     /// Returns the strings to highlight. We always ensure that there

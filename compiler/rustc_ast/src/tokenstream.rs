@@ -41,20 +41,22 @@ use std::{fmt, iter};
 /// Nothing special happens to misnamed or misplaced `SubstNt`s.
 #[derive(Debug, Clone, PartialEq, Encodable, Decodable, HashStable_Generic)]
 pub enum TokenTree {
-    /// A single token.
+    /// A single token. Should never be `OpenDelim` or `CloseDelim`, because
+    /// delimiters are implicitly represented by `Delimited`.
     Token(Token, Spacing),
     /// A delimited sequence of token trees.
     Delimited(DelimSpan, Delimiter, TokenStream),
 }
 
-// Ensure all fields of `TokenTree` is `Send` and `Sync`.
+// Ensure all fields of `TokenTree` are `DynSend` and `DynSync`.
 #[cfg(parallel_compiler)]
 fn _dummy()
 where
-    Token: Send + Sync,
-    DelimSpan: Send + Sync,
-    Delimiter: Send + Sync,
-    TokenStream: Send + Sync,
+    Token: sync::DynSend + sync::DynSync,
+    Spacing: sync::DynSend + sync::DynSync,
+    DelimSpan: sync::DynSend + sync::DynSync,
+    Delimiter: sync::DynSend + sync::DynSync,
+    TokenStream: sync::DynSend + sync::DynSync,
 {
 }
 
@@ -117,7 +119,7 @@ where
     }
 }
 
-pub trait ToAttrTokenStream: sync::Send + sync::Sync {
+pub trait ToAttrTokenStream: sync::DynSend + sync::DynSync {
     fn to_attr_token_stream(&self) -> AttrTokenStream;
 }
 
@@ -258,8 +260,7 @@ impl AttrTokenStream {
 
                         assert!(
                             found,
-                            "Failed to find trailing delimited group in: {:?}",
-                            target_tokens
+                            "Failed to find trailing delimited group in: {target_tokens:?}"
                         );
                     }
                     let mut flat: SmallVec<[_; 1]> = SmallVec::new();
@@ -389,12 +390,12 @@ impl TokenStream {
         self.0.len()
     }
 
-    pub fn trees(&self) -> CursorRef<'_> {
-        CursorRef::new(self)
+    pub fn trees(&self) -> RefTokenTreeCursor<'_> {
+        RefTokenTreeCursor::new(self)
     }
 
-    pub fn into_trees(self) -> Cursor {
-        Cursor::new(self)
+    pub fn into_trees(self) -> TokenTreeCursor {
+        TokenTreeCursor::new(self)
     }
 
     /// Compares two `TokenStream`s, checking equality without regarding span information.
@@ -550,18 +551,23 @@ impl TokenStream {
             vec_mut.extend(stream_iter);
         }
     }
+
+    pub fn chunks(&self, chunk_size: usize) -> core::slice::Chunks<'_, TokenTree> {
+        self.0.chunks(chunk_size)
+    }
 }
 
-/// By-reference iterator over a [`TokenStream`].
+/// By-reference iterator over a [`TokenStream`], that produces `&TokenTree`
+/// items.
 #[derive(Clone)]
-pub struct CursorRef<'t> {
+pub struct RefTokenTreeCursor<'t> {
     stream: &'t TokenStream,
     index: usize,
 }
 
-impl<'t> CursorRef<'t> {
+impl<'t> RefTokenTreeCursor<'t> {
     fn new(stream: &'t TokenStream) -> Self {
-        CursorRef { stream, index: 0 }
+        RefTokenTreeCursor { stream, index: 0 }
     }
 
     pub fn look_ahead(&self, n: usize) -> Option<&TokenTree> {
@@ -569,7 +575,7 @@ impl<'t> CursorRef<'t> {
     }
 }
 
-impl<'t> Iterator for CursorRef<'t> {
+impl<'t> Iterator for RefTokenTreeCursor<'t> {
     type Item = &'t TokenTree;
 
     fn next(&mut self) -> Option<&'t TokenTree> {
@@ -580,15 +586,16 @@ impl<'t> Iterator for CursorRef<'t> {
     }
 }
 
-/// Owning by-value iterator over a [`TokenStream`].
+/// Owning by-value iterator over a [`TokenStream`], that produces `TokenTree`
+/// items.
 // FIXME: Many uses of this can be replaced with by-reference iterator to avoid clones.
 #[derive(Clone)]
-pub struct Cursor {
+pub struct TokenTreeCursor {
     pub stream: TokenStream,
     index: usize,
 }
 
-impl Iterator for Cursor {
+impl Iterator for TokenTreeCursor {
     type Item = TokenTree;
 
     fn next(&mut self) -> Option<TokenTree> {
@@ -599,9 +606,9 @@ impl Iterator for Cursor {
     }
 }
 
-impl Cursor {
+impl TokenTreeCursor {
     fn new(stream: TokenStream) -> Self {
-        Cursor { stream, index: 0 }
+        TokenTreeCursor { stream, index: 0 }
     }
 
     #[inline]
@@ -614,6 +621,15 @@ impl Cursor {
 
     pub fn look_ahead(&self, n: usize) -> Option<&TokenTree> {
         self.stream.0.get(self.index + n)
+    }
+
+    // Replace the previously obtained token tree with `tts`, and rewind to
+    // just before them.
+    pub fn replace_prev_and_rewind(&mut self, tts: Vec<TokenTree>) {
+        assert!(self.index > 0);
+        self.index -= 1;
+        let stream = Lrc::make_mut(&mut self.stream.0);
+        stream.splice(self.index..self.index + 1, tts);
     }
 }
 

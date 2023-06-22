@@ -12,7 +12,7 @@
 // * `"` is treated as the start of a string.
 
 use rustc_data_structures::fx::FxHashSet;
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use rustc_data_structures::stable_hasher::{Hash64, HashStable, StableHasher};
 use rustc_hir::def_id::DefId;
 use rustc_hir::definitions::{DefPathData, DefPathDataName, DisambiguatedDefPathData};
 use rustc_hir::{AsyncGeneratorKind, GeneratorKind, Mutability};
@@ -93,7 +93,7 @@ fn push_debuginfo_type_name<'tcx>(
                     Err(e) => {
                         // Computing the layout can still fail here, e.g. if the target architecture
                         // cannot represent the type. See https://github.com/rust-lang/rust/issues/94961.
-                        tcx.sess.fatal(&format!("{}", e));
+                        tcx.sess.emit_fatal(e.into_diagnostic());
                     }
                 }
             } else {
@@ -180,16 +180,24 @@ fn push_debuginfo_type_name<'tcx>(
                 push_debuginfo_type_name(tcx, inner_type, true, output, visited);
                 match len.kind() {
                     ty::ConstKind::Param(param) => write!(output, ",{}>", param.name).unwrap(),
-                    _ => write!(output, ",{}>", len.eval_usize(tcx, ty::ParamEnv::reveal_all()))
-                        .unwrap(),
+                    _ => write!(
+                        output,
+                        ",{}>",
+                        len.eval_target_usize(tcx, ty::ParamEnv::reveal_all())
+                    )
+                    .unwrap(),
                 }
             } else {
                 output.push('[');
                 push_debuginfo_type_name(tcx, inner_type, true, output, visited);
                 match len.kind() {
                     ty::ConstKind::Param(param) => write!(output, "; {}]", param.name).unwrap(),
-                    _ => write!(output, "; {}]", len.eval_usize(tcx, ty::ParamEnv::reveal_all()))
-                        .unwrap(),
+                    _ => write!(
+                        output,
+                        "; {}]",
+                        len.eval_target_usize(tcx, ty::ParamEnv::reveal_all())
+                    )
+                    .unwrap(),
                 }
             }
         }
@@ -413,6 +421,7 @@ fn push_debuginfo_type_name<'tcx>(
         | ty::Placeholder(..)
         | ty::Alias(..)
         | ty::Bound(..)
+        | ty::GeneratorWitnessMIR(..)
         | ty::GeneratorWitness(..) => {
             bug!(
                 "debuginfo: Trying to create type name for \
@@ -665,8 +674,7 @@ fn push_const_param<'tcx>(tcx: TyCtxt<'tcx>, ct: ty::Const<'tcx>, output: &mut S
                     hcx.while_hashing_spans(false, |hcx| {
                         ct.to_valtree().hash_stable(hcx, &mut hasher)
                     });
-                    let hash: u64 = hasher.finish();
-                    hash
+                    hasher.finish::<Hash64>()
                 });
 
                 if cpp_like_debuginfo(tcx) {

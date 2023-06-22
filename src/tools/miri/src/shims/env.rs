@@ -166,7 +166,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 // `buf_size` represents the size in characters.
                 let buf_size = u64::from(this.read_scalar(size_op)?.to_u32()?);
                 Scalar::from_u32(windows_check_buffer_size(
-                    this.write_os_str_to_wide_str(&var, buf_ptr, buf_size)?,
+                    this.write_os_str_to_wide_str(
+                        &var, buf_ptr, buf_size, /*truncate*/ false,
+                    )?,
                 ))
             }
             None => {
@@ -321,7 +323,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         this.assert_target_os_is_unix("getcwd");
 
         let buf = this.read_pointer(buf_op)?;
-        let size = this.read_machine_usize(size_op)?;
+        let size = this.read_target_usize(size_op)?;
 
         if let IsolatedOp::Reject(reject_with) = this.machine.isolated_op {
             this.reject_in_isolation("`getcwd`", reject_with)?;
@@ -366,7 +368,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         match env::current_dir() {
             Ok(cwd) =>
                 return Ok(Scalar::from_u32(windows_check_buffer_size(
-                    this.write_path_to_wide_str(&cwd, buf, size)?,
+                    this.write_path_to_wide_str(&cwd, buf, size, /*truncate*/ false)?,
                 ))),
             Err(e) => this.set_last_error_from_io_error(e.kind())?,
         }

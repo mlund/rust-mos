@@ -97,8 +97,7 @@ pub enum ControlFlow<B, C = ()> {
 }
 
 #[unstable(feature = "try_trait_v2", issue = "84277")]
-#[rustc_const_unstable(feature = "const_convert", issue = "88674")]
-impl<B, C> const ops::Try for ControlFlow<B, C> {
+impl<B, C> ops::Try for ControlFlow<B, C> {
     type Output = C;
     type Residual = ControlFlow<B, convert::Infallible>;
 
@@ -117,8 +116,7 @@ impl<B, C> const ops::Try for ControlFlow<B, C> {
 }
 
 #[unstable(feature = "try_trait_v2", issue = "84277")]
-#[rustc_const_unstable(feature = "const_convert", issue = "88674")]
-impl<B, C> const ops::FromResidual for ControlFlow<B, C> {
+impl<B, C> ops::FromResidual for ControlFlow<B, C> {
     #[inline]
     fn from_residual(residual: ControlFlow<B, convert::Infallible>) -> Self {
         match residual {
@@ -128,8 +126,7 @@ impl<B, C> const ops::FromResidual for ControlFlow<B, C> {
 }
 
 #[unstable(feature = "try_trait_v2_residual", issue = "91285")]
-#[rustc_const_unstable(feature = "const_try", issue = "74935")]
-impl<B, C> const ops::Residual<C> for ControlFlow<B, convert::Infallible> {
+impl<B, C> ops::Residual<C> for ControlFlow<B, convert::Infallible> {
     type TryType = ControlFlow<B, C>;
 }
 
@@ -258,47 +255,4 @@ impl<R: ops::Try> ControlFlow<R, R::Output> {
             ControlFlow::Break(v) => v,
         }
     }
-}
-
-impl<B> ControlFlow<B, ()> {
-    /// It's frequently the case that there's no value needed with `Continue`,
-    /// so this provides a way to avoid typing `(())`, if you prefer it.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// #![feature(control_flow_enum)]
-    /// use std::ops::ControlFlow;
-    ///
-    /// let mut partial_sum = 0;
-    /// let last_used = (1..10).chain(20..25).try_for_each(|x| {
-    ///     partial_sum += x;
-    ///     if partial_sum > 100 { ControlFlow::Break(x) }
-    ///     else { ControlFlow::CONTINUE }
-    /// });
-    /// assert_eq!(last_used.break_value(), Some(22));
-    /// ```
-    #[unstable(feature = "control_flow_enum", reason = "new API", issue = "75744")]
-    pub const CONTINUE: Self = ControlFlow::Continue(());
-}
-
-impl<C> ControlFlow<(), C> {
-    /// APIs like `try_for_each` don't need values with `Break`,
-    /// so this provides a way to avoid typing `(())`, if you prefer it.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// #![feature(control_flow_enum)]
-    /// use std::ops::ControlFlow;
-    ///
-    /// let mut partial_sum = 0;
-    /// (1..10).chain(20..25).try_for_each(|x| {
-    ///     if partial_sum > 100 { ControlFlow::BREAK }
-    ///     else { partial_sum += x; ControlFlow::CONTINUE }
-    /// });
-    /// assert_eq!(partial_sum, 108);
-    /// ```
-    #[unstable(feature = "control_flow_enum", reason = "new API", issue = "75744")]
-    pub const BREAK: Self = ControlFlow::Break(());
 }

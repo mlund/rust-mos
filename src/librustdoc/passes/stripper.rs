@@ -1,10 +1,9 @@
 //! A collection of utility functions for the `strip_*` passes.
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::{TyCtxt, Visibility};
-use rustc_span::symbol::sym;
 use std::mem;
 
-use crate::clean::{self, Item, ItemId, ItemIdSet, NestedAttributesExt};
+use crate::clean::{self, Item, ItemId, ItemIdSet};
 use crate::fold::{strip_item, DocFolder};
 use crate::formats::cache::Cache;
 use crate::visit_lib::RustdocEffectiveVisibilities;
@@ -97,17 +96,7 @@ impl<'a, 'tcx> DocFolder for Stripper<'a, 'tcx> {
             }
 
             // handled in the `strip-priv-imports` pass
-            clean::ExternCrateItem { .. } => {}
-            clean::ImportItem(ref imp) => {
-                // Because json doesn't inline imports from private modules, we need to mark
-                // the imported item as retained so it's impls won't be stripped.
-                //
-                // FIXME: Is it necessary to check for json output here: See
-                // https://github.com/rust-lang/rust/pull/100325#discussion_r941495215
-                if let Some(did) = imp.source.did && self.is_json_output {
-                    self.retained.insert(did.into());
-                }
-            }
+            clean::ExternCrateItem { .. } | clean::ImportItem(_) => {}
 
             clean::ImplItem(..) => {}
 
@@ -132,7 +121,10 @@ impl<'a, 'tcx> DocFolder for Stripper<'a, 'tcx> {
             // implementations of traits are always public.
             clean::ImplItem(ref imp) if imp.trait_.is_some() => true,
             // Variant fields have inherited visibility
-            clean::VariantItem(clean::Variant::Struct(..) | clean::Variant::Tuple(..)) => true,
+            clean::VariantItem(clean::Variant {
+                kind: clean::VariantKind::Struct(..) | clean::VariantKind::Tuple(..),
+                ..
+            }) => true,
             _ => false,
         };
 
@@ -170,7 +162,7 @@ impl<'a> ImplStripper<'a, '_> {
             // If the "for" item is exported and the impl block isn't `#[doc(hidden)]`, then we
             // need to keep it.
             self.cache.effective_visibilities.is_exported(self.tcx, for_def_id)
-                && !item.attrs.lists(sym::doc).has_word(sym::hidden)
+                && !item.is_doc_hidden()
         } else {
             false
         }
@@ -201,34 +193,32 @@ impl<'a> DocFolder for ImplStripper<'a, '_> {
                     })
                 {
                     return None;
-                } else if imp.items.is_empty() && i.doc_value().is_none() {
+                } else if imp.items.is_empty() && i.doc_value().is_empty() {
                     return None;
                 }
             }
             // Because we don't inline in `maybe_inline_local` if the output format is JSON,
             // we need to make a special check for JSON output: we want to keep it unless it has
             // a `#[doc(hidden)]` attribute if the `for_` type is exported.
-            if let Some(did) = imp.for_.def_id(self.cache) {
-                if !imp.for_.is_assoc_ty() && !self.should_keep_impl(&i, did) {
-                    debug!("ImplStripper: impl item for stripped type; removing");
-                    return None;
-                }
+            if let Some(did) = imp.for_.def_id(self.cache) &&
+                !imp.for_.is_assoc_ty() && !self.should_keep_impl(&i, did)
+            {
+                debug!("ImplStripper: impl item for stripped type; removing");
+                return None;
             }
-            if let Some(did) = imp.trait_.as_ref().map(|t| t.def_id()) {
-                if !self.should_keep_impl(&i, did) {
-                    debug!("ImplStripper: impl item for stripped trait; removing");
-                    return None;
-                }
+            if let Some(did) = imp.trait_.as_ref().map(|t| t.def_id()) &&
+                !self.should_keep_impl(&i, did) {
+                debug!("ImplStripper: impl item for stripped trait; removing");
+                return None;
             }
             if let Some(generics) = imp.trait_.as_ref().and_then(|t| t.generics()) {
                 for typaram in generics {
-                    if let Some(did) = typaram.def_id(self.cache) {
-                        if !self.should_keep_impl(&i, did) {
-                            debug!(
-                                "ImplStripper: stripped item in trait's generics; removing impl"
-                            );
-                            return None;
-                        }
+                    if let Some(did) = typaram.def_id(self.cache) && !self.should_keep_impl(&i, did)
+                    {
+                        debug!(
+                            "ImplStripper: stripped item in trait's generics; removing impl"
+                        );
+                        return None;
                     }
                 }
             }
@@ -240,11 +230,25 @@ impl<'a> DocFolder for ImplStripper<'a, '_> {
 /// This stripper discards all private import statements (`use`, `extern crate`)
 pub(crate) struct ImportStripper<'tcx> {
     pub(crate) tcx: TyCtxt<'tcx>,
+    pub(crate) is_json_output: bool,
+}
+
+impl<'tcx> ImportStripper<'tcx> {
+    fn import_should_be_hidden(&self, i: &Item, imp: &clean::Import) -> bool {
+        if self.is_json_output {
+            // FIXME: This should be handled the same way as for HTML output.
+            imp.imported_item_is_doc_hidden(self.tcx)
+        } else {
+            i.is_doc_hidden()
+        }
+    }
 }
 
 impl<'tcx> DocFolder for ImportStripper<'tcx> {
     fn fold_item(&mut self, i: Item) -> Option<Item> {
         match *i.kind {
+            clean::ImportItem(imp) if self.import_should_be_hidden(&i, &imp) => None,
+            clean::ImportItem(_) if i.is_doc_hidden() => None,
             clean::ExternCrateItem { .. } | clean::ImportItem(..)
                 if i.visibility(self.tcx) != Some(Visibility::Public) =>
             {

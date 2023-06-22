@@ -89,6 +89,30 @@ macro_rules! throw_machine_stop {
     ($($tt:tt)*) => { do yeet err_machine_stop!($($tt)*) };
 }
 
+#[macro_export]
+macro_rules! err_ub_custom {
+    ($msg:expr $(, $($name:ident = $value:expr),* $(,)?)?) => {{
+        $(
+            let ($($name,)*) = ($($value,)*);
+        )?
+        err_ub!(Custom(
+            rustc_middle::error::CustomSubdiagnostic {
+                msg: || $msg,
+                add_args: Box::new(move |mut set_arg| {
+                    $($(
+                        set_arg(stringify!($name).into(), rustc_errors::IntoDiagnosticArg::into_diagnostic_arg($name));
+                    )*)?
+                })
+            }
+        ))
+    }};
+}
+
+#[macro_export]
+macro_rules! throw_ub_custom {
+    ($($tt:tt)*) => { do yeet err_ub_custom!($($tt)*) };
+}
+
 mod allocation;
 mod error;
 mod pointer;
@@ -110,7 +134,7 @@ use rustc_hir::def_id::DefId;
 use rustc_macros::HashStable;
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_serialize::{Decodable, Encodable};
-use rustc_target::abi::Endian;
+use rustc_target::abi::{AddressSpace, Endian, HasDataLayout};
 
 use crate::mir;
 use crate::ty::codec::{TyDecoder, TyEncoder};
@@ -119,16 +143,17 @@ use crate::ty::{self, Instance, Ty, TyCtxt};
 
 pub use self::error::{
     struct_error, CheckInAllocMsg, ErrorHandled, EvalToAllocationRawResult, EvalToConstValueResult,
-    EvalToValTreeResult, InterpError, InterpErrorInfo, InterpResult, InvalidProgramInfo,
-    MachineStopType, ResourceExhaustionInfo, ScalarSizeMismatch, UndefinedBehaviorInfo,
-    UninitBytesAccess, UnsupportedOpInfo,
+    EvalToValTreeResult, ExpectedKind, InterpError, InterpErrorInfo, InterpResult, InvalidMetaKind,
+    InvalidProgramInfo, MachineStopType, PointerKind, ReportedErrorInfo, ResourceExhaustionInfo,
+    ScalarSizeMismatch, UndefinedBehaviorInfo, UninitBytesAccess, UnsupportedOpInfo,
+    ValidationErrorInfo, ValidationErrorKind,
 };
 
 pub use self::value::{get_slice_bytes, ConstAlloc, ConstValue, Scalar};
 
 pub use self::allocation::{
-    alloc_range, AllocError, AllocRange, AllocResult, Allocation, ConstAllocation, InitChunk,
-    InitChunkIter,
+    alloc_range, AllocBytes, AllocError, AllocRange, AllocResult, Allocation, ConstAllocation,
+    InitChunk, InitChunkIter,
 };
 
 pub use self::pointer::{Pointer, PointerArithmetic, Provenance};
@@ -227,7 +252,9 @@ pub fn specialized_encode_alloc_id<'tcx, E: TyEncoder<I = TyCtxt<'tcx>>>(
             // References to statics doesn't need to know about their allocations,
             // just about its `DefId`.
             AllocDiscriminant::Static.encode(encoder);
-            did.encode(encoder);
+            // Cannot use `did.encode(encoder)` because of a bug around
+            // specializations and method calls.
+            Encodable::<E>::encode(&did, encoder);
         }
     }
 }
@@ -263,7 +290,8 @@ impl AllocDecodingState {
     }
 
     pub fn new(data_offsets: Vec<u32>) -> Self {
-        let decoding_state = vec![Lock::new(State::Empty); data_offsets.len()];
+        let decoding_state =
+            std::iter::repeat_with(|| Lock::new(State::Empty)).take(data_offsets.len()).collect();
 
         Self { decoding_state, data_offsets }
     }
@@ -438,6 +466,17 @@ impl<'tcx> GlobalAlloc<'tcx> {
             _ => bug!("expected vtable, got {:?}", self),
         }
     }
+
+    /// The address space that this `GlobalAlloc` should be placed in.
+    #[inline]
+    pub fn address_space(&self, cx: &impl HasDataLayout) -> AddressSpace {
+        match self {
+            GlobalAlloc::Function(..) => cx.data_layout().instruction_address_space,
+            GlobalAlloc::Static(..) | GlobalAlloc::Memory(..) | GlobalAlloc::VTable(..) => {
+                AddressSpace::DATA
+            }
+        }
+    }
 }
 
 pub(crate) struct AllocMap<'tcx> {
@@ -509,7 +548,7 @@ impl<'tcx> TyCtxt<'tcx> {
         self.reserve_and_set_dedup(GlobalAlloc::Static(static_id))
     }
 
-    /// Generates an `AllocId` for a function.  Depending on the function type,
+    /// Generates an `AllocId` for a function. Depending on the function type,
     /// this might get deduplicated or assigned a new ID each time.
     pub fn create_fn_alloc(self, instance: Instance<'tcx>) -> AllocId {
         // Functions cannot be identified by pointers, as asm-equal functions can get deduplicated
@@ -518,7 +557,7 @@ impl<'tcx> TyCtxt<'tcx> {
         // We thus generate a new `AllocId` for every mention of a function. This means that
         // `main as fn() == main as fn()` is false, while `let x = main as fn(); x == x` is true.
         // However, formatting code relies on function identity (see #58320), so we only do
-        // this for generic functions.  Lifetime parameters are ignored.
+        // this for generic functions. Lifetime parameters are ignored.
         let is_generic = instance
             .substs
             .into_iter()
@@ -535,7 +574,7 @@ impl<'tcx> TyCtxt<'tcx> {
         }
     }
 
-    /// Generates an `AllocId` for a (symbolic, not-reified) vtable.  Will get deduplicated.
+    /// Generates an `AllocId` for a (symbolic, not-reified) vtable. Will get deduplicated.
     pub fn create_vtable_alloc(
         self,
         ty: Ty<'tcx>,

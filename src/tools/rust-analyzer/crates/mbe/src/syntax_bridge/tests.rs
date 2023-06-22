@@ -19,7 +19,7 @@ fn check_punct_spacing(fixture: &str) {
             let spacing = match annotation.as_str() {
                 "Alone" => Spacing::Alone,
                 "Joint" => Spacing::Joint,
-                a => panic!("unknown annotation: {}", a),
+                a => panic!("unknown annotation: {a}"),
             };
             (token, spacing)
         })
@@ -29,8 +29,8 @@ fn check_punct_spacing(fixture: &str) {
     let mut cursor = buf.begin();
     while !cursor.eof() {
         while let Some(token_tree) = cursor.token_tree() {
-            if let TokenTreeRef::Leaf(Leaf::Punct(Punct { spacing, id, .. }), _) = token_tree {
-                if let Some(expected) = annotations.remove(&id) {
+            if let TokenTreeRef::Leaf(Leaf::Punct(Punct { spacing, span, .. }), _) = token_tree {
+                if let Some(expected) = annotations.remove(span) {
                     assert_eq!(expected, *spacing);
                 }
             }
@@ -39,7 +39,7 @@ fn check_punct_spacing(fixture: &str) {
         cursor = cursor.bump();
     }
 
-    assert!(annotations.is_empty(), "unchecked annotations: {:?}", annotations);
+    assert!(annotations.is_empty(), "unchecked annotations: {annotations:?}");
 }
 
 #[test]

@@ -158,7 +158,7 @@ fn existing_definition(db: &RootDatabase, variant_name: &ast::Name, variant: &Va
             ),
             _ => false,
         })
-        .any(|(name, _)| name.to_string() == variant_name.to_string())
+        .any(|(name, _)| name.display(db).to_string() == variant_name.to_string())
 }
 
 fn extract_generic_params(
@@ -178,7 +178,7 @@ fn extract_generic_params(
             .fold(false, |tagged, ty| tag_generics_in_variant(&ty, &mut generics) || tagged),
     };
 
-    let generics = generics.into_iter().filter_map(|(param, tag)| tag.then(|| param));
+    let generics = generics.into_iter().filter_map(|(param, tag)| tag.then_some(param));
     tagged_one.then(|| make::generic_param_list(generics))
 }
 
@@ -1006,7 +1006,7 @@ enum X<'a, 'b, 'x> {
     }
 
     #[test]
-    fn test_extract_struct_with_liftime_type_const() {
+    fn test_extract_struct_with_lifetime_type_const() {
         check_assist(
             extract_struct_from_enum_variant,
             r#"

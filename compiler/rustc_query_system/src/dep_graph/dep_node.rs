@@ -46,7 +46,7 @@ use super::{DepContext, DepKind, FingerprintStyle};
 use crate::ich::StableHashingContext;
 
 use rustc_data_structures::fingerprint::{Fingerprint, PackedFingerprint};
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use rustc_data_structures::stable_hasher::{HashStable, StableHasher, StableOrd, ToStableHashKey};
 use rustc_hir::definitions::DefPathHash;
 use std::fmt;
 use std::hash::Hash;
@@ -120,7 +120,7 @@ pub trait DepNodeParams<Tcx: DepContext>: fmt::Debug + Sized {
     }
 
     fn to_debug_str(&self, _: Tcx) -> String {
-        format!("{:?}", self)
+        format!("{self:?}")
     }
 
     /// This method tries to recover the query key from the given `DepNode`,
@@ -246,4 +246,15 @@ impl<HCX> HashStable<HCX> for WorkProductId {
     fn hash_stable(&self, hcx: &mut HCX, hasher: &mut StableHasher) {
         self.hash.hash_stable(hcx, hasher)
     }
+}
+impl<HCX> ToStableHashKey<HCX> for WorkProductId {
+    type KeyType = Fingerprint;
+    #[inline]
+    fn to_stable_hash_key(&self, _: &HCX) -> Self::KeyType {
+        self.hash
+    }
+}
+unsafe impl StableOrd for WorkProductId {
+    // Fingerprint can use unstable (just a tuple of `u64`s), so WorkProductId can as well
+    const CAN_USE_UNSTABLE_SORT: bool = true;
 }

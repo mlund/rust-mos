@@ -1,17 +1,21 @@
 use hir::GenericParamKind;
 use rustc_errors::{
-    fluent, AddToDiagnostic, Applicability, Diagnostic, DiagnosticMessage, DiagnosticStyledString,
-    MultiSpan, SubdiagnosticMessage,
+    AddToDiagnostic, Applicability, Diagnostic, DiagnosticMessage, DiagnosticStyledString,
+    IntoDiagnosticArg, MultiSpan, SubdiagnosticMessage,
 };
 use rustc_hir as hir;
-use rustc_hir::{FnRetTy, Ty};
+use rustc_hir::FnRetTy;
 use rustc_macros::{Diagnostic, Subdiagnostic};
-use rustc_middle::ty::{Region, TyCtxt};
+use rustc_middle::ty::print::TraitRefPrintOnlyTraitPath;
+use rustc_middle::ty::{Binder, FnSig, Region, Ty, TyCtxt};
 use rustc_span::symbol::kw;
+use rustc_span::Symbol;
 use rustc_span::{symbol::Ident, BytePos, Span};
 
+use crate::fluent_generated as fluent;
 use crate::infer::error_reporting::{
     need_type_info::{GeneratorKindAsDiagArg, UnderspecifiedArgKind},
+    nice_region_error::placeholder_error::Highlighted,
     ObligationCauseAsDiagArg,
 };
 
@@ -23,9 +27,9 @@ pub struct OpaqueHiddenTypeDiag {
     #[primary_span]
     #[label]
     pub span: Span,
-    #[note(opaque_type)]
+    #[note(infer_opaque_type)]
     pub opaque_type: Span,
-    #[note(hidden_type)]
+    #[note(infer_hidden_type)]
     pub hidden_type: Span,
 }
 
@@ -49,7 +53,7 @@ pub struct AnnotationRequired<'a> {
 // Copy of `AnnotationRequired` for E0283
 #[derive(Diagnostic)]
 #[diag(infer_type_annotations_needed, code = "E0283")]
-pub struct AmbigousImpl<'a> {
+pub struct AmbiguousImpl<'a> {
     #[primary_span]
     pub span: Span,
     pub source_kind: &'static str,
@@ -67,7 +71,7 @@ pub struct AmbigousImpl<'a> {
 // Copy of `AnnotationRequired` for E0284
 #[derive(Diagnostic)]
 #[diag(infer_type_annotations_needed, code = "E0284")]
-pub struct AmbigousReturn<'a> {
+pub struct AmbiguousReturn<'a> {
     #[primary_span]
     pub span: Span,
     pub source_kind: &'static str,
@@ -178,18 +182,6 @@ pub enum SourceKindMultiSuggestion<'a> {
         #[suggestion_part(code = " }}")]
         end_span: Option<Span>,
     },
-}
-
-#[derive(Subdiagnostic)]
-#[suggestion(
-    infer_suggest_add_let_for_letchains,
-    style = "verbose",
-    applicability = "machine-applicable",
-    code = "let "
-)]
-pub(crate) struct SuggAddLetForLetChains {
-    #[primary_span]
-    pub span: Span,
 }
 
 impl<'a> SourceKindMultiSuggestion<'a> {
@@ -357,8 +349,8 @@ impl AddToDiagnostic for LifetimeMismatchLabels {
 pub struct AddLifetimeParamsSuggestion<'a> {
     pub tcx: TyCtxt<'a>,
     pub sub: Region<'a>,
-    pub ty_sup: &'a Ty<'a>,
-    pub ty_sub: &'a Ty<'a>,
+    pub ty_sup: &'a hir::Ty<'a>,
+    pub ty_sub: &'a hir::Ty<'a>,
     pub add_note: bool,
 }
 
@@ -519,4 +511,990 @@ pub struct MismatchedStaticLifetime<'a> {
     pub does_not_outlive_static_from_impl: DoesNotOutliveStaticFromImpl,
     #[subdiagnostic]
     pub implicit_static_lifetimes: Vec<ImplicitStaticLifetimeSubdiag>,
+}
+
+#[derive(Diagnostic)]
+pub enum ExplicitLifetimeRequired<'a> {
+    #[diag(infer_explicit_lifetime_required_with_ident, code = "E0621")]
+    WithIdent {
+        #[primary_span]
+        #[label]
+        span: Span,
+        simple_ident: Ident,
+        named: String,
+        #[suggestion(
+            infer_explicit_lifetime_required_sugg_with_ident,
+            code = "{new_ty}",
+            applicability = "unspecified"
+        )]
+        new_ty_span: Span,
+        #[skip_arg]
+        new_ty: Ty<'a>,
+    },
+    #[diag(infer_explicit_lifetime_required_with_param_type, code = "E0621")]
+    WithParamType {
+        #[primary_span]
+        #[label]
+        span: Span,
+        named: String,
+        #[suggestion(
+            infer_explicit_lifetime_required_sugg_with_param_type,
+            code = "{new_ty}",
+            applicability = "unspecified"
+        )]
+        new_ty_span: Span,
+        #[skip_arg]
+        new_ty: Ty<'a>,
+    },
+}
+
+pub enum TyOrSig<'tcx> {
+    Ty(Highlighted<'tcx, Ty<'tcx>>),
+    ClosureSig(Highlighted<'tcx, Binder<'tcx, FnSig<'tcx>>>),
+}
+
+impl IntoDiagnosticArg for TyOrSig<'_> {
+    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue<'static> {
+        match self {
+            TyOrSig::Ty(ty) => ty.into_diagnostic_arg(),
+            TyOrSig::ClosureSig(sig) => sig.into_diagnostic_arg(),
+        }
+    }
+}
+
+#[derive(Subdiagnostic)]
+pub enum ActualImplExplNotes<'tcx> {
+    #[note(infer_actual_impl_expl_expected_signature_two)]
+    ExpectedSignatureTwo {
+        leading_ellipsis: bool,
+        ty_or_sig: TyOrSig<'tcx>,
+        trait_path: Highlighted<'tcx, TraitRefPrintOnlyTraitPath<'tcx>>,
+        lifetime_1: usize,
+        lifetime_2: usize,
+    },
+    #[note(infer_actual_impl_expl_expected_signature_any)]
+    ExpectedSignatureAny {
+        leading_ellipsis: bool,
+        ty_or_sig: TyOrSig<'tcx>,
+        trait_path: Highlighted<'tcx, TraitRefPrintOnlyTraitPath<'tcx>>,
+        lifetime_1: usize,
+    },
+    #[note(infer_actual_impl_expl_expected_signature_some)]
+    ExpectedSignatureSome {
+        leading_ellipsis: bool,
+        ty_or_sig: TyOrSig<'tcx>,
+        trait_path: Highlighted<'tcx, TraitRefPrintOnlyTraitPath<'tcx>>,
+        lifetime_1: usize,
+    },
+    #[note(infer_actual_impl_expl_expected_signature_nothing)]
+    ExpectedSignatureNothing {
+        leading_ellipsis: bool,
+        ty_or_sig: TyOrSig<'tcx>,
+        trait_path: Highlighted<'tcx, TraitRefPrintOnlyTraitPath<'tcx>>,
+    },
+    #[note(infer_actual_impl_expl_expected_passive_two)]
+    ExpectedPassiveTwo {
+        leading_ellipsis: bool,
+        ty_or_sig: TyOrSig<'tcx>,
+        trait_path: Highlighted<'tcx, TraitRefPrintOnlyTraitPath<'tcx>>,
+        lifetime_1: usize,
+        lifetime_2: usize,
+    },
+    #[note(infer_actual_impl_expl_expected_passive_any)]
+    ExpectedPassiveAny {
+        leading_ellipsis: bool,
+        ty_or_sig: TyOrSig<'tcx>,
+        trait_path: Highlighted<'tcx, TraitRefPrintOnlyTraitPath<'tcx>>,
+        lifetime_1: usize,
+    },
+    #[note(infer_actual_impl_expl_expected_passive_some)]
+    ExpectedPassiveSome {
+        leading_ellipsis: bool,
+        ty_or_sig: TyOrSig<'tcx>,
+        trait_path: Highlighted<'tcx, TraitRefPrintOnlyTraitPath<'tcx>>,
+        lifetime_1: usize,
+    },
+    #[note(infer_actual_impl_expl_expected_passive_nothing)]
+    ExpectedPassiveNothing {
+        leading_ellipsis: bool,
+        ty_or_sig: TyOrSig<'tcx>,
+        trait_path: Highlighted<'tcx, TraitRefPrintOnlyTraitPath<'tcx>>,
+    },
+    #[note(infer_actual_impl_expl_expected_other_two)]
+    ExpectedOtherTwo {
+        leading_ellipsis: bool,
+        ty_or_sig: TyOrSig<'tcx>,
+        trait_path: Highlighted<'tcx, TraitRefPrintOnlyTraitPath<'tcx>>,
+        lifetime_1: usize,
+        lifetime_2: usize,
+    },
+    #[note(infer_actual_impl_expl_expected_other_any)]
+    ExpectedOtherAny {
+        leading_ellipsis: bool,
+        ty_or_sig: TyOrSig<'tcx>,
+        trait_path: Highlighted<'tcx, TraitRefPrintOnlyTraitPath<'tcx>>,
+        lifetime_1: usize,
+    },
+    #[note(infer_actual_impl_expl_expected_other_some)]
+    ExpectedOtherSome {
+        leading_ellipsis: bool,
+        ty_or_sig: TyOrSig<'tcx>,
+        trait_path: Highlighted<'tcx, TraitRefPrintOnlyTraitPath<'tcx>>,
+        lifetime_1: usize,
+    },
+    #[note(infer_actual_impl_expl_expected_other_nothing)]
+    ExpectedOtherNothing {
+        leading_ellipsis: bool,
+        ty_or_sig: TyOrSig<'tcx>,
+        trait_path: Highlighted<'tcx, TraitRefPrintOnlyTraitPath<'tcx>>,
+    },
+    #[note(infer_actual_impl_expl_but_actually_implements_trait)]
+    ButActuallyImplementsTrait {
+        trait_path: Highlighted<'tcx, TraitRefPrintOnlyTraitPath<'tcx>>,
+        has_lifetime: bool,
+        lifetime: usize,
+    },
+    #[note(infer_actual_impl_expl_but_actually_implemented_for_ty)]
+    ButActuallyImplementedForTy {
+        trait_path: Highlighted<'tcx, TraitRefPrintOnlyTraitPath<'tcx>>,
+        has_lifetime: bool,
+        lifetime: usize,
+        ty: String,
+    },
+    #[note(infer_actual_impl_expl_but_actually_ty_implements)]
+    ButActuallyTyImplements {
+        trait_path: Highlighted<'tcx, TraitRefPrintOnlyTraitPath<'tcx>>,
+        has_lifetime: bool,
+        lifetime: usize,
+        ty: String,
+    },
+}
+
+pub enum ActualImplExpectedKind {
+    Signature,
+    Passive,
+    Other,
+}
+
+pub enum ActualImplExpectedLifetimeKind {
+    Two,
+    Any,
+    Some,
+    Nothing,
+}
+
+impl<'tcx> ActualImplExplNotes<'tcx> {
+    pub fn new_expected(
+        kind: ActualImplExpectedKind,
+        lt_kind: ActualImplExpectedLifetimeKind,
+        leading_ellipsis: bool,
+        ty_or_sig: TyOrSig<'tcx>,
+        trait_path: Highlighted<'tcx, TraitRefPrintOnlyTraitPath<'tcx>>,
+        lifetime_1: usize,
+        lifetime_2: usize,
+    ) -> Self {
+        match (kind, lt_kind) {
+            (ActualImplExpectedKind::Signature, ActualImplExpectedLifetimeKind::Two) => {
+                Self::ExpectedSignatureTwo {
+                    leading_ellipsis,
+                    ty_or_sig,
+                    trait_path,
+                    lifetime_1,
+                    lifetime_2,
+                }
+            }
+            (ActualImplExpectedKind::Signature, ActualImplExpectedLifetimeKind::Any) => {
+                Self::ExpectedSignatureAny { leading_ellipsis, ty_or_sig, trait_path, lifetime_1 }
+            }
+            (ActualImplExpectedKind::Signature, ActualImplExpectedLifetimeKind::Some) => {
+                Self::ExpectedSignatureSome { leading_ellipsis, ty_or_sig, trait_path, lifetime_1 }
+            }
+            (ActualImplExpectedKind::Signature, ActualImplExpectedLifetimeKind::Nothing) => {
+                Self::ExpectedSignatureNothing { leading_ellipsis, ty_or_sig, trait_path }
+            }
+            (ActualImplExpectedKind::Passive, ActualImplExpectedLifetimeKind::Two) => {
+                Self::ExpectedPassiveTwo {
+                    leading_ellipsis,
+                    ty_or_sig,
+                    trait_path,
+                    lifetime_1,
+                    lifetime_2,
+                }
+            }
+            (ActualImplExpectedKind::Passive, ActualImplExpectedLifetimeKind::Any) => {
+                Self::ExpectedPassiveAny { leading_ellipsis, ty_or_sig, trait_path, lifetime_1 }
+            }
+            (ActualImplExpectedKind::Passive, ActualImplExpectedLifetimeKind::Some) => {
+                Self::ExpectedPassiveSome { leading_ellipsis, ty_or_sig, trait_path, lifetime_1 }
+            }
+            (ActualImplExpectedKind::Passive, ActualImplExpectedLifetimeKind::Nothing) => {
+                Self::ExpectedPassiveNothing { leading_ellipsis, ty_or_sig, trait_path }
+            }
+            (ActualImplExpectedKind::Other, ActualImplExpectedLifetimeKind::Two) => {
+                Self::ExpectedOtherTwo {
+                    leading_ellipsis,
+                    ty_or_sig,
+                    trait_path,
+                    lifetime_1,
+                    lifetime_2,
+                }
+            }
+            (ActualImplExpectedKind::Other, ActualImplExpectedLifetimeKind::Any) => {
+                Self::ExpectedOtherAny { leading_ellipsis, ty_or_sig, trait_path, lifetime_1 }
+            }
+            (ActualImplExpectedKind::Other, ActualImplExpectedLifetimeKind::Some) => {
+                Self::ExpectedOtherSome { leading_ellipsis, ty_or_sig, trait_path, lifetime_1 }
+            }
+            (ActualImplExpectedKind::Other, ActualImplExpectedLifetimeKind::Nothing) => {
+                Self::ExpectedOtherNothing { leading_ellipsis, ty_or_sig, trait_path }
+            }
+        }
+    }
+}
+
+#[derive(Diagnostic)]
+#[diag(infer_trait_placeholder_mismatch)]
+pub struct TraitPlaceholderMismatch<'tcx> {
+    #[primary_span]
+    pub span: Span,
+    #[label(infer_label_satisfy)]
+    pub satisfy_span: Option<Span>,
+    #[label(infer_label_where)]
+    pub where_span: Option<Span>,
+    #[label(infer_label_dup)]
+    pub dup_span: Option<Span>,
+    pub def_id: String,
+    pub trait_def_id: String,
+
+    #[subdiagnostic]
+    pub actual_impl_expl_notes: Vec<ActualImplExplNotes<'tcx>>,
+}
+
+pub struct ConsiderBorrowingParamHelp {
+    pub spans: Vec<Span>,
+}
+
+impl AddToDiagnostic for ConsiderBorrowingParamHelp {
+    fn add_to_diagnostic_with<F>(self, diag: &mut Diagnostic, f: F)
+    where
+        F: Fn(&mut Diagnostic, SubdiagnosticMessage) -> SubdiagnosticMessage,
+    {
+        let mut type_param_span: MultiSpan = self.spans.clone().into();
+        for &span in &self.spans {
+            // Seems like we can't call f() here as Into<DiagnosticMessage> is required
+            type_param_span.push_span_label(span, fluent::infer_tid_consider_borrowing);
+        }
+        let msg = f(diag, fluent::infer_tid_param_help.into());
+        diag.span_help(type_param_span, msg);
+    }
+}
+
+#[derive(Subdiagnostic)]
+#[help(infer_tid_rel_help)]
+pub struct RelationshipHelp;
+
+#[derive(Diagnostic)]
+#[diag(infer_trait_impl_diff)]
+pub struct TraitImplDiff {
+    #[primary_span]
+    #[label(infer_found)]
+    pub sp: Span,
+    #[label(infer_expected)]
+    pub trait_sp: Span,
+    #[note(infer_expected_found)]
+    pub note: (),
+    #[subdiagnostic]
+    pub param_help: ConsiderBorrowingParamHelp,
+    #[subdiagnostic]
+    // Seems like subdiagnostics are always pushed to the end, so this one
+    // also has to be a subdiagnostic to maintain order.
+    pub rel_help: Option<RelationshipHelp>,
+    pub expected: String,
+    pub found: String,
+}
+
+pub struct DynTraitConstraintSuggestion {
+    pub span: Span,
+    pub ident: Ident,
+}
+
+impl AddToDiagnostic for DynTraitConstraintSuggestion {
+    fn add_to_diagnostic_with<F>(self, diag: &mut Diagnostic, f: F)
+    where
+        F: Fn(&mut Diagnostic, SubdiagnosticMessage) -> SubdiagnosticMessage,
+    {
+        let mut multi_span: MultiSpan = vec![self.span].into();
+        multi_span.push_span_label(self.span, fluent::infer_dtcs_has_lifetime_req_label);
+        multi_span.push_span_label(self.ident.span, fluent::infer_dtcs_introduces_requirement);
+        let msg = f(diag, fluent::infer_dtcs_has_req_note.into());
+        diag.span_note(multi_span, msg);
+        let msg = f(diag, fluent::infer_dtcs_suggestion.into());
+        diag.span_suggestion_verbose(
+            self.span.shrink_to_hi(),
+            msg,
+            " + '_",
+            Applicability::MaybeIncorrect,
+        );
+    }
+}
+
+#[derive(Diagnostic)]
+#[diag(infer_but_calling_introduces, code = "E0772")]
+pub struct ButCallingIntroduces {
+    #[label(infer_label1)]
+    pub param_ty_span: Span,
+    #[primary_span]
+    #[label(infer_label2)]
+    pub cause_span: Span,
+
+    pub has_param_name: bool,
+    pub param_name: String,
+    pub has_lifetime: bool,
+    pub lifetime: String,
+    pub assoc_item: Symbol,
+    pub has_impl_path: bool,
+    pub impl_path: String,
+}
+
+pub struct ReqIntroducedLocations {
+    pub span: MultiSpan,
+    pub spans: Vec<Span>,
+    pub fn_decl_span: Span,
+    pub cause_span: Span,
+    pub add_label: bool,
+}
+
+impl AddToDiagnostic for ReqIntroducedLocations {
+    fn add_to_diagnostic_with<F>(mut self, diag: &mut Diagnostic, f: F)
+    where
+        F: Fn(&mut Diagnostic, SubdiagnosticMessage) -> SubdiagnosticMessage,
+    {
+        for sp in self.spans {
+            self.span.push_span_label(sp, fluent::infer_ril_introduced_here);
+        }
+
+        if self.add_label {
+            self.span.push_span_label(self.fn_decl_span, fluent::infer_ril_introduced_by);
+        }
+        self.span.push_span_label(self.cause_span, fluent::infer_ril_because_of);
+        let msg = f(diag, fluent::infer_ril_static_introduced_by.into());
+        diag.span_note(self.span, msg);
+    }
+}
+
+pub struct MoreTargeted {
+    pub ident: Symbol,
+}
+
+impl AddToDiagnostic for MoreTargeted {
+    fn add_to_diagnostic_with<F>(self, diag: &mut Diagnostic, _f: F)
+    where
+        F: Fn(&mut Diagnostic, SubdiagnosticMessage) -> SubdiagnosticMessage,
+    {
+        diag.code(rustc_errors::error_code!(E0772));
+        diag.set_primary_message(fluent::infer_more_targeted);
+        diag.set_arg("ident", self.ident);
+    }
+}
+
+#[derive(Diagnostic)]
+#[diag(infer_but_needs_to_satisfy, code = "E0759")]
+pub struct ButNeedsToSatisfy {
+    #[primary_span]
+    pub sp: Span,
+    #[label(infer_influencer)]
+    pub influencer_point: Span,
+    #[label(infer_used_here)]
+    pub spans: Vec<Span>,
+    #[label(infer_require)]
+    pub require_span_as_label: Option<Span>,
+    #[note(infer_require)]
+    pub require_span_as_note: Option<Span>,
+    #[note(infer_introduced_by_bound)]
+    pub bound: Option<Span>,
+
+    #[subdiagnostic]
+    pub req_introduces_loc: Option<ReqIntroducedLocations>,
+
+    pub has_param_name: bool,
+    pub param_name: String,
+    pub spans_empty: bool,
+    pub has_lifetime: bool,
+    pub lifetime: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(infer_outlives_content, code = "E0312")]
+pub struct OutlivesContent<'a> {
+    #[primary_span]
+    pub span: Span,
+    #[subdiagnostic]
+    pub notes: Vec<note_and_explain::RegionExplanation<'a>>,
+}
+
+#[derive(Diagnostic)]
+#[diag(infer_outlives_bound, code = "E0476")]
+pub struct OutlivesBound<'a> {
+    #[primary_span]
+    pub span: Span,
+    #[subdiagnostic]
+    pub notes: Vec<note_and_explain::RegionExplanation<'a>>,
+}
+
+#[derive(Diagnostic)]
+#[diag(infer_fulfill_req_lifetime, code = "E0477")]
+pub struct FulfillReqLifetime<'a> {
+    #[primary_span]
+    pub span: Span,
+    pub ty: Ty<'a>,
+    #[subdiagnostic]
+    pub note: Option<note_and_explain::RegionExplanation<'a>>,
+}
+
+#[derive(Diagnostic)]
+#[diag(infer_lf_bound_not_satisfied, code = "E0478")]
+pub struct LfBoundNotSatisfied<'a> {
+    #[primary_span]
+    pub span: Span,
+    #[subdiagnostic]
+    pub notes: Vec<note_and_explain::RegionExplanation<'a>>,
+}
+
+#[derive(Diagnostic)]
+#[diag(infer_ref_longer_than_data, code = "E0491")]
+pub struct RefLongerThanData<'a> {
+    #[primary_span]
+    pub span: Span,
+    pub ty: Ty<'a>,
+    #[subdiagnostic]
+    pub notes: Vec<note_and_explain::RegionExplanation<'a>>,
+}
+
+#[derive(Subdiagnostic)]
+pub enum WhereClauseSuggestions {
+    #[suggestion(
+        infer_where_remove,
+        code = "",
+        applicability = "machine-applicable",
+        style = "verbose"
+    )]
+    Remove {
+        #[primary_span]
+        span: Span,
+    },
+    #[suggestion(
+        infer_where_copy_predicates,
+        code = "{space}where {trait_predicates}",
+        applicability = "machine-applicable",
+        style = "verbose"
+    )]
+    CopyPredicates {
+        #[primary_span]
+        span: Span,
+        space: &'static str,
+        trait_predicates: String,
+    },
+}
+
+#[derive(Subdiagnostic)]
+pub enum SuggestRemoveSemiOrReturnBinding {
+    #[multipart_suggestion(infer_srs_remove_and_box, applicability = "machine-applicable")]
+    RemoveAndBox {
+        #[suggestion_part(code = "Box::new(")]
+        first_lo: Span,
+        #[suggestion_part(code = ")")]
+        first_hi: Span,
+        #[suggestion_part(code = "Box::new(")]
+        second_lo: Span,
+        #[suggestion_part(code = ")")]
+        second_hi: Span,
+        #[suggestion_part(code = "")]
+        sp: Span,
+    },
+    #[suggestion(
+        infer_srs_remove,
+        style = "short",
+        code = "",
+        applicability = "machine-applicable"
+    )]
+    Remove {
+        #[primary_span]
+        sp: Span,
+    },
+    #[suggestion(
+        infer_srs_add,
+        style = "verbose",
+        code = "{code}",
+        applicability = "maybe-incorrect"
+    )]
+    Add {
+        #[primary_span]
+        sp: Span,
+        code: String,
+        ident: Ident,
+    },
+    #[note(infer_srs_add_one)]
+    AddOne {
+        #[primary_span]
+        spans: MultiSpan,
+    },
+}
+
+#[derive(Subdiagnostic)]
+pub enum ConsiderAddingAwait {
+    #[help(infer_await_both_futures)]
+    BothFuturesHelp,
+    #[multipart_suggestion(infer_await_both_futures, applicability = "maybe-incorrect")]
+    BothFuturesSugg {
+        #[suggestion_part(code = ".await")]
+        first: Span,
+        #[suggestion_part(code = ".await")]
+        second: Span,
+    },
+    #[suggestion(
+        infer_await_future,
+        code = ".await",
+        style = "verbose",
+        applicability = "maybe-incorrect"
+    )]
+    FutureSugg {
+        #[primary_span]
+        span: Span,
+    },
+    #[note(infer_await_note)]
+    FutureSuggNote {
+        #[primary_span]
+        span: Span,
+    },
+    #[multipart_suggestion(
+        infer_await_future,
+        style = "verbose",
+        applicability = "maybe-incorrect"
+    )]
+    FutureSuggMultiple {
+        #[suggestion_part(code = ".await")]
+        spans: Vec<Span>,
+    },
+}
+
+#[derive(Diagnostic)]
+pub enum PlaceholderRelationLfNotSatisfied {
+    #[diag(infer_lf_bound_not_satisfied)]
+    HasBoth {
+        #[primary_span]
+        span: Span,
+        #[note(infer_prlf_defined_with_sub)]
+        sub_span: Span,
+        #[note(infer_prlf_must_outlive_with_sup)]
+        sup_span: Span,
+        sub_symbol: Symbol,
+        sup_symbol: Symbol,
+        #[note(infer_prlf_known_limitation)]
+        note: (),
+    },
+    #[diag(infer_lf_bound_not_satisfied)]
+    HasSub {
+        #[primary_span]
+        span: Span,
+        #[note(infer_prlf_defined_with_sub)]
+        sub_span: Span,
+        #[note(infer_prlf_must_outlive_without_sup)]
+        sup_span: Span,
+        sub_symbol: Symbol,
+        #[note(infer_prlf_known_limitation)]
+        note: (),
+    },
+    #[diag(infer_lf_bound_not_satisfied)]
+    HasSup {
+        #[primary_span]
+        span: Span,
+        #[note(infer_prlf_defined_without_sub)]
+        sub_span: Span,
+        #[note(infer_prlf_must_outlive_with_sup)]
+        sup_span: Span,
+        sup_symbol: Symbol,
+        #[note(infer_prlf_known_limitation)]
+        note: (),
+    },
+    #[diag(infer_lf_bound_not_satisfied)]
+    HasNone {
+        #[primary_span]
+        span: Span,
+        #[note(infer_prlf_defined_without_sub)]
+        sub_span: Span,
+        #[note(infer_prlf_must_outlive_without_sup)]
+        sup_span: Span,
+        #[note(infer_prlf_known_limitation)]
+        note: (),
+    },
+    #[diag(infer_lf_bound_not_satisfied)]
+    OnlyPrimarySpan {
+        #[primary_span]
+        span: Span,
+        #[note(infer_prlf_known_limitation)]
+        note: (),
+    },
+}
+
+#[derive(Diagnostic)]
+#[diag(infer_opaque_captures_lifetime, code = "E0700")]
+pub struct OpaqueCapturesLifetime<'tcx> {
+    #[primary_span]
+    pub span: Span,
+    #[label]
+    pub opaque_ty_span: Span,
+    pub opaque_ty: Ty<'tcx>,
+}
+
+#[derive(Subdiagnostic)]
+pub enum FunctionPointerSuggestion<'a> {
+    #[suggestion(
+        infer_fps_use_ref,
+        code = "&{fn_name}",
+        style = "verbose",
+        applicability = "maybe-incorrect"
+    )]
+    UseRef {
+        #[primary_span]
+        span: Span,
+        #[skip_arg]
+        fn_name: String,
+    },
+    #[suggestion(
+        infer_fps_remove_ref,
+        code = "{fn_name}",
+        style = "verbose",
+        applicability = "maybe-incorrect"
+    )]
+    RemoveRef {
+        #[primary_span]
+        span: Span,
+        #[skip_arg]
+        fn_name: String,
+    },
+    #[suggestion(
+        infer_fps_cast,
+        code = "&({fn_name} as {sig})",
+        style = "verbose",
+        applicability = "maybe-incorrect"
+    )]
+    CastRef {
+        #[primary_span]
+        span: Span,
+        #[skip_arg]
+        fn_name: String,
+        #[skip_arg]
+        sig: Binder<'a, FnSig<'a>>,
+    },
+    #[suggestion(
+        infer_fps_cast,
+        code = "{fn_name} as {sig}",
+        style = "verbose",
+        applicability = "maybe-incorrect"
+    )]
+    Cast {
+        #[primary_span]
+        span: Span,
+        #[skip_arg]
+        fn_name: String,
+        #[skip_arg]
+        sig: Binder<'a, FnSig<'a>>,
+    },
+    #[suggestion(
+        infer_fps_cast_both,
+        code = "{fn_name} as {found_sig}",
+        style = "hidden",
+        applicability = "maybe-incorrect"
+    )]
+    CastBoth {
+        #[primary_span]
+        span: Span,
+        #[skip_arg]
+        fn_name: String,
+        #[skip_arg]
+        found_sig: Binder<'a, FnSig<'a>>,
+        expected_sig: Binder<'a, FnSig<'a>>,
+    },
+    #[suggestion(
+        infer_fps_cast_both,
+        code = "&({fn_name} as {found_sig})",
+        style = "hidden",
+        applicability = "maybe-incorrect"
+    )]
+    CastBothRef {
+        #[primary_span]
+        span: Span,
+        #[skip_arg]
+        fn_name: String,
+        #[skip_arg]
+        found_sig: Binder<'a, FnSig<'a>>,
+        expected_sig: Binder<'a, FnSig<'a>>,
+    },
+}
+
+#[derive(Subdiagnostic)]
+#[note(infer_fps_items_are_distinct)]
+pub struct FnItemsAreDistinct;
+
+#[derive(Subdiagnostic)]
+#[note(infer_fn_uniq_types)]
+pub struct FnUniqTypes;
+
+#[derive(Subdiagnostic)]
+#[help(infer_fn_consider_casting)]
+pub struct FnConsiderCasting {
+    pub casting: String,
+}
+
+#[derive(Subdiagnostic)]
+pub enum SuggestAccessingField<'a> {
+    #[suggestion(
+        infer_suggest_accessing_field,
+        code = "{snippet}.{name}",
+        applicability = "maybe-incorrect"
+    )]
+    Safe {
+        #[primary_span]
+        span: Span,
+        snippet: String,
+        name: Symbol,
+        ty: Ty<'a>,
+    },
+    #[suggestion(
+        infer_suggest_accessing_field,
+        code = "unsafe {{ {snippet}.{name} }}",
+        applicability = "maybe-incorrect"
+    )]
+    Unsafe {
+        #[primary_span]
+        span: Span,
+        snippet: String,
+        name: Symbol,
+        ty: Ty<'a>,
+    },
+}
+
+#[derive(Subdiagnostic)]
+pub enum SuggestBoxingForReturnImplTrait {
+    #[multipart_suggestion(infer_sbfrit_change_return_type, applicability = "maybe-incorrect")]
+    ChangeReturnType {
+        #[suggestion_part(code = "Box<dyn")]
+        start_sp: Span,
+        #[suggestion_part(code = ">")]
+        end_sp: Span,
+    },
+    #[multipart_suggestion(infer_sbfrit_box_return_expr, applicability = "maybe-incorrect")]
+    BoxReturnExpr {
+        #[suggestion_part(code = "Box::new(")]
+        starts: Vec<Span>,
+        #[suggestion_part(code = ")")]
+        ends: Vec<Span>,
+    },
+}
+
+#[derive(Subdiagnostic)]
+#[multipart_suggestion(infer_stp_wrap_one, applicability = "maybe-incorrect")]
+pub struct SuggestTuplePatternOne {
+    pub variant: String,
+    #[suggestion_part(code = "{variant}(")]
+    pub span_low: Span,
+    #[suggestion_part(code = ")")]
+    pub span_high: Span,
+}
+
+pub struct SuggestTuplePatternMany {
+    pub path: String,
+    pub cause_span: Span,
+    pub compatible_variants: Vec<String>,
+}
+
+impl AddToDiagnostic for SuggestTuplePatternMany {
+    fn add_to_diagnostic_with<F>(self, diag: &mut rustc_errors::Diagnostic, f: F)
+    where
+        F: Fn(&mut Diagnostic, SubdiagnosticMessage) -> SubdiagnosticMessage,
+    {
+        diag.set_arg("path", self.path);
+        let message = f(diag, crate::fluent_generated::infer_stp_wrap_many.into());
+        diag.multipart_suggestions(
+            message,
+            self.compatible_variants.into_iter().map(|variant| {
+                vec![
+                    (self.cause_span.shrink_to_lo(), format!("{}(", variant)),
+                    (self.cause_span.shrink_to_hi(), ")".to_string()),
+                ]
+            }),
+            rustc_errors::Applicability::MaybeIncorrect,
+        );
+    }
+}
+
+#[derive(Subdiagnostic)]
+pub enum TypeErrorAdditionalDiags {
+    #[suggestion(
+        infer_meant_byte_literal,
+        code = "b'{code}'",
+        applicability = "machine-applicable"
+    )]
+    MeantByteLiteral {
+        #[primary_span]
+        span: Span,
+        code: String,
+    },
+    #[suggestion(
+        infer_meant_char_literal,
+        code = "'{code}'",
+        applicability = "machine-applicable"
+    )]
+    MeantCharLiteral {
+        #[primary_span]
+        span: Span,
+        code: String,
+    },
+    #[suggestion(
+        infer_meant_str_literal,
+        code = "\"{code}\"",
+        applicability = "machine-applicable"
+    )]
+    MeantStrLiteral {
+        #[primary_span]
+        span: Span,
+        code: String,
+    },
+    #[suggestion(
+        infer_consider_specifying_length,
+        code = "{length}",
+        applicability = "maybe-incorrect"
+    )]
+    ConsiderSpecifyingLength {
+        #[primary_span]
+        span: Span,
+        length: u64,
+    },
+    #[note(infer_try_cannot_convert)]
+    TryCannotConvert { found: String, expected: String },
+    #[suggestion(infer_tuple_trailing_comma, code = ",", applicability = "machine-applicable")]
+    TupleOnlyComma {
+        #[primary_span]
+        span: Span,
+    },
+    #[multipart_suggestion(infer_tuple_trailing_comma, applicability = "machine-applicable")]
+    TupleAlsoParentheses {
+        #[suggestion_part(code = "(")]
+        span_low: Span,
+        #[suggestion_part(code = ",)")]
+        span_high: Span,
+    },
+    #[suggestion(
+        infer_suggest_add_let_for_letchains,
+        style = "verbose",
+        applicability = "machine-applicable",
+        code = "let "
+    )]
+    AddLetForLetChains {
+        #[primary_span]
+        span: Span,
+    },
+}
+
+#[derive(Diagnostic)]
+pub enum ObligationCauseFailureCode {
+    #[diag(infer_oc_method_compat, code = "E0308")]
+    MethodCompat {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_type_compat, code = "E0308")]
+    TypeCompat {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_const_compat, code = "E0308")]
+    ConstCompat {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_try_compat, code = "E0308")]
+    TryCompat {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_match_compat, code = "E0308")]
+    MatchCompat {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_if_else_different, code = "E0308")]
+    IfElseDifferent {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_no_else, code = "E0317")]
+    NoElse {
+        #[primary_span]
+        span: Span,
+    },
+    #[diag(infer_oc_no_diverge, code = "E0308")]
+    NoDiverge {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_fn_main_correct_type, code = "E0580")]
+    FnMainCorrectType {
+        #[primary_span]
+        span: Span,
+    },
+    #[diag(infer_oc_fn_start_correct_type, code = "E0308")]
+    FnStartCorrectType {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_intrinsic_correct_type, code = "E0308")]
+    IntrinsicCorrectType {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_method_correct_type, code = "E0308")]
+    MethodCorrectType {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_closure_selfref, code = "E0644")]
+    ClosureSelfref {
+        #[primary_span]
+        span: Span,
+    },
+    #[diag(infer_oc_cant_coerce, code = "E0308")]
+    CantCoerce {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_generic, code = "E0308")]
+    Generic {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
 }

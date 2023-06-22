@@ -7,6 +7,7 @@ use crate::ptr;
 #[cfg(any(
     target_arch = "x86",
     target_arch = "arm",
+    target_arch = "m68k",
     target_arch = "mips",
     target_arch = "powerpc",
     target_arch = "powerpc64",
@@ -21,6 +22,7 @@ pub const MIN_ALIGN: usize = 8;
 #[cfg(any(
     target_arch = "x86_64",
     target_arch = "aarch64",
+    target_arch = "loongarch64",
     target_arch = "mips64",
     target_arch = "s390x",
     target_arch = "sparc64",

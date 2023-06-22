@@ -1,8 +1,9 @@
-use rustc_data_structures::fx::FxHashSet;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::sync::Lock;
+use rustc_span::def_id::DefId;
 use rustc_span::Symbol;
 use rustc_target::abi::{Align, Size};
-use std::cmp::{self, Ordering};
+use std::cmp;
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct VariantInfo {
@@ -20,7 +21,25 @@ pub enum SizeKind {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum FieldKind {
+    AdtField,
+    Upvar,
+    GeneratorLocal,
+}
+
+impl std::fmt::Display for FieldKind {
+    fn fmt(&self, w: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FieldKind::AdtField => write!(w, "field"),
+            FieldKind::Upvar => write!(w, "upvar"),
+            FieldKind::GeneratorLocal => write!(w, "local"),
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct FieldInfo {
+    pub kind: FieldKind,
     pub name: Symbol,
     pub offset: u64,
     pub size: u64,
@@ -47,9 +66,29 @@ pub struct TypeSizeInfo {
     pub variants: Vec<VariantInfo>,
 }
 
+pub struct VTableSizeInfo {
+    pub trait_name: String,
+
+    /// Number of entries in a vtable with the current algorithm
+    /// (i.e. with upcasting).
+    pub entries: usize,
+
+    /// Number of entries in a vtable, as-if we did not have trait upcasting.
+    pub entries_ignoring_upcasting: usize,
+
+    /// Number of entries in a vtable needed solely for upcasting
+    /// (i.e. `entries - entries_ignoring_upcasting`).
+    pub entries_for_upcasting: usize,
+
+    /// Cost of having upcasting in % relative to the number of entries without
+    /// upcasting (i.e. `entries_for_upcasting / entries_ignoring_upcasting * 100%`).
+    pub upcasting_cost_percent: f64,
+}
+
 #[derive(Default)]
 pub struct CodeStats {
     type_sizes: Lock<FxHashSet<TypeSizeInfo>>,
+    vtable_sizes: Lock<FxHashMap<DefId, VTableSizeInfo>>,
 }
 
 impl CodeStats {
@@ -66,7 +105,11 @@ impl CodeStats {
         // Sort variants so the largest ones are shown first. A stable sort is
         // used here so that source code order is preserved for all variants
         // that have the same size.
-        variants.sort_by(|info1, info2| info2.size.cmp(&info1.size));
+        // Except for Generators, whose variants are already sorted according to
+        // their yield points in `variant_info_for_generator`.
+        if kind != DataTypeKind::Generator {
+            variants.sort_by_key(|info| cmp::Reverse(info.size));
+        }
         let info = TypeSizeInfo {
             kind,
             type_description: type_desc.to_string(),
@@ -79,19 +122,21 @@ impl CodeStats {
         self.type_sizes.borrow_mut().insert(info);
     }
 
+    pub fn record_vtable_size(&self, trait_did: DefId, trait_name: &str, info: VTableSizeInfo) {
+        let prev = self.vtable_sizes.lock().insert(trait_did, info);
+        assert!(
+            prev.is_none(),
+            "size of vtable for `{trait_name}` ({trait_did:?}) is already recorded"
+        );
+    }
+
     pub fn print_type_sizes(&self) {
         let type_sizes = self.type_sizes.borrow();
         let mut sorted: Vec<_> = type_sizes.iter().collect();
 
         // Primary sort: large-to-small.
         // Secondary sort: description (dictionary order)
-        sorted.sort_by(|info1, info2| {
-            // (reversing cmp order to get large-to-small ordering)
-            match info2.overall_size.cmp(&info1.overall_size) {
-                Ordering::Equal => info1.type_description.cmp(&info2.type_description),
-                other => other,
-            }
-        });
+        sorted.sort_by_key(|info| (cmp::Reverse(info.overall_size), &info.type_description));
 
         for info in sorted {
             let TypeSizeInfo { type_description, overall_size, align, kind, variants, .. } = info;
@@ -145,7 +190,7 @@ impl CodeStats {
                 fields.sort_by_key(|f| (f.offset, f.size));
 
                 for field in fields {
-                    let FieldInfo { ref name, offset, size, align } = field;
+                    let FieldInfo { kind, ref name, offset, size, align } = field;
 
                     if offset > min_offset {
                         let pad = offset - min_offset;
@@ -155,16 +200,16 @@ impl CodeStats {
                     if offset < min_offset {
                         // If this happens it's probably a union.
                         println!(
-                            "print-type-size {indent}field `.{name}`: {size} bytes, \
+                            "print-type-size {indent}{kind} `.{name}`: {size} bytes, \
                                   offset: {offset} bytes, \
                                   alignment: {align} bytes"
                         );
                     } else if info.packed || offset == min_offset {
-                        println!("print-type-size {indent}field `.{name}`: {size} bytes");
+                        println!("print-type-size {indent}{kind} `.{name}`: {size} bytes");
                     } else {
                         // Include field alignment in output only if it caused padding injection
                         println!(
-                            "print-type-size {indent}field `.{name}`: {size} bytes, \
+                            "print-type-size {indent}{kind} `.{name}`: {size} bytes, \
                                   alignment: {align} bytes"
                         );
                     }
@@ -178,6 +223,35 @@ impl CodeStats {
                 Some(diff @ 1..) => println!("print-type-size {indent}end padding: {diff} bytes"),
                 Some(0) => {}
             }
+        }
+    }
+
+    pub fn print_vtable_sizes(&self, crate_name: &str) {
+        let mut infos = std::mem::take(&mut *self.vtable_sizes.lock())
+            .into_iter()
+            .map(|(_did, stats)| stats)
+            .collect::<Vec<_>>();
+
+        // Primary sort: cost % in reverse order (from largest to smallest)
+        // Secondary sort: trait_name
+        infos.sort_by(|a, b| {
+            a.upcasting_cost_percent
+                .total_cmp(&b.upcasting_cost_percent)
+                .reverse()
+                .then_with(|| a.trait_name.cmp(&b.trait_name))
+        });
+
+        for VTableSizeInfo {
+            trait_name,
+            entries,
+            entries_ignoring_upcasting,
+            entries_for_upcasting,
+            upcasting_cost_percent,
+        } in infos
+        {
+            println!(
+                r#"print-vtable-sizes {{ "crate_name": "{crate_name}", "trait_name": "{trait_name}", "entries": "{entries}", "entries_ignoring_upcasting": "{entries_ignoring_upcasting}", "entries_for_upcasting": "{entries_for_upcasting}", "upcasting_cost_percent": "{upcasting_cost_percent}" }}"#
+            );
         }
     }
 }

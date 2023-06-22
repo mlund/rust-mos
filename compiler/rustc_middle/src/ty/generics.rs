@@ -85,10 +85,10 @@ impl GenericParamDef {
     ) -> Option<EarlyBinder<ty::GenericArg<'tcx>>> {
         match self.kind {
             GenericParamDefKind::Type { has_default, .. } if has_default => {
-                Some(tcx.bound_type_of(self.def_id).map_bound(|t| t.into()))
+                Some(tcx.type_of(self.def_id).map_bound(|t| t.into()))
             }
             GenericParamDefKind::Const { has_default } if has_default => {
-                Some(tcx.bound_const_param_default(self.def_id).map_bound(|c| c.into()))
+                Some(tcx.const_param_default(self.def_id).map_bound(|c| c.into()))
             }
             _ => None,
         }
@@ -100,10 +100,10 @@ impl GenericParamDef {
         preceding_substs: &[ty::GenericArg<'tcx>],
     ) -> ty::GenericArg<'tcx> {
         match &self.kind {
-            ty::GenericParamDefKind::Lifetime => tcx.lifetimes.re_static.into(),
-            ty::GenericParamDefKind::Type { .. } => tcx.ty_error().into(),
+            ty::GenericParamDefKind::Lifetime => ty::Region::new_error_misc(tcx).into(),
+            ty::GenericParamDefKind::Type { .. } => tcx.ty_error_misc().into(),
             ty::GenericParamDefKind::Const { .. } => {
-                tcx.const_error(tcx.bound_type_of(self.def_id).subst(tcx, preceding_substs)).into()
+                tcx.const_error_misc(tcx.type_of(self.def_id).subst(tcx, preceding_substs)).into()
             }
         }
     }
@@ -298,7 +298,7 @@ impl<'tcx> Generics {
             .iter()
             .rev()
             .take_while(|param| {
-                param.default_value(tcx).map_or(false, |default| {
+                param.default_value(tcx).is_some_and(|default| {
                     default.subst(tcx, substs) == substs[param.index as usize]
                 })
             })
@@ -341,15 +341,9 @@ impl<'tcx> GenericPredicates<'tcx> {
         &self,
         tcx: TyCtxt<'tcx>,
         substs: SubstsRef<'tcx>,
-    ) -> InstantiatedPredicates<'tcx> {
-        InstantiatedPredicates {
-            predicates: self
-                .predicates
-                .iter()
-                .map(|(p, _)| EarlyBinder(*p).subst(tcx, substs))
-                .collect(),
-            spans: self.predicates.iter().map(|(_, sp)| *sp).collect(),
-        }
+    ) -> impl Iterator<Item = (Predicate<'tcx>, Span)> + DoubleEndedIterator + ExactSizeIterator
+    {
+        EarlyBinder::bind(self.predicates).subst_iter_copied(tcx, substs)
     }
 
     #[instrument(level = "debug", skip(self, tcx))]
@@ -364,7 +358,7 @@ impl<'tcx> GenericPredicates<'tcx> {
         }
         instantiated
             .predicates
-            .extend(self.predicates.iter().map(|(p, _)| EarlyBinder(*p).subst(tcx, substs)));
+            .extend(self.predicates.iter().map(|(p, _)| EarlyBinder::bind(*p).subst(tcx, substs)));
         instantiated.spans.extend(self.predicates.iter().map(|(_, sp)| *sp));
     }
 

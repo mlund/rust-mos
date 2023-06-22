@@ -9,7 +9,7 @@ use rustc_session::parse::{feature_err, ParseSess};
 use rustc_span::symbol::{kw, sym, Ident};
 
 use rustc_span::edition::Edition;
-use rustc_span::{Span, SyntaxContext};
+use rustc_span::Span;
 
 const VALID_FRAGMENT_NAMES_MSG: &str = "valid fragment specifiers are \
                                         `ident`, `block`, `stmt`, `expr`, `pat`, `ty`, `lifetime`, \
@@ -72,7 +72,7 @@ pub(super) fn parse(
                                             // `SyntaxContext::root()` from a foreign crate will
                                             // have the edition of that crate (which we manually
                                             // retrieve via the `edition` parameter).
-                                            if span.ctxt() == SyntaxContext::root() {
+                                            if span.ctxt().is_root() {
                                                 edition
                                             } else {
                                                 span.edition()
@@ -85,7 +85,7 @@ pub(super) fn parse(
                                                     frag.name
                                                 );
                                                 sess.span_diagnostic
-                                                    .struct_span_err(span, &msg)
+                                                    .struct_span_err(span, msg)
                                                     .help(VALID_FRAGMENT_NAMES_MSG)
                                                     .emit();
                                                 token::NonterminalKind::Ident
@@ -171,7 +171,7 @@ fn parse_tree(
                     } else {
                         match delim {
                             Delimiter::Brace => {
-                                // The delimiter is `{`.  This indicates the beginning
+                                // The delimiter is `{`. This indicates the beginning
                                 // of a meta-variable expression (e.g. `${count(ident)}`).
                                 // Try to parse the meta-variable expression.
                                 match MetaVarExpr::parse(&tts, delim_span.entire(), sess) {
@@ -195,12 +195,12 @@ fn parse_tree(
                             _ => {
                                 let tok = pprust::token_kind_to_string(&token::OpenDelim(delim));
                                 let msg = format!("expected `(` or `{{`, found `{}`", tok);
-                                sess.span_diagnostic.span_err(delim_span.entire(), &msg);
+                                sess.span_diagnostic.span_err(delim_span.entire(), msg);
                             }
                         }
                     }
                     // If we didn't find a metavar expression above, then we must have a
-                    // repetition sequence in the macro (e.g. `$(pat)*`).  Parse the
+                    // repetition sequence in the macro (e.g. `$(pat)*`). Parse the
                     // contents of the sequence itself
                     let sequence = parse(tts, parsing_patterns, sess, node_id, features, edition);
                     // Get the Kleene operator and optional separator
@@ -246,7 +246,7 @@ fn parse_tree(
                         "expected identifier, found `{}`",
                         pprust::token_to_string(&token),
                     );
-                    sess.span_diagnostic.span_err(token.span, &msg);
+                    sess.span_diagnostic.span_err(token.span, msg);
                     TokenTree::MetaVar(token.span, Ident::empty())
                 }
 
@@ -358,7 +358,7 @@ fn parse_sep_and_kleene_op(
 // For example, `macro_rules! foo { ( ${length()} ) => {} }`
 fn span_dollar_dollar_or_metavar_in_the_lhs_err(sess: &ParseSess, token: &Token) {
     sess.span_diagnostic
-        .span_err(token.span, &format!("unexpected token: {}", pprust::token_to_string(token)));
+        .span_err(token.span, format!("unexpected token: {}", pprust::token_to_string(token)));
     sess.span_diagnostic.span_note_without_error(
         token.span,
         "`$$` and meta-variable expressions are not allowed inside macro parameter definitions",

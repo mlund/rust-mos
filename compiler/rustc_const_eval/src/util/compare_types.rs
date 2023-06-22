@@ -3,8 +3,8 @@
 //! FIXME: Move this to a more general place. The utility of this extends to
 //! other areas of the compiler as well.
 
-use rustc_infer::infer::{DefiningAnchor, TyCtxtInferExt};
-use rustc_infer::traits::ObligationCause;
+use rustc_infer::infer::TyCtxtInferExt;
+use rustc_middle::traits::{DefiningAnchor, ObligationCause};
 use rustc_middle::ty::{ParamEnv, Ty, TyCtxt};
 use rustc_trait_selection::traits::ObligationCtxt;
 
@@ -58,6 +58,6 @@ pub fn is_subtype<'tcx>(
     // even if they're constrained in our current function.
     //
     // It seems very unlikely that this hides any bugs.
-    let _ = infcx.inner.borrow_mut().opaque_type_storage.take_opaque_types();
+    let _ = infcx.take_opaque_types();
     errors.is_empty()
 }

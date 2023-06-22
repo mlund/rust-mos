@@ -17,7 +17,6 @@
 #![unstable(feature = "test", issue = "50297")]
 #![doc(test(attr(deny(warnings))))]
 #![feature(internal_output_capture)]
-#![feature(is_terminal)]
 #![feature(staged_api)]
 #![feature(process_exitcode_internals)]
 #![feature(panic_can_unwind)]
@@ -116,7 +115,7 @@ pub fn test_main(args: &[String], tests: Vec<TestDescAndFn>, options: Option<Opt
     } else {
         if !opts.nocapture {
             // If we encounter a non-unwinding panic, flush any captured output from the current test,
-            // and stop  capturing output to ensure that the non-unwinding panic message is visible.
+            // and stop capturing output to ensure that the non-unwinding panic message is visible.
             // We also acquire the locks for both output streams to prevent output from other threads
             // from interleaving with the panic message or appearing after it.
             let builtin_panic_hook = panic::take_hook();
@@ -204,7 +203,7 @@ fn make_owned_test(test: &&TestDescAndFn) -> TestDescAndFn {
 }
 
 /// Invoked when unit tests terminate. Returns `Result::Err` if the test is
-/// considered a failure. By default, invokes `report() and checks for a `0`
+/// considered a failure. By default, invokes `report()` and checks for a `0`
 /// result.
 pub fn assert_test_result<T: Termination>(result: T) -> Result<(), String> {
     let code = result.report().to_i32();
@@ -220,14 +219,14 @@ pub fn assert_test_result<T: Termination>(result: T) -> Result<(), String> {
 
 struct FilteredTests {
     tests: Vec<(TestId, TestDescAndFn)>,
-    benchs: Vec<(TestId, TestDescAndFn)>,
+    benches: Vec<(TestId, TestDescAndFn)>,
     next_id: usize,
 }
 
 impl FilteredTests {
     fn add_bench(&mut self, desc: TestDesc, testfn: TestFn) {
         let test = TestDescAndFn { desc, testfn };
-        self.benchs.push((TestId(self.next_id), test));
+        self.benches.push((TestId(self.next_id), test));
         self.next_id += 1;
     }
     fn add_test(&mut self, desc: TestDesc, testfn: TestFn) {
@@ -246,7 +245,7 @@ impl FilteredTests {
         self.add_test(desc, testfn);
     }
     fn total_len(&self) -> usize {
-        self.tests.len() + self.benchs.len()
+        self.tests.len() + self.benches.len()
     }
 }
 
@@ -291,7 +290,7 @@ where
 
     let tests_len = tests.len();
 
-    let mut filtered = FilteredTests { tests: Vec::new(), benchs: Vec::new(), next_id: 0 };
+    let mut filtered = FilteredTests { tests: Vec::new(), benches: Vec::new(), next_id: 0 };
 
     for test in filter_tests(opts, tests) {
         let mut desc = test.desc;
@@ -458,7 +457,7 @@ where
 
     if opts.bench_benchmarks {
         // All benchmarks run at the end, in serial.
-        for (id, b) in filtered.benchs {
+        for (id, b) in filtered.benches {
             let event = TestEvent::TeWait(b.desc.clone());
             notify_about_test_event(event)?;
             let join_handle = run_test(opts, false, id, b, run_strategy, tx.clone());
@@ -789,7 +788,7 @@ fn run_test_in_spawned_subprocess(
         }
     });
     let record_result2 = record_result.clone();
-    panic::set_hook(Box::new(move |info| record_result2(Some(&info))));
+    panic::set_hook(Box::new(move |info| record_result2(Some(info))));
     if let Err(message) = testfn() {
         panic!("{}", message);
     }

@@ -180,7 +180,7 @@ fn make_tuple_field_list(
 ) -> Option<ast::FieldList> {
     let args = call_expr.arg_list()?.args();
     let tuple_fields = args.map(|arg| {
-        let ty = expr_ty(ctx, arg, &scope).unwrap_or_else(make::ty_placeholder);
+        let ty = expr_ty(ctx, arg, scope).unwrap_or_else(make::ty_placeholder);
         make::tuple_field(None, ty)
     });
     Some(make::tuple_field_list(tuple_fields).into())
@@ -192,7 +192,7 @@ fn expr_ty(
     scope: &hir::SemanticsScope<'_>,
 ) -> Option<ast::Type> {
     let ty = ctx.sema.type_of_expr(&arg).map(|it| it.adjusted())?;
-    let text = ty.display_source_code(ctx.db(), scope.module().into()).ok()?;
+    let text = ty.display_source_code(ctx.db(), scope.module().into(), false).ok()?;
     Some(make::ty(&text))
 }
 

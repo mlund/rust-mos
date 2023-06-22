@@ -2,7 +2,7 @@
 
 use rustc_ast::ast;
 use rustc_ast::HasAttrs;
-use rustc_span::{symbol::sym, Span, Symbol};
+use rustc_span::{symbol::sym, Span};
 
 use self::doc_comment::DocCommentFormatter;
 use crate::comment::{contains_comment, rewrite_doc_comment, CommentStyle};
@@ -18,20 +18,6 @@ use crate::types::{rewrite_path, PathContext};
 use crate::utils::{count_newlines, mk_sp};
 
 mod doc_comment;
-
-pub(crate) fn contains_name(attrs: &[ast::Attribute], name: Symbol) -> bool {
-    attrs.iter().any(|attr| attr.has_name(name))
-}
-
-pub(crate) fn first_attr_value_str_by_name(
-    attrs: &[ast::Attribute],
-    name: Symbol,
-) -> Option<Symbol> {
-    attrs
-        .iter()
-        .find(|attr| attr.has_name(name))
-        .and_then(|attr| attr.value_str())
-}
 
 /// Returns attributes on the given statement.
 pub(crate) fn get_attrs_from_stmt(stmt: &ast::Stmt) -> &[ast::Attribute] {
@@ -336,7 +322,7 @@ impl Rewrite for ast::Attribute {
         } else {
             let should_skip = self
                 .ident()
-                .map(|s| context.skip_context.skip_attribute(s.name.as_str()))
+                .map(|s| context.skip_context.attributes.skip(s.name.as_str()))
                 .unwrap_or(false);
             let prefix = attr_prefix(self);
 
@@ -390,7 +376,7 @@ impl Rewrite for [ast::Attribute] {
 
         // Determine if the source text is annotated with `#[rustfmt::skip::attributes(derive)]`
         // or `#![rustfmt::skip::attributes(derive)]`
-        let skip_derives = context.skip_context.skip_attribute("derive");
+        let skip_derives = context.skip_context.attributes.skip("derive");
 
         // This is not just a simple map because we need to handle doc comments
         // (where we take as many doc comment attributes as possible) and possibly

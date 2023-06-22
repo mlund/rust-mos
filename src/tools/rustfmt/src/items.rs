@@ -560,7 +560,7 @@ impl<'a> FmtVisitor<'a> {
         let variant_body = match field.data {
             ast::VariantData::Tuple(..) | ast::VariantData::Struct(..) => format_struct(
                 &context,
-                &StructParts::from_variant(field),
+                &StructParts::from_variant(field, &context),
                 self.block_indent,
                 Some(one_line_width),
             )?,
@@ -951,14 +951,14 @@ impl<'a> StructParts<'a> {
         format_header(context, self.prefix, self.ident, self.vis, offset)
     }
 
-    fn from_variant(variant: &'a ast::Variant) -> Self {
+    fn from_variant(variant: &'a ast::Variant, context: &RewriteContext<'_>) -> Self {
         StructParts {
             prefix: "",
             ident: variant.ident,
             vis: &DEFAULT_VISIBILITY,
             def: &variant.data,
             generics: None,
-            span: variant.span,
+            span: enum_variant_span(variant, context),
         }
     }
 
@@ -976,6 +976,25 @@ impl<'a> StructParts<'a> {
             generics: Some(generics),
             span: item.span,
         }
+    }
+}
+
+fn enum_variant_span(variant: &ast::Variant, context: &RewriteContext<'_>) -> Span {
+    use ast::VariantData::*;
+    if let Some(ref anon_const) = variant.disr_expr {
+        let span_before_consts = variant.span.until(anon_const.value.span);
+        let hi = match &variant.data {
+            Struct(..) => context
+                .snippet_provider
+                .span_after_last(span_before_consts, "}"),
+            Tuple(..) => context
+                .snippet_provider
+                .span_after_last(span_before_consts, ")"),
+            Unit(..) => variant.ident.span.hi(),
+        };
+        mk_sp(span_before_consts.lo(), hi)
+    } else {
+        variant.span
     }
 }
 
@@ -1084,7 +1103,11 @@ pub(crate) fn format_trait(
             let item_snippet = context.snippet(item.span);
             if let Some(lo) = item_snippet.find('/') {
                 // 1 = `{`
-                let comment_hi = body_lo - BytePos(1);
+                let comment_hi = if generics.params.len() > 0 {
+                    generics.span.lo() - BytePos(1)
+                } else {
+                    body_lo - BytePos(1)
+                };
                 let comment_lo = item.span.lo() + BytePos(lo as u32);
                 if comment_lo < comment_hi {
                     match recover_missing_comment_in_span(
@@ -1241,7 +1264,7 @@ fn format_unit_struct(
 ) -> Option<String> {
     let header_str = format_header(context, p.prefix, p.ident, p.vis, offset);
     let generics_str = if let Some(generics) = p.generics {
-        let hi = context.snippet_provider.span_before(p.span, ";");
+        let hi = context.snippet_provider.span_before_last(p.span, ";");
         format_generics(
             context,
             generics,
@@ -1274,7 +1297,7 @@ pub(crate) fn format_struct_struct(
     let header_hi = struct_parts.ident.span.hi();
     let body_lo = if let Some(generics) = struct_parts.generics {
         // Adjust the span to start at the end of the generic arguments before searching for the '{'
-        let span = span.with_lo(generics.span.hi());
+        let span = span.with_lo(generics.where_clause.span.hi());
         context.snippet_provider.span_after(span, "{")
     } else {
         context.snippet_provider.span_after(span, "{")
@@ -1800,13 +1823,15 @@ pub(crate) struct StaticParts<'a> {
 
 impl<'a> StaticParts<'a> {
     pub(crate) fn from_item(item: &'a ast::Item) -> Self {
-        let (defaultness, prefix, ty, mutability, expr) = match item.kind {
-            ast::ItemKind::Static(ref ty, mutability, ref expr) => {
-                (None, "static", ty, mutability, expr)
-            }
-            ast::ItemKind::Const(defaultness, ref ty, ref expr) => {
-                (Some(defaultness), "const", ty, ast::Mutability::Not, expr)
-            }
+        let (defaultness, prefix, ty, mutability, expr) = match &item.kind {
+            ast::ItemKind::Static(s) => (None, "static", &s.ty, s.mutability, &s.expr),
+            ast::ItemKind::Const(c) => (
+                Some(c.defaultness),
+                "const",
+                &c.ty,
+                ast::Mutability::Not,
+                &c.expr,
+            ),
             _ => unreachable!(),
         };
         StaticParts {
@@ -1822,10 +1847,8 @@ impl<'a> StaticParts<'a> {
     }
 
     pub(crate) fn from_trait_item(ti: &'a ast::AssocItem) -> Self {
-        let (defaultness, ty, expr_opt) = match ti.kind {
-            ast::AssocItemKind::Const(defaultness, ref ty, ref expr_opt) => {
-                (defaultness, ty, expr_opt)
-            }
+        let (defaultness, ty, expr_opt) = match &ti.kind {
+            ast::AssocItemKind::Const(c) => (c.defaultness, &c.ty, &c.expr),
             _ => unreachable!(),
         };
         StaticParts {
@@ -1841,8 +1864,8 @@ impl<'a> StaticParts<'a> {
     }
 
     pub(crate) fn from_impl_item(ii: &'a ast::AssocItem) -> Self {
-        let (defaultness, ty, expr) = match ii.kind {
-            ast::AssocItemKind::Const(defaultness, ref ty, ref expr) => (defaultness, ty, expr),
+        let (defaultness, ty, expr) = match &ii.kind {
+            ast::AssocItemKind::Const(c) => (c.defaultness, &c.ty, &c.expr),
             _ => unreachable!(),
         };
         StaticParts {
@@ -2602,7 +2625,7 @@ fn rewrite_params(
         &param_items,
         context
             .config
-            .fn_args_layout()
+            .fn_params_layout()
             .to_list_tactic(param_items.len()),
         Separator::Comma,
         one_line_budget,

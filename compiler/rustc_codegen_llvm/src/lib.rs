@@ -5,11 +5,13 @@
 //! This API is completely unstable and subject to change.
 
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![feature(hash_raw_entry)]
-#![feature(let_chains)]
 #![feature(extern_types)]
-#![feature(once_cell)]
+#![feature(hash_raw_entry)]
 #![feature(iter_intersperse)]
+#![feature(let_chains)]
+#![feature(never_type)]
+#![feature(impl_trait_in_assoc_type)]
+#![feature(c_str_literals)]
 #![recursion_limit = "256"]
 #![allow(rustc::potential_query_instability)]
 #![deny(rustc::untranslatable_diagnostic)]
@@ -22,7 +24,7 @@ extern crate tracing;
 
 use back::write::{create_informational_target_machine, create_target_machine};
 
-use errors::FailParsingTargetMachineConfigToTargetMachine;
+use errors::ParseTargetMachineConfig;
 pub use llvm_util::target_features;
 use rustc_ast::expand::allocator::AllocatorKind;
 use rustc_codegen_ssa::back::lto::{LtoModuleCodegen, SerializedModule, ThinModule};
@@ -32,11 +34,12 @@ use rustc_codegen_ssa::back::write::{
 use rustc_codegen_ssa::traits::*;
 use rustc_codegen_ssa::ModuleCodegen;
 use rustc_codegen_ssa::{CodegenResults, CompiledModule};
-use rustc_data_structures::fx::FxHashMap;
-use rustc_errors::{ErrorGuaranteed, FatalError, Handler};
+use rustc_data_structures::fx::FxIndexMap;
+use rustc_errors::{DiagnosticMessage, ErrorGuaranteed, FatalError, Handler, SubdiagnosticMessage};
+use rustc_fluent_macro::fluent_messages;
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
-use rustc_middle::ty::query::Providers;
+use rustc_middle::query::Providers;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{OptLevel, OutputFilenames, PrintRequest};
 use rustc_session::Session;
@@ -68,7 +71,7 @@ mod declare;
 mod errors;
 mod intrinsic;
 
-// The following is a work around that replaces `pub mod llvm;` and that fixes issue 53912.
+// The following is a workaround that replaces `pub mod llvm;` and that fixes issue 53912.
 #[path = "llvm/mod.rs"]
 mod llvm_;
 pub mod llvm {
@@ -81,6 +84,8 @@ mod type_;
 mod type_of;
 mod va_arg;
 mod value;
+
+fluent_messages! { "../messages.ftl" }
 
 #[derive(Clone)]
 pub struct LlvmCodegenBackend(());
@@ -169,6 +174,7 @@ impl WriteBackendMethods for LlvmCodegenBackend {
     type Module = ModuleLlvm;
     type ModuleBuffer = back::lto::ModuleBuffer;
     type TargetMachine = &'static mut llvm::TargetMachine;
+    type TargetMachineError = crate::errors::LlvmError<'static>;
     type ThinData = back::lto::ThinData;
     type ThinBuffer = back::lto::ThinBuffer;
     fn print_pass_timings(&self) {
@@ -244,6 +250,10 @@ impl LlvmCodegenBackend {
 }
 
 impl CodegenBackend for LlvmCodegenBackend {
+    fn locale_resource(&self) -> &'static str {
+        crate::DEFAULT_LOCALE_RESOURCE
+    }
+
     fn init(&self, sess: &Session) {
         llvm_util::init(sess); // Make sure llvm is inited
     }
@@ -346,18 +356,18 @@ impl CodegenBackend for LlvmCodegenBackend {
         ongoing_codegen: Box<dyn Any>,
         sess: &Session,
         outputs: &OutputFilenames,
-    ) -> Result<(CodegenResults, FxHashMap<WorkProductId, WorkProduct>), ErrorGuaranteed> {
+    ) -> Result<(CodegenResults, FxIndexMap<WorkProductId, WorkProduct>), ErrorGuaranteed> {
         let (codegen_results, work_products) = ongoing_codegen
             .downcast::<rustc_codegen_ssa::back::write::OngoingCodegen<LlvmCodegenBackend>>()
             .expect("Expected LlvmCodegenBackend's OngoingCodegen, found Box<Any>")
             .join(sess);
 
-        sess.time("llvm_dump_timing_file", || {
-            if sess.opts.unstable_opts.llvm_time_trace {
+        if sess.opts.unstable_opts.llvm_time_trace {
+            sess.time("llvm_dump_timing_file", || {
                 let file_name = outputs.with_extension("llvm_timings.json");
                 llvm_util::time_trace_profiler_finish(&file_name);
-            }
-        });
+            });
+        }
 
         Ok((codegen_results, work_products))
     }
@@ -416,8 +426,7 @@ impl ModuleLlvm {
             let tm = match (cgcx.tm_factory)(tm_factory_config) {
                 Ok(m) => m,
                 Err(e) => {
-                    handler.emit_err(FailParsingTargetMachineConfigToTargetMachine { error: e });
-                    return Err(FatalError);
+                    return Err(handler.emit_almost_fatal(ParseTargetMachineConfig(e)));
                 }
             };
 

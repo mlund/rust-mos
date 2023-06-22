@@ -1,15 +1,11 @@
 use crate::cgu_reuse_tracker::CguReuseTracker;
 use crate::code_stats::CodeStats;
-pub use crate::code_stats::{DataTypeKind, FieldInfo, SizeKind, VariantInfo};
-use crate::config::{self, CrateType, InstrumentCoverage, OptLevel, OutputType, SwitchWithOptPath};
-use crate::errors::{
-    BranchProtectionRequiresAArch64, CannotEnableCrtStaticLinux, CannotMixAndMatchSanitizers,
-    LinkerPluginToWindowsNotSupported, NotCircumventFeature, ProfileSampleUseFileDoesNotExist,
-    ProfileUseFileDoesNotExist, SanitizerCfiEnabled, SanitizerNotSupported, SanitizersNotSupported,
-    SkippingConstChecks, SplitDebugInfoUnstablePlatform, StackProtectorNotSupportedForTarget,
-    TargetRequiresUnwindTables, UnleashedFeatureHelp, UnstableVirtualFunctionElimination,
-    UnsupportedDwarfVersion,
+pub use crate::code_stats::{DataTypeKind, FieldInfo, FieldKind, SizeKind, VariantInfo};
+use crate::config::Input;
+use crate::config::{
+    self, CrateType, InstrumentCoverage, OptLevel, OutFileName, OutputType, SwitchWithOptPath,
 };
+use crate::errors;
 use crate::parse::{add_feature_diagnostics, ParseSess};
 use crate::search_paths::{PathKind, SearchPath};
 use crate::{filesearch, lint};
@@ -17,7 +13,7 @@ use crate::{filesearch, lint};
 pub use rustc_ast::attr::MarkedAttrs;
 pub use rustc_ast::Attribute;
 use rustc_data_structures::flock;
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_data_structures::fx::{FxHashMap, FxIndexSet};
 use rustc_data_structures::jobserver::{self, Client};
 use rustc_data_structures::profiling::{duration_to_secs_str, SelfProfiler, SelfProfilerRef};
 use rustc_data_structures::sync::{
@@ -30,12 +26,13 @@ use rustc_errors::registry::Registry;
 use rustc_errors::{
     error_code, fallback_fluent_bundle, DiagnosticBuilder, DiagnosticId, DiagnosticMessage,
     ErrorGuaranteed, FluentBundle, IntoDiagnostic, LazyFallbackBundle, MultiSpan, Noted,
+    TerminalUrl,
 };
 use rustc_macros::HashStable_Generic;
 pub use rustc_span::def_id::StableCrateId;
 use rustc_span::edition::Edition;
 use rustc_span::source_map::{FileLoader, RealFileLoader, SourceMap, Span};
-use rustc_span::{sym, SourceFileHashAlgorithm, Symbol};
+use rustc_span::{SourceFileHashAlgorithm, Symbol};
 use rustc_target::asm::InlineAsmArch;
 use rustc_target::spec::{CodeModel, PanicStrategy, RelocModel, RelroLevel};
 use rustc_target::spec::{
@@ -133,8 +130,13 @@ pub struct Limits {
     pub move_size_limit: Limit,
     /// The maximum length of types during monomorphization.
     pub type_length_limit: Limit,
-    /// The maximum blocks a const expression can evaluate.
-    pub const_eval_limit: Limit,
+}
+
+pub struct CompilerIO {
+    pub input: Input,
+    pub output_dir: Option<PathBuf>,
+    pub output_file: Option<OutFileName>,
+    pub temps_dir: Option<PathBuf>,
 }
 
 /// Represents the data associated with a compilation
@@ -147,16 +149,15 @@ pub struct Session {
     pub target_tlib_path: Lrc<SearchPath>,
     pub parse_sess: ParseSess,
     pub sysroot: PathBuf,
-    /// The name of the root source file of the crate, in the local file system.
-    /// `None` means that there is no source file.
-    pub local_crate_source_file: Option<PathBuf>,
+    /// Input, input file path and output file path to this compilation process.
+    pub io: CompilerIO,
 
     crate_types: OnceCell<Vec<CrateType>>,
     /// The `stable_crate_id` is constructed out of the crate name and all the
     /// `-C metadata` arguments passed to the compiler. Its value forms a unique
     /// global identifier for the crate. It is used to allow multiple crates
     /// with the same name to coexist. See the
-    /// `rustc_codegen_llvm::back::symbol_names` module for more information.
+    /// `rustc_symbol_mangling` crate for more information.
     pub stable_crate_id: OnceCell<StableCrateId>,
 
     features: OnceCell<rustc_feature::Features>,
@@ -197,7 +198,7 @@ pub struct Session {
     pub ctfe_backtrace: Lock<CtfeBacktrace>,
 
     /// This tracks where `-Zunleash-the-miri-inside-of-you` was used to get around a
-    /// const check, optionally with the relevant feature gate.  We use this to
+    /// const check, optionally with the relevant feature gate. We use this to
     /// warn about unleashing, but with a single diagnostic instead of dozens that
     /// drown everything else in noise.
     miri_unleashed_features: Lock<Vec<(Span, Option<Symbol>)>>,
@@ -206,10 +207,13 @@ pub struct Session {
     pub asm_arch: Option<InlineAsmArch>,
 
     /// Set of enabled features for the current target.
-    pub target_features: FxHashSet<Symbol>,
+    pub target_features: FxIndexSet<Symbol>,
 
     /// Set of enabled features for the current target, including unstable ones.
-    pub unstable_target_features: FxHashSet<Symbol>,
+    pub unstable_target_features: FxIndexSet<Symbol>,
+
+    /// The version of the rustc process, possibly including a commit hash and description.
+    pub cfg_version: &'static str,
 }
 
 pub struct PerfStats {
@@ -223,9 +227,42 @@ pub struct PerfStats {
     pub normalize_projection_ty: AtomicUsize,
 }
 
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+pub enum MetadataKind {
+    None,
+    Uncompressed,
+    Compressed,
+}
+
+#[derive(Clone, Copy)]
+pub enum CodegenUnits {
+    /// Specified by the user. In this case we try fairly hard to produce the
+    /// number of CGUs requested.
+    User(usize),
+
+    /// A default value, i.e. not specified by the user. In this case we take
+    /// more liberties about CGU formation, e.g. avoid producing very small
+    /// CGUs.
+    Default(usize),
+}
+
+impl CodegenUnits {
+    pub fn as_usize(self) -> usize {
+        match self {
+            CodegenUnits::User(n) => n,
+            CodegenUnits::Default(n) => n,
+        }
+    }
+}
+
 impl Session {
     pub fn miri_unleashed_feature(&self, span: Span, feature_gate: Option<Symbol>) {
         self.miri_unleashed_features.lock().push((span, feature_gate));
+    }
+
+    pub fn local_crate_source_file(&self) -> Option<PathBuf> {
+        let path = self.io.input.opt_path()?;
+        Some(self.opts.file_path_mapping().map_prefix(path).0.into_owned())
     }
 
     fn check_miri_unleashed_features(&self) {
@@ -233,15 +270,15 @@ impl Session {
         if !unleashed_features.is_empty() {
             let mut must_err = false;
             // Create a diagnostic pointing at where things got unleashed.
-            self.emit_warning(SkippingConstChecks {
+            self.emit_warning(errors::SkippingConstChecks {
                 unleashed_features: unleashed_features
                     .iter()
                     .map(|(span, gate)| {
                         gate.map(|gate| {
                             must_err = true;
-                            UnleashedFeatureHelp::Named { span: *span, gate }
+                            errors::UnleashedFeatureHelp::Named { span: *span, gate }
                         })
-                        .unwrap_or(UnleashedFeatureHelp::Unnamed { span: *span })
+                        .unwrap_or(errors::UnleashedFeatureHelp::Unnamed { span: *span })
                     })
                     .collect(),
             });
@@ -249,7 +286,7 @@ impl Session {
             // If we should err, make sure we did.
             if must_err && self.has_errors().is_none() {
                 // We have skipped a feature gate, and not run into other errors... reject.
-                self.emit_err(NotCircumventFeature);
+                self.emit_err(errors::NotCircumventFeature);
             }
         }
     }
@@ -279,6 +316,43 @@ impl Session {
 
     pub fn crate_types(&self) -> &[CrateType] {
         self.crate_types.get().unwrap().as_slice()
+    }
+
+    /// Returns true if the crate is a testing one.
+    pub fn is_test_crate(&self) -> bool {
+        self.opts.test
+    }
+
+    pub fn needs_crate_hash(&self) -> bool {
+        // Why is the crate hash needed for these configurations?
+        // - debug_assertions: for the "fingerprint the result" check in
+        //   `rustc_query_system::query::plumbing::execute_job`.
+        // - incremental: for query lookups.
+        // - needs_metadata: for putting into crate metadata.
+        // - instrument_coverage: for putting into coverage data (see
+        //   `hash_mir_source`).
+        cfg!(debug_assertions)
+            || self.opts.incremental.is_some()
+            || self.needs_metadata()
+            || self.instrument_coverage()
+    }
+
+    pub fn metadata_kind(&self) -> MetadataKind {
+        self.crate_types()
+            .iter()
+            .map(|ty| match *ty {
+                CrateType::Executable | CrateType::Staticlib | CrateType::Cdylib => {
+                    MetadataKind::None
+                }
+                CrateType::Rlib => MetadataKind::Uncompressed,
+                CrateType::Dylib | CrateType::ProcMacro => MetadataKind::Compressed,
+            })
+            .max()
+            .unwrap_or(MetadataKind::None)
+    }
+
+    pub fn needs_metadata(&self) -> bool {
+        self.metadata_kind() != MetadataKind::None
     }
 
     pub fn init_crate_types(&self, crate_types: Vec<CrateType>) {
@@ -440,20 +514,6 @@ impl Session {
     }
     #[rustc_lint_diagnostics]
     #[track_caller]
-    pub fn span_err_or_warn<S: Into<MultiSpan>>(
-        &self,
-        is_warning: bool,
-        sp: S,
-        msg: impl Into<DiagnosticMessage>,
-    ) {
-        if is_warning {
-            self.span_warn(sp, msg);
-        } else {
-            self.span_err(sp, msg);
-        }
-    }
-    #[rustc_lint_diagnostics]
-    #[track_caller]
     pub fn span_err<S: Into<MultiSpan>>(
         &self,
         sp: S,
@@ -471,6 +531,8 @@ impl Session {
         self.diagnostic().span_err_with_code(sp, msg, code)
     }
     #[rustc_lint_diagnostics]
+    #[allow(rustc::untranslatable_diagnostic)]
+    #[allow(rustc::diagnostic_outside_of_impl)]
     pub fn err(&self, msg: impl Into<DiagnosticMessage>) -> ErrorGuaranteed {
         self.diagnostic().err(msg)
     }
@@ -571,12 +633,16 @@ impl Session {
             ))
         }
     }
+
+    #[rustc_lint_diagnostics]
     #[allow(rustc::untranslatable_diagnostic)]
     #[allow(rustc::diagnostic_outside_of_impl)]
     #[track_caller]
     pub fn span_warn<S: Into<MultiSpan>>(&self, sp: S, msg: impl Into<DiagnosticMessage>) {
         self.diagnostic().span_warn(sp, msg)
     }
+
+    #[rustc_lint_diagnostics]
     #[allow(rustc::untranslatable_diagnostic)]
     #[allow(rustc::diagnostic_outside_of_impl)]
     pub fn span_warn_with_code<S: Into<MultiSpan>>(
@@ -587,10 +653,26 @@ impl Session {
     ) {
         self.diagnostic().span_warn_with_code(sp, msg, code)
     }
+
+    #[rustc_lint_diagnostics]
+    #[allow(rustc::untranslatable_diagnostic)]
+    #[allow(rustc::diagnostic_outside_of_impl)]
     pub fn warn(&self, msg: impl Into<DiagnosticMessage>) {
         self.diagnostic().warn(msg)
     }
-    /// Delay a span_bug() call until abort_if_errors()
+
+    /// Ensures that compilation cannot succeed.
+    ///
+    /// If this function has been called but no errors have been emitted and
+    /// compilation succeeds, it will cause an internal compiler error (ICE).
+    ///
+    /// This can be used in code paths that should never run on successful compilations.
+    /// For example, it can be used to create an [`ErrorGuaranteed`]
+    /// (but you should prefer threading through the [`ErrorGuaranteed`] from an error emission directly).
+    ///
+    /// If no span is available, use [`DUMMY_SP`].
+    ///
+    /// [`DUMMY_SP`]: rustc_span::DUMMY_SP
     #[track_caller]
     pub fn delay_span_bug<S: Into<MultiSpan>>(
         &self,
@@ -617,11 +699,17 @@ impl Session {
         self.diagnostic().delay_good_path_bug(msg)
     }
 
+    #[rustc_lint_diagnostics]
+    #[allow(rustc::untranslatable_diagnostic)]
+    #[allow(rustc::diagnostic_outside_of_impl)]
     pub fn note_without_error(&self, msg: impl Into<DiagnosticMessage>) {
         self.diagnostic().note_without_error(msg)
     }
 
     #[track_caller]
+    #[rustc_lint_diagnostics]
+    #[allow(rustc::untranslatable_diagnostic)]
+    #[allow(rustc::diagnostic_outside_of_impl)]
     pub fn span_note_without_error<S: Into<MultiSpan>>(
         &self,
         sp: S,
@@ -629,6 +717,8 @@ impl Session {
     ) {
         self.diagnostic().span_note_without_error(sp, msg)
     }
+
+    #[rustc_lint_diagnostics]
     #[allow(rustc::untranslatable_diagnostic)]
     #[allow(rustc::diagnostic_outside_of_impl)]
     pub fn struct_note_without_error(
@@ -686,8 +776,28 @@ impl Session {
         self.opts.unstable_opts.sanitizer.contains(SanitizerSet::CFI)
     }
 
+    pub fn is_sanitizer_cfi_canonical_jump_tables_disabled(&self) -> bool {
+        self.opts.unstable_opts.sanitizer_cfi_canonical_jump_tables == Some(false)
+    }
+
+    pub fn is_sanitizer_cfi_canonical_jump_tables_enabled(&self) -> bool {
+        self.opts.unstable_opts.sanitizer_cfi_canonical_jump_tables == Some(true)
+    }
+
+    pub fn is_sanitizer_cfi_generalize_pointers_enabled(&self) -> bool {
+        self.opts.unstable_opts.sanitizer_cfi_generalize_pointers == Some(true)
+    }
+
+    pub fn is_sanitizer_cfi_normalize_integers_enabled(&self) -> bool {
+        self.opts.unstable_opts.sanitizer_cfi_normalize_integers == Some(true)
+    }
+
     pub fn is_sanitizer_kcfi_enabled(&self) -> bool {
         self.opts.unstable_opts.sanitizer.contains(SanitizerSet::KCFI)
+    }
+
+    pub fn is_split_lto_unit_enabled(&self) -> bool {
+        self.opts.unstable_opts.split_lto_unit == Some(true)
     }
 
     /// Check whether this compile session and crate type use static crt.
@@ -731,7 +841,7 @@ impl Session {
     }
 
     pub fn generate_proc_macro_decls_symbol(&self, stable_crate_id: StableCrateId) -> String {
-        format!("__rustc_proc_macro_decls_{:08x}__", stable_crate_id.to_u64())
+        format!("__rustc_proc_macro_decls_{:08x}__", stable_crate_id.as_u64())
     }
 
     pub fn target_filesearch(&self, kind: PathKind) -> filesearch::FileSearch<'_> {
@@ -846,10 +956,14 @@ impl Session {
 
     /// We want to know if we're allowed to do an optimization for crate foo from -z fuel=foo=n.
     /// This expends fuel if applicable, and records fuel if applicable.
-    pub fn consider_optimizing<T: Fn() -> String>(&self, crate_name: &str, msg: T) -> bool {
+    pub fn consider_optimizing(
+        &self,
+        get_crate_name: impl Fn() -> Symbol,
+        msg: impl Fn() -> String,
+    ) -> bool {
         let mut ret = true;
         if let Some((ref c, _)) = self.opts.unstable_opts.fuel {
-            if c == crate_name {
+            if c == get_crate_name().as_str() {
                 assert_eq!(self.threads(), 1);
                 let mut fuel = self.optimization_fuel.lock();
                 ret = fuel.remaining != 0;
@@ -858,7 +972,7 @@ impl Session {
                         // We only call `msg` in case we can actually emit warnings.
                         // Otherwise, this could cause a `delay_good_path_bug` to
                         // trigger (issue #79546).
-                        self.warn(&format!("optimization-fuel-exhausted: {}", msg()));
+                        self.emit_warning(errors::OptimisationFuelExhausted { msg: msg() });
                     }
                     fuel.out_of_fuel = true;
                 } else if fuel.remaining > 0 {
@@ -867,7 +981,7 @@ impl Session {
             }
         }
         if let Some(ref c) = self.opts.unstable_opts.print_fuel {
-            if c == crate_name {
+            if c == get_crate_name().as_str() {
                 assert_eq!(self.threads(), 1);
                 self.print_fuel.fetch_add(1, SeqCst);
             }
@@ -875,23 +989,24 @@ impl Session {
         ret
     }
 
-    pub fn rust_2015(&self) -> bool {
-        self.edition() == Edition::Edition2015
+    /// Is this edition 2015?
+    pub fn is_rust_2015(&self) -> bool {
+        self.edition().is_rust_2015()
     }
 
     /// Are we allowed to use features from the Rust 2018 edition?
     pub fn rust_2018(&self) -> bool {
-        self.edition() >= Edition::Edition2018
+        self.edition().rust_2018()
     }
 
     /// Are we allowed to use features from the Rust 2021 edition?
     pub fn rust_2021(&self) -> bool {
-        self.edition() >= Edition::Edition2021
+        self.edition().rust_2021()
     }
 
     /// Are we allowed to use features from the Rust 2024 edition?
     pub fn rust_2024(&self) -> bool {
-        self.edition() >= Edition::Edition2024
+        self.edition().rust_2024()
     }
 
     /// Returns `true` if we cannot skip the PLT for shared library calls.
@@ -917,44 +1032,10 @@ impl Session {
     /// Checks if LLVM lifetime markers should be emitted.
     pub fn emit_lifetime_markers(&self) -> bool {
         self.opts.optimize != config::OptLevel::No
-        // AddressSanitizer uses lifetimes to detect use after scope bugs.
+        // AddressSanitizer and KernelAddressSanitizer uses lifetimes to detect use after scope bugs.
         // MemorySanitizer uses lifetimes to detect use of uninitialized stack variables.
         // HWAddressSanitizer will use lifetimes to detect use after scope bugs in the future.
-        || self.opts.unstable_opts.sanitizer.intersects(SanitizerSet::ADDRESS | SanitizerSet::MEMORY | SanitizerSet::HWADDRESS)
-    }
-
-    pub fn is_proc_macro_attr(&self, attr: &Attribute) -> bool {
-        [sym::proc_macro, sym::proc_macro_attribute, sym::proc_macro_derive]
-            .iter()
-            .any(|kind| attr.has_name(*kind))
-    }
-
-    pub fn contains_name(&self, attrs: &[Attribute], name: Symbol) -> bool {
-        attrs.iter().any(|item| item.has_name(name))
-    }
-
-    pub fn find_by_name<'a>(
-        &'a self,
-        attrs: &'a [Attribute],
-        name: Symbol,
-    ) -> Option<&'a Attribute> {
-        attrs.iter().find(|attr| attr.has_name(name))
-    }
-
-    pub fn filter_by_name<'a>(
-        &'a self,
-        attrs: &'a [Attribute],
-        name: Symbol,
-    ) -> impl Iterator<Item = &'a Attribute> {
-        attrs.iter().filter(move |attr| attr.has_name(name))
-    }
-
-    pub fn first_attr_value_str_by_name(
-        &self,
-        attrs: &[Attribute],
-        name: Symbol,
-    ) -> Option<Symbol> {
-        attrs.iter().find(|at| at.has_name(name)).and_then(|at| at.value_str())
+        || self.opts.unstable_opts.sanitizer.intersects(SanitizerSet::ADDRESS | SanitizerSet::KERNELADDRESS | SanitizerSet::MEMORY | SanitizerSet::HWADDRESS)
     }
 
     pub fn diagnostic_width(&self) -> usize {
@@ -1044,7 +1125,7 @@ impl Session {
 
         // If there's only one codegen unit and LTO isn't enabled then there's
         // no need for ThinLTO so just return false.
-        if self.codegen_units() == 1 {
+        if self.codegen_units().as_usize() == 1 {
             return config::Lto::No;
         }
 
@@ -1139,25 +1220,26 @@ impl Session {
 
     /// Returns the number of query threads that should be used for this
     /// compilation
+    #[inline]
     pub fn threads(&self) -> usize {
         self.opts.unstable_opts.threads
     }
 
     /// Returns the number of codegen units that should be used for this
     /// compilation
-    pub fn codegen_units(&self) -> usize {
+    pub fn codegen_units(&self) -> CodegenUnits {
         if let Some(n) = self.opts.cli_forced_codegen_units {
-            return n;
+            return CodegenUnits::User(n);
         }
         if let Some(n) = self.target.default_codegen_units {
-            return n as usize;
+            return CodegenUnits::Default(n as usize);
         }
 
         // If incremental compilation is turned on, we default to a high number
         // codegen units in order to reduce the "collateral damage" small
         // changes cause.
         if self.opts.incremental.is_some() {
-            return 256;
+            return CodegenUnits::Default(256);
         }
 
         // Why is 16 codegen units the default all the time?
@@ -1210,7 +1292,7 @@ impl Session {
         // As a result 16 was chosen here! Mostly because it was a power of 2
         // and most benchmarks agreed it was roughly a local optimum. Not very
         // scientific.
-        16
+        CodegenUnits::Default(16)
     }
 
     pub fn teach(&self, code: &DiagnosticId) -> bool {
@@ -1237,6 +1319,19 @@ fn default_emitter(
 ) -> Box<dyn Emitter + sync::Send> {
     let macro_backtrace = sopts.unstable_opts.macro_backtrace;
     let track_diagnostics = sopts.unstable_opts.track_diagnostics;
+    let terminal_url = match sopts.unstable_opts.terminal_urls {
+        TerminalUrl::Auto => {
+            match (std::env::var("COLORTERM").as_deref(), std::env::var("TERM").as_deref()) {
+                (Ok("truecolor"), Ok("xterm-256color"))
+                    if sopts.unstable_features.is_nightly_build() =>
+                {
+                    TerminalUrl::Yes
+                }
+                _ => TerminalUrl::No,
+            }
+        }
+        t => t,
+    };
     match sopts.error_format {
         config::ErrorOutputType::HumanReadable(kind) => {
             let (short, color_config) = kind.unzip();
@@ -1261,6 +1356,7 @@ fn default_emitter(
                     sopts.diagnostic_width,
                     macro_backtrace,
                     track_diagnostics,
+                    terminal_url,
                 );
                 Box::new(emitter.ui_testing(sopts.unstable_opts.ui_testing))
             }
@@ -1276,6 +1372,7 @@ fn default_emitter(
                 sopts.diagnostic_width,
                 macro_backtrace,
                 track_diagnostics,
+                terminal_url,
             )
             .ui_testing(sopts.unstable_opts.ui_testing),
         ),
@@ -1286,12 +1383,14 @@ fn default_emitter(
 #[allow(rustc::bad_opt_access)]
 pub fn build_session(
     sopts: config::Options,
-    local_crate_source_file: Option<PathBuf>,
+    io: CompilerIO,
     bundle: Option<Lrc<rustc_errors::FluentBundle>>,
     registry: rustc_errors::registry::Registry,
+    fluent_resources: Vec<&'static str>,
     driver_lint_caps: FxHashMap<lint::LintId, lint::Level>,
     file_loader: Option<Box<dyn FileLoader + Send + Sync + 'static>>,
     target_override: Option<Target>,
+    cfg_version: &'static str,
 ) -> Session {
     // FIXME: This is not general enough to make the warning lint completely override
     // normal diagnostic warnings, since the warning lint can also be denied and changed
@@ -1300,8 +1399,8 @@ pub fn build_session(
         .lint_opts
         .iter()
         .rfind(|&(key, _)| *key == "warnings")
-        .map_or(false, |&(_, level)| level == lint::Allow);
-    let cap_lints_allow = sopts.lint_cap.map_or(false, |cap| cap == lint::Allow);
+        .is_some_and(|&(_, level)| level == lint::Allow);
+    let cap_lints_allow = sopts.lint_cap.is_some_and(|cap| cap == lint::Allow);
     let can_emit_warnings = !(warnings_allow || cap_lints_allow);
 
     let sysroot = match &sopts.maybe_sysroot {
@@ -1312,10 +1411,10 @@ pub fn build_session(
     let target_cfg = config::build_target_config(&sopts, target_override, &sysroot);
     let host_triple = TargetTriple::from_triple(config::host_triple());
     let (host, target_warnings) = Target::search(&host_triple, &sysroot).unwrap_or_else(|e| {
-        early_error(sopts.error_format, &format!("Error loading host specification: {e}"))
+        early_error(sopts.error_format, format!("Error loading host specification: {e}"))
     });
     for warning in target_warnings.warning_messages() {
-        early_warn(sopts.error_format, &warning)
+        early_warn(sopts.error_format, warning)
     }
 
     let loader = file_loader.unwrap_or_else(|| Box::new(RealFileLoader));
@@ -1333,7 +1432,7 @@ pub fn build_session(
     ));
 
     let fallback_bundle = fallback_fluent_bundle(
-        rustc_errors::DEFAULT_LOCALE_RESOURCES,
+        fluent_resources,
         sopts.unstable_opts.translate_directionality_markers,
     );
     let emitter = default_emitter(&sopts, registry, source_map.clone(), bundle, fallback_bundle);
@@ -1357,7 +1456,7 @@ pub fn build_session(
         match profiler {
             Ok(profiler) => Some(Arc::new(profiler)),
             Err(e) => {
-                early_warn(sopts.error_format, &format!("failed to create profiler: {e}"));
+                early_warn(sopts.error_format, format!("failed to create profiler: {e}"));
                 None
             }
         }
@@ -1379,11 +1478,6 @@ pub fn build_session(
         Lrc::new(SearchPath::from_sysroot_and_triple(&sysroot, target_triple))
     };
 
-    let file_path_mapping = sopts.file_path_mapping();
-
-    let local_crate_source_file =
-        local_crate_source_file.map(|path| file_path_mapping.map_prefix(path).0);
-
     let optimization_fuel = Lock::new(OptimizationFuel {
         remaining: sopts.unstable_opts.fuel.as_ref().map_or(0, |&(_, i)| i),
         out_of_fuel: false,
@@ -1396,7 +1490,10 @@ pub fn build_session(
         CguReuseTracker::new_disabled()
     };
 
-    let prof = SelfProfilerRef::new(self_profiler, sopts.unstable_opts.time_passes);
+    let prof = SelfProfilerRef::new(
+        self_profiler,
+        sopts.unstable_opts.time_passes.then(|| sopts.unstable_opts.time_passes_format),
+    );
 
     let ctfe_backtrace = Lock::new(match env::var("RUSTC_CTFE_BACKTRACE") {
         Ok(ref val) if val == "immediate" => CtfeBacktrace::Immediate,
@@ -1415,7 +1512,7 @@ pub fn build_session(
         target_tlib_path,
         parse_sess,
         sysroot,
-        local_crate_source_file,
+        io,
         crate_types: OnceCell::new(),
         stable_crate_id: OnceCell::new(),
         features: OnceCell::new(),
@@ -1436,8 +1533,9 @@ pub fn build_session(
         ctfe_backtrace,
         miri_unleashed_features: Lock::new(Default::default()),
         asm_arch,
-        target_features: FxHashSet::default(),
-        unstable_target_features: FxHashSet::default(),
+        target_features: Default::default(),
+        unstable_target_features: Default::default(),
+        cfg_version,
     };
 
     validate_commandline_args_with_session_available(&sess);
@@ -1463,28 +1561,28 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
         && sess.opts.cg.prefer_dynamic
         && sess.target.is_like_windows
     {
-        sess.emit_err(LinkerPluginToWindowsNotSupported);
+        sess.emit_err(errors::LinkerPluginToWindowsNotSupported);
     }
 
     // Make sure that any given profiling data actually exists so LLVM can't
     // decide to silently skip PGO.
     if let Some(ref path) = sess.opts.cg.profile_use {
         if !path.exists() {
-            sess.emit_err(ProfileUseFileDoesNotExist { path });
+            sess.emit_err(errors::ProfileUseFileDoesNotExist { path });
         }
     }
 
     // Do the same for sample profile data.
     if let Some(ref path) = sess.opts.unstable_opts.profile_sample_use {
         if !path.exists() {
-            sess.emit_err(ProfileSampleUseFileDoesNotExist { path });
+            sess.emit_err(errors::ProfileSampleUseFileDoesNotExist { path });
         }
     }
 
     // Unwind tables cannot be disabled if the target requires them.
     if let Some(include_uwtables) = sess.opts.cg.force_unwind_tables {
         if sess.target.requires_uwtable && !include_uwtables {
-            sess.emit_err(TargetRequiresUnwindTables);
+            sess.emit_err(errors::TargetRequiresUnwindTables);
         }
     }
 
@@ -1494,16 +1592,18 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
     match unsupported_sanitizers.into_iter().count() {
         0 => {}
         1 => {
-            sess.emit_err(SanitizerNotSupported { us: unsupported_sanitizers.to_string() });
+            sess.emit_err(errors::SanitizerNotSupported { us: unsupported_sanitizers.to_string() });
         }
         _ => {
-            sess.emit_err(SanitizersNotSupported { us: unsupported_sanitizers.to_string() });
+            sess.emit_err(errors::SanitizersNotSupported {
+                us: unsupported_sanitizers.to_string(),
+            });
         }
     }
     // Cannot mix and match sanitizers.
     let mut sanitizer_iter = sess.opts.unstable_opts.sanitizer.into_iter();
     if let (Some(first), Some(second)) = (sanitizer_iter.next(), sanitizer_iter.next()) {
-        sess.emit_err(CannotMixAndMatchSanitizers {
+        sess.emit_err(errors::CannotMixAndMatchSanitizers {
             first: first.to_string(),
             second: second.to_string(),
         });
@@ -1511,30 +1611,66 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
 
     // Cannot enable crt-static with sanitizers on Linux
     if sess.crt_static(None) && !sess.opts.unstable_opts.sanitizer.is_empty() {
-        sess.emit_err(CannotEnableCrtStaticLinux);
+        sess.emit_err(errors::CannotEnableCrtStaticLinux);
     }
 
-    // LLVM CFI and VFE both require LTO.
-    if sess.lto() != config::Lto::Fat {
-        if sess.is_sanitizer_cfi_enabled() {
-            sess.emit_err(SanitizerCfiEnabled);
-        }
-        if sess.opts.unstable_opts.virtual_function_elimination {
-            sess.emit_err(UnstableVirtualFunctionElimination);
-        }
+    // LLVM CFI requires LTO.
+    if sess.is_sanitizer_cfi_enabled()
+        && !(sess.lto() == config::Lto::Fat
+            || sess.lto() == config::Lto::Thin
+            || sess.opts.cg.linker_plugin_lto.enabled())
+    {
+        sess.emit_err(errors::SanitizerCfiRequiresLto);
     }
 
-    // LLVM CFI and KCFI are mutually exclusive
+    // LLVM CFI is incompatible with LLVM KCFI.
     if sess.is_sanitizer_cfi_enabled() && sess.is_sanitizer_kcfi_enabled() {
-        sess.emit_err(CannotMixAndMatchSanitizers {
+        sess.emit_err(errors::CannotMixAndMatchSanitizers {
             first: "cfi".to_string(),
             second: "kcfi".to_string(),
         });
     }
 
+    // Canonical jump tables requires CFI.
+    if sess.is_sanitizer_cfi_canonical_jump_tables_disabled() {
+        if !sess.is_sanitizer_cfi_enabled() {
+            sess.emit_err(errors::SanitizerCfiCanonicalJumpTablesRequiresCfi);
+        }
+    }
+
+    // LLVM CFI pointer generalization requires CFI or KCFI.
+    if sess.is_sanitizer_cfi_generalize_pointers_enabled() {
+        if !(sess.is_sanitizer_cfi_enabled() || sess.is_sanitizer_kcfi_enabled()) {
+            sess.emit_err(errors::SanitizerCfiGeneralizePointersRequiresCfi);
+        }
+    }
+
+    // LLVM CFI integer normalization requires CFI or KCFI.
+    if sess.is_sanitizer_cfi_normalize_integers_enabled() {
+        if !(sess.is_sanitizer_cfi_enabled() || sess.is_sanitizer_kcfi_enabled()) {
+            sess.emit_err(errors::SanitizerCfiNormalizeIntegersRequiresCfi);
+        }
+    }
+
+    // LTO unit splitting requires LTO.
+    if sess.is_split_lto_unit_enabled()
+        && !(sess.lto() == config::Lto::Fat
+            || sess.lto() == config::Lto::Thin
+            || sess.opts.cg.linker_plugin_lto.enabled())
+    {
+        sess.emit_err(errors::SplitLtoUnitRequiresLto);
+    }
+
+    // VFE requires LTO.
+    if sess.lto() != config::Lto::Fat {
+        if sess.opts.unstable_opts.virtual_function_elimination {
+            sess.emit_err(errors::UnstableVirtualFunctionElimination);
+        }
+    }
+
     if sess.opts.unstable_opts.stack_protector != StackProtector::None {
         if !sess.target.options.supports_stack_protector {
-            sess.emit_warning(StackProtectorNotSupportedForTarget {
+            sess.emit_warning(errors::StackProtectorNotSupportedForTarget {
                 stack_protector: sess.opts.unstable_opts.stack_protector,
                 target_triple: &sess.opts.target_triple,
             });
@@ -1542,19 +1678,30 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
     }
 
     if sess.opts.unstable_opts.branch_protection.is_some() && sess.target.arch != "aarch64" {
-        sess.emit_err(BranchProtectionRequiresAArch64);
+        sess.emit_err(errors::BranchProtectionRequiresAArch64);
     }
 
     if let Some(dwarf_version) = sess.opts.unstable_opts.dwarf_version {
         if dwarf_version > 5 {
-            sess.emit_err(UnsupportedDwarfVersion { dwarf_version });
+            sess.emit_err(errors::UnsupportedDwarfVersion { dwarf_version });
         }
     }
 
     if !sess.target.options.supported_split_debuginfo.contains(&sess.split_debuginfo())
         && !sess.opts.unstable_opts.unstable_options
     {
-        sess.emit_err(SplitDebugInfoUnstablePlatform { debuginfo: sess.split_debuginfo() });
+        sess.emit_err(errors::SplitDebugInfoUnstablePlatform { debuginfo: sess.split_debuginfo() });
+    }
+
+    if sess.opts.unstable_opts.instrument_xray.is_some() && !sess.target.options.supports_xray {
+        sess.emit_err(errors::InstrumentationNotSupported { us: "XRay".to_string() });
+    }
+
+    if let Some(flavor) = sess.opts.cg.linker_flavor {
+        if let Some(compatible_list) = sess.target.linker_flavor.check_compatibility(flavor) {
+            let flavor = flavor.desc();
+            sess.emit_err(errors::IncompatibleLinkerFlavor { flavor, compatible_list });
+        }
     }
 }
 
@@ -1577,7 +1724,10 @@ pub enum IncrCompSession {
 }
 
 fn early_error_handler(output: config::ErrorOutputType) -> rustc_errors::Handler {
-    let fallback_bundle = fallback_fluent_bundle(rustc_errors::DEFAULT_LOCALE_RESOURCES, false);
+    // FIXME(#100717): early errors aren't translated at the moment, so this is fine, but it will
+    // need to reference every crate that might emit an early error for translation to work.
+    let fallback_bundle =
+        fallback_fluent_bundle(vec![rustc_errors::DEFAULT_LOCALE_RESOURCE], false);
     let emitter: Box<dyn Emitter + sync::Send> = match output {
         config::ErrorOutputType::HumanReadable(kind) => {
             let (short, color_config) = kind.unzip();
@@ -1591,6 +1741,7 @@ fn early_error_handler(output: config::ErrorOutputType) -> rustc_errors::Handler
                 None,
                 false,
                 false,
+                TerminalUrl::No,
             ))
         }
         config::ErrorOutputType::Json { pretty, json_rendered } => Box::new(JsonEmitter::basic(
@@ -1601,6 +1752,7 @@ fn early_error_handler(output: config::ErrorOutputType) -> rustc_errors::Handler
             None,
             false,
             false,
+            TerminalUrl::No,
         )),
     };
     rustc_errors::Handler::with_emitter(true, None, emitter)
@@ -1608,18 +1760,22 @@ fn early_error_handler(output: config::ErrorOutputType) -> rustc_errors::Handler
 
 #[allow(rustc::untranslatable_diagnostic)]
 #[allow(rustc::diagnostic_outside_of_impl)]
-pub fn early_error_no_abort(output: config::ErrorOutputType, msg: &str) -> ErrorGuaranteed {
+#[must_use = "ErrorGuaranteed must be returned from `run_compiler` in order to exit with a non-zero status code"]
+pub fn early_error_no_abort(
+    output: config::ErrorOutputType,
+    msg: impl Into<DiagnosticMessage>,
+) -> ErrorGuaranteed {
     early_error_handler(output).struct_err(msg).emit()
 }
 
 #[allow(rustc::untranslatable_diagnostic)]
 #[allow(rustc::diagnostic_outside_of_impl)]
-pub fn early_error(output: config::ErrorOutputType, msg: &str) -> ! {
+pub fn early_error(output: config::ErrorOutputType, msg: impl Into<DiagnosticMessage>) -> ! {
     early_error_handler(output).struct_fatal(msg).emit()
 }
 
 #[allow(rustc::untranslatable_diagnostic)]
 #[allow(rustc::diagnostic_outside_of_impl)]
-pub fn early_warn(output: config::ErrorOutputType, msg: &str) {
+pub fn early_warn(output: config::ErrorOutputType, msg: impl Into<DiagnosticMessage>) {
     early_error_handler(output).struct_warn(msg).emit()
 }

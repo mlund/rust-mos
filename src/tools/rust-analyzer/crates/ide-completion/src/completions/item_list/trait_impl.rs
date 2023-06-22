@@ -37,7 +37,7 @@ use ide_db::{
     traits::get_missing_assoc_items, SymbolKind,
 };
 use syntax::{
-    ast::{self, edit_in_place::AttrsOwnerEdit},
+    ast::{self, edit_in_place::AttrsOwnerEdit, HasTypeBounds},
     AstNode, SyntaxElement, SyntaxKind, TextRange, T,
 };
 use text_edit::TextEdit;
@@ -150,21 +150,24 @@ fn complete_trait_impl(
     impl_def: &ast::Impl,
 ) {
     if let Some(hir_impl) = ctx.sema.to_def(impl_def) {
-        get_missing_assoc_items(&ctx.sema, impl_def).into_iter().for_each(|item| {
-            use self::ImplCompletionKind::*;
-            match (item, kind) {
-                (hir::AssocItem::Function(func), All | Fn) => {
-                    add_function_impl(acc, ctx, replacement_range, func, hir_impl)
+        get_missing_assoc_items(&ctx.sema, impl_def)
+            .into_iter()
+            .filter(|item| ctx.check_stability(Some(&item.attrs(ctx.db))))
+            .for_each(|item| {
+                use self::ImplCompletionKind::*;
+                match (item, kind) {
+                    (hir::AssocItem::Function(func), All | Fn) => {
+                        add_function_impl(acc, ctx, replacement_range, func, hir_impl)
+                    }
+                    (hir::AssocItem::TypeAlias(type_alias), All | TypeAlias) => {
+                        add_type_alias_impl(acc, ctx, replacement_range, type_alias, hir_impl)
+                    }
+                    (hir::AssocItem::Const(const_), All | Const) => {
+                        add_const_impl(acc, ctx, replacement_range, const_, hir_impl)
+                    }
+                    _ => {}
                 }
-                (hir::AssocItem::TypeAlias(type_alias), All | TypeAlias) => {
-                    add_type_alias_impl(acc, ctx, replacement_range, type_alias, hir_impl)
-                }
-                (hir::AssocItem::Const(const_), All | Const) => {
-                    add_const_impl(acc, ctx, replacement_range, const_, hir_impl)
-                }
-                _ => {}
-            }
-        });
+            });
     }
 }
 
@@ -179,7 +182,7 @@ fn add_function_impl(
 
     let label = format!(
         "fn {}({})",
-        fn_name,
+        fn_name.display(ctx.db),
         if func.assoc_fn_params(ctx.db).is_empty() { "" } else { ".." }
     );
 
@@ -190,7 +193,7 @@ fn add_function_impl(
     };
 
     let mut item = CompletionItem::new(completion_kind, replacement_range, label);
-    item.lookup_by(format!("fn {}", fn_name))
+    item.lookup_by(format!("fn {}", fn_name.display(ctx.db)))
         .set_documentation(func.docs(ctx.db))
         .set_relevance(CompletionRelevance { is_item_from_trait: true, ..Default::default() });
 
@@ -205,15 +208,15 @@ fn add_function_impl(
             let function_decl = function_declaration(&transformed_fn, source.file_id.is_macro());
             match ctx.config.snippet_cap {
                 Some(cap) => {
-                    let snippet = format!("{} {{\n    $0\n}}", function_decl);
+                    let snippet = format!("{function_decl} {{\n    $0\n}}");
                     item.snippet_edit(cap, TextEdit::replace(replacement_range, snippet));
                 }
                 None => {
-                    let header = format!("{} {{", function_decl);
+                    let header = format!("{function_decl} {{");
                     item.text_edit(TextEdit::replace(replacement_range, header));
                 }
             };
-            item.add_to(acc);
+            item.add_to(acc, ctx.db);
         }
     }
 }
@@ -224,9 +227,8 @@ fn get_transformed_assoc_item(
     assoc_item: ast::AssocItem,
     impl_def: hir::Impl,
 ) -> Option<ast::AssocItem> {
-    let assoc_item = assoc_item.clone_for_update();
     let trait_ = impl_def.trait_(ctx.db)?;
-    let source_scope = &ctx.sema.scope_for_def(trait_);
+    let source_scope = &ctx.sema.scope(assoc_item.syntax())?;
     let target_scope = &ctx.sema.scope(ctx.sema.source(impl_def)?.syntax().value)?;
     let transform = PathTransform::trait_impl(
         target_scope,
@@ -235,6 +237,9 @@ fn get_transformed_assoc_item(
         ctx.sema.source(impl_def)?.value,
     );
 
+    let assoc_item = assoc_item.clone_for_update();
+    // FIXME: Paths in nested macros are not handled well. See
+    // `macro_generated_assoc_item2` test.
     transform.apply(assoc_item.syntax());
     assoc_item.remove_attrs_and_docs();
     Some(assoc_item)
@@ -249,10 +254,10 @@ fn add_type_alias_impl(
 ) {
     let alias_name = type_alias.name(ctx.db).unescaped().to_smol_str();
 
-    let label = format!("type {} =", alias_name);
+    let label = format!("type {alias_name} =");
 
     let mut item = CompletionItem::new(SymbolKind::TypeAlias, replacement_range, label);
-    item.lookup_by(format!("type {}", alias_name))
+    item.lookup_by(format!("type {alias_name}"))
         .set_documentation(type_alias.docs(ctx.db))
         .set_relevance(CompletionRelevance { is_item_from_trait: true, ..Default::default() });
 
@@ -265,10 +270,21 @@ fn add_type_alias_impl(
             };
 
             let start = transformed_ty.syntax().text_range().start();
-            let Some(end) = transformed_ty
-                .eq_token()
-                .map(|tok| tok.text_range().start())
-                .or(transformed_ty.semicolon_token().map(|tok| tok.text_range().start())) else { return };
+
+            let end = if let Some(end) =
+                transformed_ty.colon_token().map(|tok| tok.text_range().start())
+            {
+                end
+            } else if let Some(end) = transformed_ty.eq_token().map(|tok| tok.text_range().start())
+            {
+                end
+            } else if let Some(end) =
+                transformed_ty.semicolon_token().map(|tok| tok.text_range().start())
+            {
+                end
+            } else {
+                return;
+            };
 
             let len = end - start;
             let mut decl = transformed_ty.syntax().text().slice(..len).to_string();
@@ -279,14 +295,14 @@ fn add_type_alias_impl(
 
             match ctx.config.snippet_cap {
                 Some(cap) => {
-                    let snippet = format!("{}$0;", decl);
+                    let snippet = format!("{decl}$0;");
                     item.snippet_edit(cap, TextEdit::replace(replacement_range, snippet));
                 }
                 None => {
                     item.text_edit(TextEdit::replace(replacement_range, decl));
                 }
             };
-            item.add_to(acc);
+            item.add_to(acc, ctx.db);
         }
     }
 }
@@ -310,10 +326,10 @@ fn add_const_impl(
                 };
 
                 let label = make_const_compl_syntax(&transformed_const, source.file_id.is_macro());
-                let replacement = format!("{} ", label);
+                let replacement = format!("{label} ");
 
                 let mut item = CompletionItem::new(SymbolKind::Const, replacement_range, label);
-                item.lookup_by(format!("const {}", const_name))
+                item.lookup_by(format!("const {const_name}"))
                     .set_documentation(const_.docs(ctx.db))
                     .set_relevance(CompletionRelevance {
                         is_item_from_trait: true,
@@ -322,11 +338,11 @@ fn add_const_impl(
                 match ctx.config.snippet_cap {
                     Some(cap) => item.snippet_edit(
                         cap,
-                        TextEdit::replace(replacement_range, format!("{}$0;", replacement)),
+                        TextEdit::replace(replacement_range, format!("{replacement}$0;")),
                     ),
                     None => item.text_edit(TextEdit::replace(replacement_range, replacement)),
                 };
-                item.add_to(acc);
+                item.add_to(acc, ctx.db);
             }
         }
     }
@@ -820,6 +836,33 @@ impl Test for () {
     }
 
     #[test]
+    fn fn_with_lifetimes() {
+        check_edit(
+            "fn foo",
+            r#"
+trait Test<'a, 'b, T> {
+    fn foo(&self, a: &'a T, b: &'b T) -> &'a T;
+}
+
+impl<'x, 'y, A> Test<'x, 'y, A> for () {
+    t$0
+}
+"#,
+            r#"
+trait Test<'a, 'b, T> {
+    fn foo(&self, a: &'a T, b: &'b T) -> &'a T;
+}
+
+impl<'x, 'y, A> Test<'x, 'y, A> for () {
+    fn foo(&self, a: &'x A, b: &'y A) -> &'x A {
+    $0
+}
+}
+"#,
+        );
+    }
+
+    #[test]
     fn complete_without_name() {
         let test = |completion: &str, hint: &str, completed: &str, next_sibling: &str| {
             check_edit(
@@ -834,11 +877,10 @@ trait Test {{
 struct T;
 
 impl Test for T {{
-    {}
-    {}
+    {hint}
+    {next_sibling}
 }}
-"#,
-                    hint, next_sibling
+"#
                 ),
                 &format!(
                     r#"
@@ -850,17 +892,16 @@ trait Test {{
 struct T;
 
 impl Test for T {{
-    {}
-    {}
+    {completed}
+    {next_sibling}
 }}
-"#,
-                    completed, next_sibling
+"#
                 ),
             )
         };
 
         // Enumerate some possible next siblings.
-        for next_sibling in &[
+        for next_sibling in [
             "",
             "fn other_fn() {}", // `const $0 fn` -> `const fn`
             "type OtherType = i32;",
@@ -894,10 +935,9 @@ struct T;
 impl Foo for T {{
     // Comment
     #[bar]
-    {}
+    {hint}
 }}
-"#,
-                    hint
+"#
                 ),
                 &format!(
                     r#"
@@ -911,10 +951,9 @@ struct T;
 impl Foo for T {{
     // Comment
     #[bar]
-    {}
+    {completed}
 }}
-"#,
-                    completed
+"#
                 ),
             )
         };
@@ -1176,6 +1215,81 @@ struct Test;
 
 impl Foo for Test {
     fn foo(&mut self,bar:i64,baz: &mut u32) -> Result<(),u32> {
+    $0
+}
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn macro_generated_assoc_item() {
+        check_edit(
+            "fn method",
+            r#"
+macro_rules! ty { () => { i32 } }
+trait SomeTrait { type Output; }
+impl SomeTrait for i32 { type Output = i64; }
+macro_rules! define_method {
+    () => {
+        fn method(&mut self, params: <ty!() as SomeTrait>::Output);
+    };
+}
+trait AnotherTrait { define_method!(); }
+impl AnotherTrait for () {
+    $0
+}
+"#,
+            r#"
+macro_rules! ty { () => { i32 } }
+trait SomeTrait { type Output; }
+impl SomeTrait for i32 { type Output = i64; }
+macro_rules! define_method {
+    () => {
+        fn method(&mut self, params: <ty!() as SomeTrait>::Output);
+    };
+}
+trait AnotherTrait { define_method!(); }
+impl AnotherTrait for () {
+    fn method(&mut self,params: <ty!()as SomeTrait>::Output) {
+    $0
+}
+}
+"#,
+        );
+    }
+
+    // FIXME: `T` in `ty!(T)` should be replaced by `PathTransform`.
+    #[test]
+    fn macro_generated_assoc_item2() {
+        check_edit(
+            "fn method",
+            r#"
+macro_rules! ty { ($me:ty) => { $me } }
+trait SomeTrait { type Output; }
+impl SomeTrait for i32 { type Output = i64; }
+macro_rules! define_method {
+    ($t:ty) => {
+        fn method(&mut self, params: <ty!($t) as SomeTrait>::Output);
+    };
+}
+trait AnotherTrait<T: SomeTrait> { define_method!(T); }
+impl AnotherTrait<i32> for () {
+    $0
+}
+"#,
+            r#"
+macro_rules! ty { ($me:ty) => { $me } }
+trait SomeTrait { type Output; }
+impl SomeTrait for i32 { type Output = i64; }
+macro_rules! define_method {
+    ($t:ty) => {
+        fn method(&mut self, params: <ty!($t) as SomeTrait>::Output);
+    };
+}
+trait AnotherTrait<T: SomeTrait> { define_method!(T); }
+impl AnotherTrait<i32> for () {
+    fn method(&mut self,params: <ty!(T)as SomeTrait>::Output) {
     $0
 }
 }

@@ -1,5 +1,5 @@
 use clippy_utils::diagnostics::{span_lint_and_note, span_lint_and_sugg};
-use clippy_utils::source::snippet_with_macro_callsite;
+use clippy_utils::source::snippet_with_context;
 use clippy_utils::ty::{has_drop, is_copy};
 use clippy_utils::{
     any_parent_is_automatically_derived, contains_name, get_parent_expr, is_from_proc_macro, match_def_path, paths,
@@ -11,6 +11,7 @@ use rustc_hir::def::Res;
 use rustc_hir::{Block, Expr, ExprKind, PatKind, QPath, Stmt, StmtKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty;
+use rustc_middle::ty::print::with_forced_trimmed_paths;
 use rustc_session::{declare_tool_lint, impl_lint_pass};
 use rustc_span::symbol::{Ident, Symbol};
 use rustc_span::Span;
@@ -98,9 +99,7 @@ impl<'tcx> LateLintPass<'tcx> for Default {
             if let ty::Adt(def, ..) = expr_ty.kind();
             if !is_from_proc_macro(cx, expr);
             then {
-                // TODO: Work out a way to put "whatever the imported way of referencing
-                // this type in this file" rather than a fully-qualified type.
-                let replacement = format!("{}::default()", cx.tcx.def_path_str(def.did()));
+                let replacement = with_forced_trimmed_paths!(format!("{}::default()", cx.tcx.def_path_str(def.did())));
                 span_lint_and_sugg(
                     cx,
                     DEFAULT_TRAIT_ACCESS,
@@ -151,7 +150,7 @@ impl<'tcx> LateLintPass<'tcx> for Default {
                     .fields
                     .iter()
                     .all(|field| {
-                        is_copy(cx, cx.tcx.type_of(field.did))
+                        is_copy(cx, cx.tcx.type_of(field.did).subst_identity())
                     });
                 if !has_drop(cx, binding_type) || all_fields_are_copy;
                 then {
@@ -160,6 +159,8 @@ impl<'tcx> LateLintPass<'tcx> for Default {
                     continue;
                 }
             };
+
+            let init_ctxt = local.span.ctxt();
 
             // find all "later statement"'s where the fields of the binding set as
             // Default::default() get reassigned, unless the reassignment refers to the original binding
@@ -170,7 +171,7 @@ impl<'tcx> LateLintPass<'tcx> for Default {
                 // find out if and which field was set by this `consecutive_statement`
                 if let Some((field_ident, assign_rhs)) = field_reassigned_by_stmt(consecutive_statement, binding_name) {
                     // interrupt and cancel lint if assign_rhs references the original binding
-                    if contains_name(binding_name, assign_rhs) {
+                    if contains_name(binding_name, assign_rhs, cx) || init_ctxt != consecutive_statement.span.ctxt() {
                         cancel_lint = true;
                         break;
                     }
@@ -205,11 +206,12 @@ impl<'tcx> LateLintPass<'tcx> for Default {
                     .iter()
                     .all(|field| assigned_fields.iter().any(|(a, _)| a == &field.name));
 
+                let mut app = Applicability::Unspecified;
                 let field_list = assigned_fields
                     .into_iter()
                     .map(|(field, rhs)| {
                         // extract and store the assigned value for help message
-                        let value_snippet = snippet_with_macro_callsite(cx, rhs.span, "..");
+                        let value_snippet = snippet_with_context(cx, rhs.span, init_ctxt, "..", &mut app).0;
                         format!("{field}: {value_snippet}")
                     })
                     .collect::<Vec<String>>()

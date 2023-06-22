@@ -3,12 +3,16 @@ use std::hash::Hash;
 
 use rustdoc_json_types::{
     Constant, Crate, DynTrait, Enum, FnDecl, Function, FunctionPointer, GenericArg, GenericArgs,
-    GenericBound, GenericParamDef, Generics, Id, Impl, Import, ItemEnum, Module, OpaqueTy, Path,
-    Primitive, ProcMacro, Static, Struct, StructKind, Term, Trait, TraitAlias, Type, TypeBinding,
-    TypeBindingKind, Typedef, Union, Variant, WherePredicate,
+    GenericBound, GenericParamDef, Generics, Id, Impl, Import, ItemEnum, ItemSummary, Module,
+    OpaqueTy, Path, Primitive, ProcMacro, Static, Struct, StructKind, Term, Trait, TraitAlias,
+    Type, TypeBinding, TypeBindingKind, Typedef, Union, Variant, VariantKind, WherePredicate,
 };
+use serde_json::Value;
 
-use crate::{item_kind::Kind, Error, ErrorKind};
+use crate::{item_kind::Kind, json_find, Error, ErrorKind};
+
+// This is a rustc implementation detail that we rely on here
+const LOCAL_CRATE_ID: u32 = 0;
 
 /// The Validator walks over the JSON tree, and ensures it is well formed.
 /// It is made of several parts.
@@ -22,6 +26,7 @@ use crate::{item_kind::Kind, Error, ErrorKind};
 pub struct Validator<'a> {
     pub(crate) errs: Vec<Error>,
     krate: &'a Crate,
+    krate_json: Value,
     /// Worklist of Ids to check.
     todo: HashSet<&'a Id>,
     /// Ids that have already been visited, so don't need to be checked again.
@@ -39,9 +44,10 @@ enum PathKind {
 }
 
 impl<'a> Validator<'a> {
-    pub fn new(krate: &'a Crate) -> Self {
+    pub fn new(krate: &'a Crate, krate_json: Value) -> Self {
         Self {
             krate,
+            krate_json,
             errs: Vec::new(),
             seen_ids: HashSet::new(),
             todo: HashSet::new(),
@@ -50,11 +56,31 @@ impl<'a> Validator<'a> {
     }
 
     pub fn check_crate(&mut self) {
+        // Graph traverse the index
         let root = &self.krate.root;
         self.add_mod_id(root);
         while let Some(id) = set_remove(&mut self.todo) {
             self.seen_ids.insert(id);
             self.check_item(id);
+        }
+
+        let root_crate_id = self.krate.index[root].crate_id;
+        assert_eq!(root_crate_id, LOCAL_CRATE_ID, "LOCAL_CRATE_ID is wrong");
+        for (id, item_info) in &self.krate.paths {
+            self.check_item_info(id, item_info);
+        }
+    }
+
+    fn check_items(&mut self, id: &Id, items: &[Id]) {
+        let mut visited_ids = HashSet::with_capacity(items.len());
+
+        for item in items {
+            if !visited_ids.insert(item) {
+                self.fail(
+                    id,
+                    ErrorKind::Custom(format!("Duplicated entry in `items` field: `{item:?}`")),
+                );
+            }
         }
     }
 
@@ -70,9 +96,9 @@ impl<'a> Validator<'a> {
                 ItemEnum::Enum(x) => self.check_enum(x),
                 ItemEnum::Variant(x) => self.check_variant(x, id),
                 ItemEnum::Function(x) => self.check_function(x),
-                ItemEnum::Trait(x) => self.check_trait(x),
+                ItemEnum::Trait(x) => self.check_trait(x, id),
                 ItemEnum::TraitAlias(x) => self.check_trait_alias(x),
-                ItemEnum::Impl(x) => self.check_impl(x),
+                ItemEnum::Impl(x) => self.check_impl(x, id),
                 ItemEnum::Typedef(x) => self.check_typedef(x),
                 ItemEnum::OpaqueTy(x) => self.check_opaque_ty(x),
                 ItemEnum::Constant(x) => self.check_constant(x),
@@ -81,7 +107,7 @@ impl<'a> Validator<'a> {
                 ItemEnum::Macro(x) => self.check_macro(x),
                 ItemEnum::ProcMacro(x) => self.check_proc_macro(x),
                 ItemEnum::Primitive(x) => self.check_primitive_type(x),
-                ItemEnum::Module(x) => self.check_module(x),
+                ItemEnum::Module(x) => self.check_module(x, id),
                 // FIXME: Why don't these have their own structs?
                 ItemEnum::ExternCrate { .. } => {}
                 ItemEnum::AssocConst { type_, default: _ } => self.check_type(type_),
@@ -99,7 +125,8 @@ impl<'a> Validator<'a> {
     }
 
     // Core checkers
-    fn check_module(&mut self, module: &'a Module) {
+    fn check_module(&mut self, module: &'a Module, id: &Id) {
+        self.check_items(id, &module.items);
         module.items.iter().for_each(|i| self.add_mod_item_id(i));
     }
 
@@ -140,24 +167,24 @@ impl<'a> Validator<'a> {
     }
 
     fn check_variant(&mut self, x: &'a Variant, id: &'a Id) {
-        match x {
-            Variant::Plain(discr) => {
-                if let Some(discr) = discr {
-                    if let (Err(_), Err(_)) =
-                        (discr.value.parse::<i128>(), discr.value.parse::<u128>())
-                    {
-                        self.fail(
-                            id,
-                            ErrorKind::Custom(format!(
-                                "Failed to parse discriminant value `{}`",
-                                discr.value
-                            )),
-                        );
-                    }
-                }
+        let Variant { kind, discriminant } = x;
+
+        if let Some(discr) = discriminant {
+            if let (Err(_), Err(_)) = (discr.value.parse::<i128>(), discr.value.parse::<u128>()) {
+                self.fail(
+                    id,
+                    ErrorKind::Custom(format!(
+                        "Failed to parse discriminant value `{}`",
+                        discr.value
+                    )),
+                );
             }
-            Variant::Tuple(tys) => tys.iter().flatten().for_each(|t| self.add_field_id(t)),
-            Variant::Struct { fields, fields_stripped: _ } => {
+        }
+
+        match kind {
+            VariantKind::Plain => {}
+            VariantKind::Tuple(tys) => tys.iter().flatten().for_each(|t| self.add_field_id(t)),
+            VariantKind::Struct { fields, fields_stripped: _ } => {
                 fields.iter().for_each(|f| self.add_field_id(f))
             }
         }
@@ -168,7 +195,8 @@ impl<'a> Validator<'a> {
         self.check_fn_decl(&x.decl);
     }
 
-    fn check_trait(&mut self, x: &'a Trait) {
+    fn check_trait(&mut self, x: &'a Trait, id: &Id) {
+        self.check_items(id, &x.items);
         self.check_generics(&x.generics);
         x.items.iter().for_each(|i| self.add_trait_item_id(i));
         x.bounds.iter().for_each(|i| self.check_generic_bound(i));
@@ -180,7 +208,8 @@ impl<'a> Validator<'a> {
         x.params.iter().for_each(|i| self.check_generic_bound(i));
     }
 
-    fn check_impl(&mut self, x: &'a Impl) {
+    fn check_impl(&mut self, x: &'a Impl, id: &Id) {
+        self.check_items(id, &x.items);
         self.check_generics(&x.generics);
         if let Some(path) = &x.trait_ {
             self.check_path(path, PathKind::Trait);
@@ -244,7 +273,9 @@ impl<'a> Validator<'a> {
             Type::QualifiedPath { name: _, args, self_type, trait_ } => {
                 self.check_generic_args(&**args);
                 self.check_type(&**self_type);
-                self.check_path(trait_, PathKind::Trait);
+                if let Some(trait_) = trait_ {
+                    self.check_path(trait_, PathKind::Trait);
+                }
             }
         }
     }
@@ -361,6 +392,19 @@ impl<'a> Validator<'a> {
         fp.generic_params.iter().for_each(|gpd| self.check_generic_param_def(gpd));
     }
 
+    fn check_item_info(&mut self, id: &Id, item_info: &ItemSummary) {
+        // FIXME: Their should be a better way to determine if an item is local, rather than relying on `LOCAL_CRATE_ID`,
+        // which encodes rustc implementation details.
+        if item_info.crate_id == LOCAL_CRATE_ID && !self.krate.index.contains_key(id) {
+            self.errs.push(Error {
+                id: id.clone(),
+                kind: ErrorKind::Custom(
+                    "Id for local item in `paths` but not in `index`".to_owned(),
+                ),
+            })
+        }
+    }
+
     fn add_id_checked(&mut self, id: &'a Id, valid: fn(Kind) -> bool, expected: &str) {
         if let Some(kind) = self.kind_of(id) {
             if valid(kind) {
@@ -373,7 +417,11 @@ impl<'a> Validator<'a> {
         } else {
             if !self.missing_ids.contains(id) {
                 self.missing_ids.insert(id);
-                self.fail(id, ErrorKind::NotFound)
+
+                let sels = json_find::find_selector(&self.krate_json, &Value::String(id.0.clone()));
+                assert_ne!(sels.len(), 0);
+
+                self.fail(id, ErrorKind::NotFound(sels))
             }
         }
     }

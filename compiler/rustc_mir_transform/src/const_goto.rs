@@ -28,7 +28,9 @@ pub struct ConstGoto;
 
 impl<'tcx> MirPass<'tcx> for ConstGoto {
     fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        sess.mir_opt_level() >= 4
+        // This pass participates in some as-of-yet untested unsoundness found
+        // in https://github.com/rust-lang/rust/issues/112460
+        sess.mir_opt_level() >= 2 && sess.opts.unstable_opts.unsound_mir_opts
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -57,6 +59,15 @@ impl<'tcx> MirPass<'tcx> for ConstGoto {
 }
 
 impl<'tcx> Visitor<'tcx> for ConstGotoOptimizationFinder<'_, 'tcx> {
+    fn visit_basic_block_data(&mut self, block: BasicBlock, data: &BasicBlockData<'tcx>) {
+        if data.is_cleanup {
+            // Because of the restrictions around control flow in cleanup blocks, we don't perform
+            // this optimization at all in such blocks.
+            return;
+        }
+        self.super_basic_block_data(block, data);
+    }
+
     fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, location: Location) {
         let _: Option<_> = try {
             let target = terminator.kind.as_goto()?;

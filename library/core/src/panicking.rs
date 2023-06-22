@@ -29,6 +29,9 @@
 use crate::fmt;
 use crate::panic::{Location, PanicInfo};
 
+#[cfg(feature = "panic_immediate_abort")]
+const _: () = assert!(cfg!(panic = "abort"), "panic_immediate_abort requires -C panic=abort");
+
 // First we define the two main entry points that all panics go through.
 // In the end both are just convenience wrappers around `panic_impl`.
 
@@ -64,13 +67,17 @@ pub const fn panic_fmt(fmt: fmt::Arguments<'_>) -> ! {
     unsafe { panic_impl(&pi) }
 }
 
-/// Like `panic`, but without unwinding and track_caller to reduce the impact on codesize.
-/// (No `fmt` variant as a `fmt::Arguments` needs more space to be passed.)
+/// Like `panic_fmt`, but for non-unwinding panics.
+///
+/// Has to be a separate function so that it can carry the `rustc_nounwind` attribute.
 #[cfg_attr(not(feature = "panic_immediate_abort"), inline(never), cold)]
 #[cfg_attr(feature = "panic_immediate_abort", inline)]
-#[cfg_attr(not(bootstrap), lang = "panic_nounwind")] // needed by codegen for non-unwinding panics
+#[track_caller]
+// This attribute has the key side-effect that if the panic handler ignores `can_unwind`
+// and unwinds anyway, we will hit the "unwinding out of nounwind function" guard,
+// which causes a "panic in a function that cannot unwind".
 #[rustc_nounwind]
-pub fn panic_nounwind(msg: &'static str) -> ! {
+pub fn panic_nounwind_fmt(fmt: fmt::Arguments<'_>) -> ! {
     if cfg!(feature = "panic_immediate_abort") {
         super::intrinsics::abort()
     }
@@ -83,8 +90,6 @@ pub fn panic_nounwind(msg: &'static str) -> ! {
     }
 
     // PanicInfo with the `can_unwind` flag set to false forces an abort.
-    let pieces = [msg];
-    let fmt = fmt::Arguments::new_v1(&pieces, &[]);
     let pi = PanicInfo::internal_constructor(Some(&fmt), Location::caller(), false);
 
     // SAFETY: `panic_impl` is defined in safe Rust code and thus is safe to call.
@@ -109,7 +114,16 @@ pub const fn panic(expr: &'static str) -> ! {
     // truncation and padding (even though none is used here). Using
     // Arguments::new_v1 may allow the compiler to omit Formatter::pad from the
     // output binary, saving up to a few kilobytes.
-    panic_fmt(fmt::Arguments::new_v1(&[expr], &[]));
+    panic_fmt(fmt::Arguments::new_const(&[expr]));
+}
+
+/// Like `panic`, but without unwinding and track_caller to reduce the impact on codesize.
+#[cfg_attr(not(feature = "panic_immediate_abort"), inline(never), cold)]
+#[cfg_attr(feature = "panic_immediate_abort", inline)]
+#[lang = "panic_nounwind"] // needed by codegen for non-unwinding panics
+#[rustc_nounwind]
+pub fn panic_nounwind(expr: &'static str) -> ! {
+    panic_nounwind_fmt(fmt::Arguments::new_const(&[expr]));
 }
 
 #[inline]
@@ -148,14 +162,28 @@ fn panic_bounds_check(index: usize, len: usize) -> ! {
     panic!("index out of bounds: the len is {len} but the index is {index}")
 }
 
+#[cold]
+#[cfg_attr(not(feature = "panic_immediate_abort"), inline(never))]
+#[track_caller]
+#[lang = "panic_misaligned_pointer_dereference"] // needed by codegen for panic on misaligned pointer deref
+#[rustc_nounwind] // `CheckAlignment` MIR pass requires this function to never unwind
+fn panic_misaligned_pointer_dereference(required: usize, found: usize) -> ! {
+    if cfg!(feature = "panic_immediate_abort") {
+        super::intrinsics::abort()
+    }
+
+    panic_nounwind_fmt(format_args!(
+        "misaligned pointer dereference: address must be a multiple of {required:#x} but is {found:#x}"
+    ))
+}
+
 /// Panic because we cannot unwind out of a function.
 ///
 /// This function is called directly by the codegen backend, and must not have
 /// any extra arguments (including those synthesized by track_caller).
 #[cfg_attr(not(feature = "panic_immediate_abort"), inline(never), cold)]
 #[cfg_attr(feature = "panic_immediate_abort", inline)]
-#[cfg_attr(bootstrap, lang = "panic_no_unwind")] // needed by codegen for panic in nounwind function
-#[cfg_attr(not(bootstrap), lang = "panic_cannot_unwind")] // needed by codegen for panic in nounwind function
+#[lang = "panic_cannot_unwind"] // needed by codegen for panic in nounwind function
 #[rustc_nounwind]
 fn panic_cannot_unwind() -> ! {
     panic_nounwind("panic in a function that cannot unwind")

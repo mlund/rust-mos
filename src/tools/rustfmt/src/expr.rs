@@ -29,9 +29,9 @@ use crate::spanned::Spanned;
 use crate::string::{rewrite_string, StringFormat};
 use crate::types::{rewrite_path, PathContext};
 use crate::utils::{
-    colon_spaces, contains_skip, count_newlines, first_line_ends_with, inner_attributes,
-    last_line_extendable, last_line_width, mk_sp, outer_attributes, semicolon_for_expr,
-    unicode_str_width, wrap_str,
+    colon_spaces, contains_skip, count_newlines, filtered_str_fits, first_line_ends_with,
+    inner_attributes, last_line_extendable, last_line_width, mk_sp, outer_attributes,
+    semicolon_for_expr, unicode_str_width, wrap_str,
 };
 use crate::vertical::rewrite_with_alignment;
 use crate::visitor::FmtVisitor;
@@ -205,6 +205,7 @@ pub(crate) fn format_expr(
         }
         ast::ExprKind::Closure(ref cl) => closures::rewrite_closure(
             &cl.binder,
+            cl.constness,
             cl.capture_clause,
             &cl.asyncness,
             cl.movability,
@@ -217,7 +218,7 @@ pub(crate) fn format_expr(
         ast::ExprKind::Try(..)
         | ast::ExprKind::Field(..)
         | ast::ExprKind::MethodCall(..)
-        | ast::ExprKind::Await(_) => rewrite_chain(expr, context, shape),
+        | ast::ExprKind::Await(_, _) => rewrite_chain(expr, context, shape),
         ast::ExprKind::MacCall(ref mac) => {
             rewrite_macro(mac, None, context, shape, MacroPosition::Expression).or_else(|| {
                 wrap_str(
@@ -231,11 +232,11 @@ pub(crate) fn format_expr(
         ast::ExprKind::Ret(Some(ref expr)) => {
             rewrite_unary_prefix(context, "return ", &**expr, shape)
         }
+        ast::ExprKind::Become(ref expr) => rewrite_unary_prefix(context, "become ", &**expr, shape),
         ast::ExprKind::Yeet(None) => Some("do yeet".to_owned()),
         ast::ExprKind::Yeet(Some(ref expr)) => {
             rewrite_unary_prefix(context, "do yeet ", &**expr, shape)
         }
-        ast::ExprKind::Box(ref expr) => rewrite_unary_prefix(context, "box ", &**expr, shape),
         ast::ExprKind::AddrOf(borrow_kind, mutability, ref expr) => {
             rewrite_expr_addrof(context, borrow_kind, mutability, expr, shape)
         }
@@ -366,7 +367,7 @@ pub(crate) fn format_expr(
                 ))
             }
         }
-        ast::ExprKind::Async(capture_by, _node_id, ref block) => {
+        ast::ExprKind::Async(capture_by, ref block) => {
             let mover = if capture_by == ast::CaptureBy::Value {
                 "move "
             } else {
@@ -399,7 +400,12 @@ pub(crate) fn format_expr(
             }
         }
         ast::ExprKind::Underscore => Some("_".to_owned()),
-        ast::ExprKind::IncludedBytes(..) => unreachable!(),
+        ast::ExprKind::FormatArgs(..)
+        | ast::ExprKind::IncludedBytes(..)
+        | ast::ExprKind::OffsetOf(..) => {
+            // These do not occur in the AST because macros aren't expanded.
+            unreachable!()
+        }
         ast::ExprKind::Err => None,
     };
 
@@ -1295,7 +1301,6 @@ pub(crate) fn is_simple_expr(expr: &ast::Expr) -> bool {
         ast::ExprKind::Lit(..) => true,
         ast::ExprKind::Path(ref qself, ref path) => qself.is_none() && path.segments.len() <= 1,
         ast::ExprKind::AddrOf(_, _, ref expr)
-        | ast::ExprKind::Box(ref expr)
         | ast::ExprKind::Cast(ref expr, _)
         | ast::ExprKind::Field(ref expr, _)
         | ast::ExprKind::Try(ref expr)
@@ -1357,7 +1362,6 @@ pub(crate) fn can_be_overflowed_expr(
 
         // Handle unary-like expressions
         ast::ExprKind::AddrOf(_, _, ref expr)
-        | ast::ExprKind::Box(ref expr)
         | ast::ExprKind::Try(ref expr)
         | ast::ExprKind::Unary(_, ref expr)
         | ast::ExprKind::Cast(ref expr, _) => can_be_overflowed_expr(context, expr, args_len),
@@ -1369,7 +1373,6 @@ pub(crate) fn is_nested_call(expr: &ast::Expr) -> bool {
     match expr.kind {
         ast::ExprKind::Call(..) | ast::ExprKind::MacCall(..) => true,
         ast::ExprKind::AddrOf(_, _, ref expr)
-        | ast::ExprKind::Box(ref expr)
         | ast::ExprKind::Try(ref expr)
         | ast::ExprKind::Unary(_, ref expr)
         | ast::ExprKind::Cast(ref expr, _) => is_nested_call(expr),
@@ -1722,9 +1725,11 @@ pub(crate) fn rewrite_field(
         let overhead = name.len() + separator.len();
         let expr_shape = shape.offset_left(overhead)?;
         let expr = field.expr.rewrite(context, expr_shape);
-
+        let is_lit = matches!(field.expr.kind, ast::ExprKind::Lit(_));
         match expr {
-            Some(ref e) if e.as_str() == name && context.config.use_field_init_shorthand() => {
+            Some(ref e)
+                if !is_lit && e.as_str() == name && context.config.use_field_init_shorthand() =>
+            {
                 Some(attrs_str + name)
             }
             Some(e) => Some(format!("{}{}{}{}", attrs_str, name, separator, e)),
@@ -1887,7 +1892,7 @@ impl<'ast> RhsAssignKind<'ast> {
                     ast::ExprKind::Try(..)
                         | ast::ExprKind::Field(..)
                         | ast::ExprKind::MethodCall(..)
-                        | ast::ExprKind::Await(_)
+                        | ast::ExprKind::Await(_, _)
                 )
             }
             _ => false,
@@ -2049,8 +2054,7 @@ fn choose_rhs<R: Rewrite>(
 
             match (orig_rhs, new_rhs) {
                 (Some(ref orig_rhs), Some(ref new_rhs))
-                    if wrap_str(new_rhs.clone(), context.config.max_width(), new_shape)
-                        .is_none() =>
+                    if !filtered_str_fits(&new_rhs, context.config.max_width(), new_shape) =>
                 {
                     Some(format!("{}{}", before_space_str, orig_rhs))
                 }
@@ -2130,7 +2134,6 @@ pub(crate) fn is_method_call(expr: &ast::Expr) -> bool {
     match expr.kind {
         ast::ExprKind::MethodCall(..) => true,
         ast::ExprKind::AddrOf(_, _, ref expr)
-        | ast::ExprKind::Box(ref expr)
         | ast::ExprKind::Cast(ref expr, _)
         | ast::ExprKind::Try(ref expr)
         | ast::ExprKind::Unary(_, ref expr) => is_method_call(expr),

@@ -1,11 +1,9 @@
 use rustc_ast as ast;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::sync::Lrc;
-use rustc_errors::{ColorConfig, ErrorGuaranteed, FatalError};
-use rustc_hir as hir;
-use rustc_hir::def_id::LOCAL_CRATE;
-use rustc_hir::intravisit;
-use rustc_hir::{HirId, CRATE_HIR_ID};
+use rustc_errors::{ColorConfig, ErrorGuaranteed, FatalError, TerminalUrl};
+use rustc_hir::def_id::{LocalDefId, CRATE_DEF_ID, LOCAL_CRATE};
+use rustc_hir::{self as hir, intravisit, CRATE_HIR_ID};
 use rustc_interface::interface;
 use rustc_middle::hir::map::Map;
 use rustc_middle::hir::nested_filter;
@@ -95,10 +93,10 @@ pub(crate) fn run(options: RustdocOptions) -> Result<(), ErrorGuaranteed> {
         crate_cfg: interface::parse_cfgspecs(cfgs),
         crate_check_cfg: interface::parse_check_cfg(options.check_cfgs.clone()),
         input,
-        input_path: None,
         output_file: None,
         output_dir: None,
         file_loader: None,
+        locale_resources: rustc_driver::DEFAULT_LOCALE_RESOURCES,
         lint_caps,
         parse_sess_created: None,
         register_lints: Some(Box::new(crate::lint::register_lints)),
@@ -115,9 +113,7 @@ pub(crate) fn run(options: RustdocOptions) -> Result<(), ErrorGuaranteed> {
     let (tests, unused_extern_reports, compiling_test_count) =
         interface::run_compiler(config, |compiler| {
             compiler.enter(|queries| {
-                let mut global_ctxt = queries.global_ctxt()?.take();
-
-                let collector = global_ctxt.enter(|tcx| {
+                let collector = queries.global_ctxt()?.enter(|tcx| {
                     let crate_attrs = tcx.hir().attrs(CRATE_HIR_ID);
 
                     let opts = scrape_test_config(crate_attrs);
@@ -143,7 +139,7 @@ pub(crate) fn run(options: RustdocOptions) -> Result<(), ErrorGuaranteed> {
                     };
                     hir_collector.visit_testable(
                         "".to_string(),
-                        CRATE_HIR_ID,
+                        CRATE_DEF_ID,
                         tcx.hir().span(CRATE_HIR_ID),
                         |this| tcx.hir().walk_toplevel_module(this),
                     );
@@ -156,9 +152,7 @@ pub(crate) fn run(options: RustdocOptions) -> Result<(), ErrorGuaranteed> {
 
                 let unused_extern_reports = collector.unused_extern_reports.clone();
                 let compiling_test_count = collector.compiling_test_count.load(Ordering::SeqCst);
-                let ret: Result<_, ErrorGuaranteed> =
-                    Ok((collector.tests, unused_extern_reports, compiling_test_count));
-                ret
+                Ok((collector.tests, unused_extern_reports, compiling_test_count))
             })
         })?;
 
@@ -236,11 +230,11 @@ fn scrape_test_config(attrs: &[ast::Attribute]) -> GlobalTestOptions {
         if attr.has_name(sym::no_crate_inject) {
             opts.no_crate_inject = true;
         }
-        if attr.has_name(sym::attr) {
-            if let Some(l) = attr.meta_item_list() {
-                for item in l {
-                    opts.attrs.push(pprust::meta_list_item_to_string(item));
-                }
+        if attr.has_name(sym::attr)
+            && let Some(l) = attr.meta_item_list()
+        {
+            for item in l {
+                opts.attrs.push(pprust::meta_list_item_to_string(item));
             }
         }
     }
@@ -404,6 +398,8 @@ fn run_test(
     compiler.stdin(Stdio::piped());
     compiler.stderr(Stdio::piped());
 
+    debug!("compiler invocation for doctest: {:?}", compiler);
+
     let mut child = compiler.spawn().expect("Failed to spawn rustc process");
     {
         let stdin = child.stdin.as_mut().expect("Failed to open stdin");
@@ -552,8 +548,10 @@ pub(crate) fn make_test(
             // Any errors in parsing should also appear when the doctest is compiled for real, so just
             // send all the errors that librustc_ast emits directly into a `Sink` instead of stderr.
             let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
-            let fallback_bundle =
-                rustc_errors::fallback_fluent_bundle(rustc_errors::DEFAULT_LOCALE_RESOURCES, false);
+            let fallback_bundle = rustc_errors::fallback_fluent_bundle(
+                rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec(),
+                false,
+            );
             supports_color = EmitterWriter::stderr(
                 ColorConfig::Auto,
                 None,
@@ -564,6 +562,7 @@ pub(crate) fn make_test(
                 Some(80),
                 false,
                 false,
+                TerminalUrl::No,
             )
             .supports_color();
 
@@ -578,6 +577,7 @@ pub(crate) fn make_test(
                 None,
                 false,
                 false,
+                TerminalUrl::No,
             );
 
             // FIXME(misdreavus): pass `-Z treat-err-as-bug` to the doctest parser
@@ -599,31 +599,28 @@ pub(crate) fn make_test(
             loop {
                 match parser.parse_item(ForceCollect::No) {
                     Ok(Some(item)) => {
-                        if !found_main {
-                            if let ast::ItemKind::Fn(..) = item.kind {
-                                if item.ident.name == sym::main {
-                                    found_main = true;
-                                }
+                        if !found_main &&
+                            let ast::ItemKind::Fn(..) = item.kind &&
+                            item.ident.name == sym::main
+                        {
+                            found_main = true;
+                        }
+
+                        if !found_extern_crate &&
+                            let ast::ItemKind::ExternCrate(original) = item.kind
+                        {
+                            // This code will never be reached if `crate_name` is none because
+                            // `found_extern_crate` is initialized to `true` if it is none.
+                            let crate_name = crate_name.unwrap();
+
+                            match original {
+                                Some(name) => found_extern_crate = name.as_str() == crate_name,
+                                None => found_extern_crate = item.ident.as_str() == crate_name,
                             }
                         }
 
-                        if !found_extern_crate {
-                            if let ast::ItemKind::ExternCrate(original) = item.kind {
-                                // This code will never be reached if `crate_name` is none because
-                                // `found_extern_crate` is initialized to `true` if it is none.
-                                let crate_name = crate_name.unwrap();
-
-                                match original {
-                                    Some(name) => found_extern_crate = name.as_str() == crate_name,
-                                    None => found_extern_crate = item.ident.as_str() == crate_name,
-                                }
-                            }
-                        }
-
-                        if !found_macro {
-                            if let ast::ItemKind::MacCall(..) = item.kind {
-                                found_macro = true;
-                            }
+                        if !found_macro && let ast::ItemKind::MacCall(..) = item.kind {
+                            found_macro = true;
                         }
 
                         if found_main && found_extern_crate {
@@ -682,6 +679,10 @@ pub(crate) fn make_test(
             // parse the source, but only has false positives, not false
             // negatives.
             if s.contains(crate_name) {
+                // rustdoc implicitly inserts an `extern crate` item for the own crate
+                // which may be unused, so we need to allow the lint.
+                prog.push_str(&format!("#[allow(unused_extern_crates)]\n"));
+
                 prog.push_str(&format!("extern crate r#{crate_name};\n"));
                 line_offset += 1;
             }
@@ -749,8 +750,10 @@ fn check_if_attr_is_complete(source: &str, edition: Edition) -> bool {
             // Any errors in parsing should also appear when the doctest is compiled for real, so just
             // send all the errors that librustc_ast emits directly into a `Sink` instead of stderr.
             let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
-            let fallback_bundle =
-                rustc_errors::fallback_fluent_bundle(rustc_errors::DEFAULT_LOCALE_RESOURCES, false);
+            let fallback_bundle = rustc_errors::fallback_fluent_bundle(
+                rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec(),
+                false,
+            );
 
             let emitter = EmitterWriter::new(
                 Box::new(io::sink()),
@@ -763,6 +766,7 @@ fn check_if_attr_is_complete(source: &str, edition: Edition) -> bool {
                 None,
                 false,
                 false,
+                TerminalUrl::No,
             );
 
             let handler = Handler::with_emitter(false, None, Box::new(emitter));
@@ -771,8 +775,8 @@ fn check_if_attr_is_complete(source: &str, edition: Edition) -> bool {
                 match maybe_new_parser_from_source_str(&sess, filename, source.to_owned()) {
                     Ok(p) => p,
                     Err(_) => {
-                        debug!("Cannot build a parser to check mod attr so skipping...");
-                        return true;
+                        // If there is an unclosed delimiter, an error will be returned by the tokentrees.
+                        return false;
                     }
                 };
             // If a parsing error happened, it's very likely that the attribute is incomplete.
@@ -780,15 +784,7 @@ fn check_if_attr_is_complete(source: &str, edition: Edition) -> bool {
                 e.cancel();
                 return false;
             }
-            // We now check if there is an unclosed delimiter for the attribute. To do so, we look at
-            // the `unclosed_delims` and see if the opening square bracket was closed.
-            parser
-                .unclosed_delims()
-                .get(0)
-                .map(|unclosed| {
-                    unclosed.unclosed_span.map(|s| s.lo()).unwrap_or(BytePos(0)) != BytePos(2)
-                })
-                .unwrap_or(true)
+            true
         })
     })
     .unwrap_or(false)
@@ -976,14 +972,12 @@ impl Collector {
     fn get_filename(&self) -> FileName {
         if let Some(ref source_map) = self.source_map {
             let filename = source_map.span_to_filename(self.position);
-            if let FileName::Real(ref filename) = filename {
-                if let Ok(cur_dir) = env::current_dir() {
-                    if let Some(local_path) = filename.local_path() {
-                        if let Ok(path) = local_path.strip_prefix(&cur_dir) {
-                            return path.to_owned().into();
-                        }
-                    }
-                }
+            if let FileName::Real(ref filename) = filename &&
+                let Ok(cur_dir) = env::current_dir() &&
+                let Some(local_path) = filename.local_path() &&
+                let Ok(path) = local_path.strip_prefix(&cur_dir)
+            {
+                return path.to_owned().into();
             }
             filename
         } else if let Some(ref filename) = self.filename {
@@ -1069,6 +1063,11 @@ impl Tester for Collector {
                     Ignore::Some(ref ignores) => ignores.iter().any(|s| target_str.contains(s)),
                 },
                 ignore_message: None,
+                source_file: "",
+                start_line: 0,
+                start_col: 0,
+                end_line: 0,
+                end_col: 0,
                 // compiler failures are test failures
                 should_panic: test::ShouldPanic::No,
                 compile_fail: config.compile_fail,
@@ -1219,13 +1218,13 @@ impl<'a, 'hir, 'tcx> HirCollector<'a, 'hir, 'tcx> {
     fn visit_testable<F: FnOnce(&mut Self)>(
         &mut self,
         name: String,
-        hir_id: HirId,
+        def_id: LocalDefId,
         sp: Span,
         nested: F,
     ) {
-        let ast_attrs = self.tcx.hir().attrs(hir_id);
+        let ast_attrs = self.tcx.hir().attrs(self.tcx.hir().local_def_id_to_hir_id(def_id));
         if let Some(ref cfg) = ast_attrs.cfg(self.tcx, &FxHashSet::default()) {
-            if !cfg.matches(&self.sess.parse_sess, Some(self.sess.features_untracked())) {
+            if !cfg.matches(&self.sess.parse_sess, Some(self.tcx.features())) {
                 return;
             }
         }
@@ -1238,11 +1237,12 @@ impl<'a, 'hir, 'tcx> HirCollector<'a, 'hir, 'tcx> {
         // The collapse-docs pass won't combine sugared/raw doc attributes, or included files with
         // anything else, this will combine them for us.
         let attrs = Attributes::from_ast(ast_attrs);
-        if let Some(doc) = attrs.collapsed_doc_value() {
+        if let Some(doc) = attrs.opt_doc_value() {
             // Use the outermost invocation, so that doctest names come from where the docs were written.
             let span = ast_attrs
-                .span()
-                .map(|span| span.ctxt().outer_expn().expansion_cause().unwrap_or(span))
+                .iter()
+                .find(|attr| attr.doc_str().is_some())
+                .map(|attr| attr.span.ctxt().outer_expn().expansion_cause().unwrap_or(attr.span))
                 .unwrap_or(DUMMY_SP);
             self.collector.set_position(span);
             markdown::find_testable_code(
@@ -1252,7 +1252,7 @@ impl<'a, 'hir, 'tcx> HirCollector<'a, 'hir, 'tcx> {
                 self.collector.enable_per_target_ignores,
                 Some(&crate::html::markdown::ExtraInfo::new(
                     self.tcx,
-                    hir_id,
+                    def_id.to_def_id(),
                     span_of_attrs(&attrs).unwrap_or(sp),
                 )),
             );
@@ -1281,37 +1281,37 @@ impl<'a, 'hir, 'tcx> intravisit::Visitor<'hir> for HirCollector<'a, 'hir, 'tcx> 
             _ => item.ident.to_string(),
         };
 
-        self.visit_testable(name, item.hir_id(), item.span, |this| {
+        self.visit_testable(name, item.owner_id.def_id, item.span, |this| {
             intravisit::walk_item(this, item);
         });
     }
 
     fn visit_trait_item(&mut self, item: &'hir hir::TraitItem<'_>) {
-        self.visit_testable(item.ident.to_string(), item.hir_id(), item.span, |this| {
+        self.visit_testable(item.ident.to_string(), item.owner_id.def_id, item.span, |this| {
             intravisit::walk_trait_item(this, item);
         });
     }
 
     fn visit_impl_item(&mut self, item: &'hir hir::ImplItem<'_>) {
-        self.visit_testable(item.ident.to_string(), item.hir_id(), item.span, |this| {
+        self.visit_testable(item.ident.to_string(), item.owner_id.def_id, item.span, |this| {
             intravisit::walk_impl_item(this, item);
         });
     }
 
     fn visit_foreign_item(&mut self, item: &'hir hir::ForeignItem<'_>) {
-        self.visit_testable(item.ident.to_string(), item.hir_id(), item.span, |this| {
+        self.visit_testable(item.ident.to_string(), item.owner_id.def_id, item.span, |this| {
             intravisit::walk_foreign_item(this, item);
         });
     }
 
     fn visit_variant(&mut self, v: &'hir hir::Variant<'_>) {
-        self.visit_testable(v.ident.to_string(), v.hir_id, v.span, |this| {
+        self.visit_testable(v.ident.to_string(), v.def_id, v.span, |this| {
             intravisit::walk_variant(this, v);
         });
     }
 
     fn visit_field_def(&mut self, f: &'hir hir::FieldDef<'_>) {
-        self.visit_testable(f.ident.to_string(), f.hir_id, f.span, |this| {
+        self.visit_testable(f.ident.to_string(), f.def_id, f.span, |this| {
             intravisit::walk_field_def(this, f);
         });
     }

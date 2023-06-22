@@ -1,6 +1,7 @@
-use crate::{LateContext, LateLintPass, LintContext};
+use crate::lints::{NonFmtPanicBraces, NonFmtPanicUnused};
+use crate::{fluent_generated as fluent, LateContext, LateLintPass, LintContext};
 use rustc_ast as ast;
-use rustc_errors::{fluent, Applicability};
+use rustc_errors::Applicability;
 use rustc_hir as hir;
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_middle::lint::in_external_macro;
@@ -118,20 +119,21 @@ fn check_panic<'tcx>(cx: &LateContext<'tcx>, f: &'tcx hir::Expr<'tcx>, arg: &'tc
         arg_span = expn.call_site;
     }
 
+    #[allow(rustc::diagnostic_outside_of_impl)]
     cx.struct_span_lint(NON_FMT_PANICS, arg_span, fluent::lint_non_fmt_panic, |lint| {
         lint.set_arg("name", symbol);
-        lint.note(fluent::note);
-        lint.note(fluent::more_info_note);
+        lint.note(fluent::lint_note);
+        lint.note(fluent::lint_more_info_note);
         if !is_arg_inside_call(arg_span, span) {
             // No clue where this argument is coming from.
             return lint;
         }
-        if arg_macro.map_or(false, |id| cx.tcx.is_diagnostic_item(sym::format_macro, id)) {
+        if arg_macro.is_some_and(|id| cx.tcx.is_diagnostic_item(sym::format_macro, id)) {
             // A case of `panic!(format!(..))`.
-            lint.note(fluent::supports_fmt_note);
+            lint.note(fluent::lint_supports_fmt_note);
             if let Some((open, close, _)) = find_delimiters(cx, arg_span) {
                 lint.multipart_suggestion(
-                    fluent::supports_fmt_suggestion,
+                    fluent::lint_supports_fmt_suggestion,
                     vec![
                         (arg_span.until(open.shrink_to_hi()), "".into()),
                         (close.until(arg_span.shrink_to_hi()), "".into()),
@@ -144,7 +146,7 @@ fn check_panic<'tcx>(cx: &LateContext<'tcx>, f: &'tcx hir::Expr<'tcx>, arg: &'tc
             // If this is a &str or String, we can confidently give the `"{}", ` suggestion.
             let is_str = matches!(
                 ty.kind(),
-                ty::Ref(_, r, _) if *r.kind() == ty::Str,
+                ty::Ref(_, r, _) if r.is_str(),
             ) || matches!(
                 ty.ty_adt_def(),
                 Some(ty_def) if Some(ty_def.did()) == cx.tcx.lang_items().string(),
@@ -177,7 +179,7 @@ fn check_panic<'tcx>(cx: &LateContext<'tcx>, f: &'tcx hir::Expr<'tcx>, arg: &'tc
             if suggest_display {
                 lint.span_suggestion_verbose(
                     arg_span.shrink_to_lo(),
-                    fluent::display_suggestion,
+                    fluent::lint_display_suggestion,
                     "\"{}\", ",
                     fmt_applicability,
                 );
@@ -185,7 +187,7 @@ fn check_panic<'tcx>(cx: &LateContext<'tcx>, f: &'tcx hir::Expr<'tcx>, arg: &'tc
                 lint.set_arg("ty", ty);
                 lint.span_suggestion_verbose(
                     arg_span.shrink_to_lo(),
-                    fluent::debug_suggestion,
+                    fluent::lint_debug_suggestion,
                     "\"{:?}\", ",
                     fmt_applicability,
                 );
@@ -195,7 +197,7 @@ fn check_panic<'tcx>(cx: &LateContext<'tcx>, f: &'tcx hir::Expr<'tcx>, arg: &'tc
                 if let Some((open, close, del)) = find_delimiters(cx, span) {
                     lint.set_arg("already_suggested", suggest_display || suggest_debug);
                     lint.multipart_suggestion(
-                        fluent::panic_suggestion,
+                        fluent::lint_panic_suggestion,
                         if del == '(' {
                             vec![(span.until(open), "std::panic::panic_any".into())]
                         } else {
@@ -253,25 +255,14 @@ fn check_panic_str<'tcx>(
                 .map(|span| fmt_span.from_inner(InnerSpan::new(span.start, span.end)))
                 .collect(),
         };
-        cx.struct_span_lint(NON_FMT_PANICS, arg_spans, fluent::lint_non_fmt_panic_unused, |lint| {
-            lint.set_arg("count", n_arguments);
-            lint.note(fluent::note);
-            if is_arg_inside_call(arg.span, span) {
-                lint.span_suggestion(
-                    arg.span.shrink_to_hi(),
-                    fluent::add_args_suggestion,
-                    ", ...",
-                    Applicability::HasPlaceholders,
-                );
-                lint.span_suggestion(
-                    arg.span.shrink_to_lo(),
-                    fluent::add_fmt_suggestion,
-                    "\"{}\", ",
-                    Applicability::MachineApplicable,
-                );
-            }
-            lint
-        });
+        cx.emit_spanned_lint(
+            NON_FMT_PANICS,
+            arg_spans,
+            NonFmtPanicUnused {
+                count: n_arguments,
+                suggestion: is_arg_inside_call(arg.span, span).then_some(arg.span),
+            },
+        );
     } else {
         let brace_spans: Option<Vec<_>> =
             snippet.filter(|s| s.starts_with('"') || s.starts_with("r#")).map(|s| {
@@ -281,22 +272,12 @@ fn check_panic_str<'tcx>(
                     .collect()
             });
         let count = brace_spans.as_ref().map(|v| v.len()).unwrap_or(/* any number >1 */ 2);
-        cx.struct_span_lint(
+        cx.emit_spanned_lint(
             NON_FMT_PANICS,
             brace_spans.unwrap_or_else(|| vec![span]),
-            fluent::lint_non_fmt_panic_braces,
-            |lint| {
-                lint.set_arg("count", count);
-                lint.note(fluent::note);
-                if is_arg_inside_call(arg.span, span) {
-                    lint.span_suggestion(
-                        arg.span.shrink_to_lo(),
-                        fluent::suggestion,
-                        "\"{}\", ",
-                        Applicability::MachineApplicable,
-                    );
-                }
-                lint
+            NonFmtPanicBraces {
+                count,
+                suggestion: is_arg_inside_call(arg.span, span).then_some(arg.span.shrink_to_lo()),
             },
         );
     }

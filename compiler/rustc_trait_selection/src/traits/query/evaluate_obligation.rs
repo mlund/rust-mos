@@ -1,3 +1,4 @@
+use rustc_infer::traits::{TraitEngine, TraitEngineExt};
 use rustc_middle::ty;
 
 use crate::infer::canonical::OriginalQueryValues;
@@ -66,7 +67,7 @@ impl<'tcx> InferCtxtExt<'tcx> for InferCtxt<'tcx> {
         let mut _orig_values = OriginalQueryValues::default();
 
         let param_env = match obligation.predicate.kind().skip_binder() {
-            ty::PredicateKind::Clause(ty::Clause::Trait(pred)) => {
+            ty::PredicateKind::Clause(ty::ClauseKind::Trait(pred)) => {
                 // we ignore the value set to it.
                 let mut _constness = pred.constness;
                 obligation
@@ -77,12 +78,31 @@ impl<'tcx> InferCtxtExt<'tcx> for InferCtxt<'tcx> {
             _ => obligation.param_env.without_const(),
         };
 
-        let c_pred = self
-            .canonicalize_query_keep_static(param_env.and(obligation.predicate), &mut _orig_values);
-        // Run canonical query. If overflow occurs, rerun from scratch but this time
-        // in standard trait query mode so that overflow is handled appropriately
-        // within `SelectionContext`.
-        self.tcx.at(obligation.cause.span()).evaluate_obligation(c_pred)
+        if self.next_trait_solver() {
+            self.probe(|snapshot| {
+                let mut fulfill_cx = crate::solve::FulfillmentCtxt::new();
+                fulfill_cx.register_predicate_obligation(self, obligation.clone());
+                // True errors
+                // FIXME(-Ztrait-solver=next): Overflows are reported as ambig here, is that OK?
+                if !fulfill_cx.select_where_possible(self).is_empty() {
+                    Ok(EvaluationResult::EvaluatedToErr)
+                } else if !fulfill_cx.select_all_or_error(self).is_empty() {
+                    Ok(EvaluationResult::EvaluatedToAmbig)
+                } else if self.opaque_types_added_in_snapshot(snapshot) {
+                    Ok(EvaluationResult::EvaluatedToOkModuloOpaqueTypes)
+                } else if self.region_constraints_added_in_snapshot(snapshot) {
+                    Ok(EvaluationResult::EvaluatedToOkModuloRegions)
+                } else {
+                    Ok(EvaluationResult::EvaluatedToOk)
+                }
+            })
+        } else {
+            let c_pred = self.canonicalize_query_keep_static(
+                param_env.and(obligation.predicate),
+                &mut _orig_values,
+            );
+            self.tcx.at(obligation.cause.span()).evaluate_obligation(c_pred)
+        }
     }
 
     // Helper function that canonicalizes and runs the query. If an
@@ -92,6 +112,9 @@ impl<'tcx> InferCtxtExt<'tcx> for InferCtxt<'tcx> {
         &self,
         obligation: &PredicateObligation<'tcx>,
     ) -> EvaluationResult {
+        // Run canonical query. If overflow occurs, rerun from scratch but this time
+        // in standard trait query mode so that overflow is handled appropriately
+        // within `SelectionContext`.
         match self.evaluate_obligation(obligation) {
             Ok(result) => result,
             Err(OverflowError::Canonical) => {

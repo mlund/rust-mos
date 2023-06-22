@@ -47,6 +47,7 @@ pub enum FlycheckConfig {
         features: Vec<String>,
         extra_args: Vec<String>,
         extra_env: FxHashMap<String, String>,
+        ansi_color_output: bool,
     },
     CustomCommand {
         command: String,
@@ -60,9 +61,9 @@ pub enum FlycheckConfig {
 impl fmt::Display for FlycheckConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            FlycheckConfig::CargoCommand { command, .. } => write!(f, "cargo {}", command),
+            FlycheckConfig::CargoCommand { command, .. } => write!(f, "cargo {command}"),
             FlycheckConfig::CustomCommand { command, args, .. } => {
-                write!(f, "{} {}", command, args.join(" "))
+                write!(f, "{command} {}", args.join(" "))
             }
         }
     }
@@ -75,8 +76,8 @@ impl fmt::Display for FlycheckConfig {
 #[derive(Debug)]
 pub struct FlycheckHandle {
     // XXX: drop order is significant
-    sender: Sender<Restart>,
-    _thread: jod_thread::JoinHandle,
+    sender: Sender<StateChange>,
+    _thread: stdx::thread::JoinHandle,
     id: usize,
 }
 
@@ -88,8 +89,8 @@ impl FlycheckHandle {
         workspace_root: AbsPathBuf,
     ) -> FlycheckHandle {
         let actor = FlycheckActor::new(id, sender, config, workspace_root);
-        let (sender, receiver) = unbounded::<Restart>();
-        let thread = jod_thread::Builder::new()
+        let (sender, receiver) = unbounded::<StateChange>();
+        let thread = stdx::thread::Builder::new(stdx::thread::ThreadIntent::Worker)
             .name("Flycheck".to_owned())
             .spawn(move || actor.run(receiver))
             .expect("failed to spawn thread");
@@ -98,12 +99,12 @@ impl FlycheckHandle {
 
     /// Schedule a re-start of the cargo check worker.
     pub fn restart(&self) {
-        self.sender.send(Restart::Yes).unwrap();
+        self.sender.send(StateChange::Restart).unwrap();
     }
 
     /// Stop this cargo check worker.
     pub fn cancel(&self) {
-        self.sender.send(Restart::No).unwrap();
+        self.sender.send(StateChange::Cancel).unwrap();
     }
 
     pub fn id(&self) -> usize {
@@ -148,9 +149,9 @@ pub enum Progress {
     DidFailToRestart(String),
 }
 
-enum Restart {
-    Yes,
-    No,
+enum StateChange {
+    Restart,
+    Cancel,
 }
 
 /// A [`FlycheckActor`] is a single check instance of a workspace.
@@ -171,7 +172,7 @@ struct FlycheckActor {
 }
 
 enum Event {
-    Restart(Restart),
+    RequestStateChange(StateChange),
     CheckEvent(Option<CargoMessage>),
 }
 
@@ -190,30 +191,31 @@ impl FlycheckActor {
         self.send(Message::Progress { id: self.id, progress });
     }
 
-    fn next_event(&self, inbox: &Receiver<Restart>) -> Option<Event> {
+    fn next_event(&self, inbox: &Receiver<StateChange>) -> Option<Event> {
         let check_chan = self.cargo_handle.as_ref().map(|cargo| &cargo.receiver);
         if let Ok(msg) = inbox.try_recv() {
             // give restarts a preference so check outputs don't block a restart or stop
-            return Some(Event::Restart(msg));
+            return Some(Event::RequestStateChange(msg));
         }
         select! {
-            recv(inbox) -> msg => msg.ok().map(Event::Restart),
+            recv(inbox) -> msg => msg.ok().map(Event::RequestStateChange),
             recv(check_chan.unwrap_or(&never())) -> msg => Some(Event::CheckEvent(msg.ok())),
         }
     }
 
-    fn run(mut self, inbox: Receiver<Restart>) {
+    fn run(mut self, inbox: Receiver<StateChange>) {
         'event: while let Some(event) = self.next_event(&inbox) {
             match event {
-                Event::Restart(Restart::No) => {
+                Event::RequestStateChange(StateChange::Cancel) => {
+                    tracing::debug!(flycheck_id = self.id, "flycheck cancelled");
                     self.cancel_check_process();
                 }
-                Event::Restart(Restart::Yes) => {
+                Event::RequestStateChange(StateChange::Restart) => {
                     // Cancel the previously spawned process
                     self.cancel_check_process();
                     while let Ok(restart) = inbox.recv_timeout(Duration::from_millis(50)) {
                         // restart chained with a stop, so just cancel
-                        if let Restart::No = restart {
+                        if let StateChange::Cancel = restart {
                             continue 'event;
                         }
                     }
@@ -254,10 +256,20 @@ impl FlycheckActor {
                 }
                 Event::CheckEvent(Some(message)) => match message {
                     CargoMessage::CompilerArtifact(msg) => {
+                        tracing::trace!(
+                            flycheck_id = self.id,
+                            artifact = msg.target.name,
+                            "artifact received"
+                        );
                         self.report_progress(Progress::DidCheckCrate(msg.target.name));
                     }
 
                     CargoMessage::Diagnostic(msg) => {
+                        tracing::trace!(
+                            flycheck_id = self.id,
+                            message = msg.message,
+                            "diagnostic received"
+                        );
                         self.send(Message::AddDiagnostic {
                             id: self.id,
                             workspace_root: self.root.clone(),
@@ -293,15 +305,24 @@ impl FlycheckActor {
                 extra_args,
                 features,
                 extra_env,
+                ansi_color_output,
             } => {
                 let mut cmd = Command::new(toolchain::cargo());
                 cmd.arg(command);
                 cmd.current_dir(&self.root);
-                cmd.args(&["--workspace", "--message-format=json", "--manifest-path"])
-                    .arg(self.root.join("Cargo.toml").as_os_str());
+                cmd.arg("--workspace");
+
+                cmd.arg(if *ansi_color_output {
+                    "--message-format=json-diagnostic-rendered-ansi"
+                } else {
+                    "--message-format=json"
+                });
+
+                cmd.arg("--manifest-path");
+                cmd.arg(self.root.join("Cargo.toml").as_os_str());
 
                 for target in target_triples {
-                    cmd.args(&["--target", target.as_str()]);
+                    cmd.args(["--target", target.as_str()]);
                 }
                 if *all_targets {
                     cmd.arg("--all-targets");
@@ -360,28 +381,35 @@ impl FlycheckActor {
     }
 }
 
-struct JodChild(GroupChild);
+struct JodGroupChild(GroupChild);
+
+impl Drop for JodGroupChild {
+    fn drop(&mut self) {
+        _ = self.0.kill();
+        _ = self.0.wait();
+    }
+}
 
 /// A handle to a cargo process used for fly-checking.
 struct CargoHandle {
     /// The handle to the actual cargo process. As we cannot cancel directly from with
     /// a read syscall dropping and therefore terminating the process is our best option.
-    child: JodChild,
-    thread: jod_thread::JoinHandle<io::Result<(bool, String)>>,
+    child: JodGroupChild,
+    thread: stdx::thread::JoinHandle<io::Result<(bool, String)>>,
     receiver: Receiver<CargoMessage>,
 }
 
 impl CargoHandle {
     fn spawn(mut command: Command) -> std::io::Result<CargoHandle> {
         command.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
-        let mut child = command.group_spawn().map(JodChild)?;
+        let mut child = command.group_spawn().map(JodGroupChild)?;
 
         let stdout = child.0.inner().stdout.take().unwrap();
         let stderr = child.0.inner().stderr.take().unwrap();
 
         let (sender, receiver) = unbounded();
         let actor = CargoActor::new(sender, stdout, stderr);
-        let thread = jod_thread::Builder::new()
+        let thread = stdx::thread::Builder::new(stdx::thread::ThreadIntent::Worker)
             .name("CargoHandle".to_owned())
             .spawn(move || actor.run())
             .expect("failed to spawn thread");
@@ -401,8 +429,7 @@ impl CargoHandle {
             Ok(())
         } else {
             Err(io::Error::new(io::ErrorKind::Other, format!(
-                "Cargo watcher failed, the command produced no valid metadata (exit code: {:?}):\n{}",
-                exit_status, error
+                "Cargo watcher failed, the command produced no valid metadata (exit code: {exit_status:?}):\n{error}"
             )))
         }
     }
@@ -429,45 +456,59 @@ impl CargoActor {
         // simply skip a line if it doesn't parse, which just ignores any
         // erroneous output.
 
-        let mut error = String::new();
-        let mut read_at_least_one_message = false;
+        let mut stdout_errors = String::new();
+        let mut stderr_errors = String::new();
+        let mut read_at_least_one_stdout_message = false;
+        let mut read_at_least_one_stderr_message = false;
+        let process_line = |line: &str, error: &mut String| {
+            // Try to deserialize a message from Cargo or Rustc.
+            let mut deserializer = serde_json::Deserializer::from_str(line);
+            deserializer.disable_recursion_limit();
+            if let Ok(message) = JsonMessage::deserialize(&mut deserializer) {
+                match message {
+                    // Skip certain kinds of messages to only spend time on what's useful
+                    JsonMessage::Cargo(message) => match message {
+                        cargo_metadata::Message::CompilerArtifact(artifact) if !artifact.fresh => {
+                            self.sender.send(CargoMessage::CompilerArtifact(artifact)).unwrap();
+                        }
+                        cargo_metadata::Message::CompilerMessage(msg) => {
+                            self.sender.send(CargoMessage::Diagnostic(msg.message)).unwrap();
+                        }
+                        _ => (),
+                    },
+                    JsonMessage::Rustc(message) => {
+                        self.sender.send(CargoMessage::Diagnostic(message)).unwrap();
+                    }
+                }
+                return true;
+            }
+
+            error.push_str(line);
+            error.push('\n');
+            false
+        };
         let output = streaming_output(
             self.stdout,
             self.stderr,
             &mut |line| {
-                read_at_least_one_message = true;
-
-                // Try to deserialize a message from Cargo or Rustc.
-                let mut deserializer = serde_json::Deserializer::from_str(line);
-                deserializer.disable_recursion_limit();
-                if let Ok(message) = JsonMessage::deserialize(&mut deserializer) {
-                    match message {
-                        // Skip certain kinds of messages to only spend time on what's useful
-                        JsonMessage::Cargo(message) => match message {
-                            cargo_metadata::Message::CompilerArtifact(artifact)
-                                if !artifact.fresh =>
-                            {
-                                self.sender.send(CargoMessage::CompilerArtifact(artifact)).unwrap();
-                            }
-                            cargo_metadata::Message::CompilerMessage(msg) => {
-                                self.sender.send(CargoMessage::Diagnostic(msg.message)).unwrap();
-                            }
-                            _ => (),
-                        },
-                        JsonMessage::Rustc(message) => {
-                            self.sender.send(CargoMessage::Diagnostic(message)).unwrap();
-                        }
-                    }
+                if process_line(line, &mut stdout_errors) {
+                    read_at_least_one_stdout_message = true;
                 }
             },
             &mut |line| {
-                error.push_str(line);
-                error.push('\n');
+                if process_line(line, &mut stderr_errors) {
+                    read_at_least_one_stderr_message = true;
+                }
             },
         );
+
+        let read_at_least_one_message =
+            read_at_least_one_stdout_message || read_at_least_one_stderr_message;
+        let mut error = stdout_errors;
+        error.push_str(&stderr_errors);
         match output {
             Ok(_) => Ok((read_at_least_one_message, error)),
-            Err(e) => Err(io::Error::new(e.kind(), format!("{:?}: {}", e, error))),
+            Err(e) => Err(io::Error::new(e.kind(), format!("{e:?}: {error}"))),
         }
     }
 }

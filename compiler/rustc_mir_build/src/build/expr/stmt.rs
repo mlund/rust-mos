@@ -40,7 +40,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 // Generate better code for things that don't need to be
                 // dropped.
                 if lhs.ty.needs_drop(this.tcx, this.param_env) {
-                    let rhs = unpack!(block = this.as_local_operand(block, rhs));
+                    let rhs = unpack!(block = this.as_local_rvalue(block, rhs));
                     let lhs = unpack!(block = this.as_place(block, lhs));
                     unpack!(block = this.build_drop_and_replace(block, lhs_span, lhs, rhs));
                 } else {
@@ -57,7 +57,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 // question raised here -- should we "freeze" the
                 // value of the lhs here?  I'm inclined to think not,
                 // since it seems closer to the semantics of the
-                // overloaded version, which takes `&mut self`.  This
+                // overloaded version, which takes `&mut self`. This
                 // only affects weird things like `x += {x += 1; x}`
                 // -- is that equal to `x + (x + 1)` or `2*(x+1)`?
 
@@ -113,7 +113,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 //
                 // it is usually better to focus on `the_value` rather
                 // than the entirety of block(s) surrounding it.
-                let adjusted_span = (|| {
+                let adjusted_span =
                     if let ExprKind::Block { block } = expr.kind
                         && let Some(tail_ex) = this.thir[block].expr
                     {
@@ -135,10 +135,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                             tail_result_is_ignored: true,
                             span: expr.span,
                         });
-                        return Some(expr.span);
-                    }
-                    None
-                })();
+                        Some(expr.span)
+                    } else {
+                        None
+                    };
 
                 let temp =
                     unpack!(block = this.as_temp(block, statement_scope, expr, Mutability::Not));

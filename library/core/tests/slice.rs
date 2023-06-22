@@ -1,6 +1,7 @@
 use core::cell::Cell;
 use core::cmp::Ordering;
 use core::mem::MaybeUninit;
+use core::num::NonZeroUsize;
 use core::result::Result::{Err, Ok};
 use core::slice;
 
@@ -142,20 +143,20 @@ fn test_iterator_advance_by() {
 
     for i in 0..=v.len() {
         let mut iter = v.iter();
-        iter.advance_by(i).unwrap();
+        assert_eq!(iter.advance_by(i), Ok(()));
         assert_eq!(iter.as_slice(), &v[i..]);
     }
 
     let mut iter = v.iter();
-    assert_eq!(iter.advance_by(v.len() + 1), Err(v.len()));
+    assert_eq!(iter.advance_by(v.len() + 1), Err(NonZeroUsize::new(1).unwrap()));
     assert_eq!(iter.as_slice(), &[]);
 
     let mut iter = v.iter();
-    iter.advance_by(3).unwrap();
+    assert_eq!(iter.advance_by(3), Ok(()));
     assert_eq!(iter.as_slice(), &v[3..]);
-    iter.advance_by(2).unwrap();
+    assert_eq!(iter.advance_by(2), Ok(()));
     assert_eq!(iter.as_slice(), &[]);
-    iter.advance_by(0).unwrap();
+    assert_eq!(iter.advance_by(0), Ok(()));
 }
 
 #[test]
@@ -164,20 +165,20 @@ fn test_iterator_advance_back_by() {
 
     for i in 0..=v.len() {
         let mut iter = v.iter();
-        iter.advance_back_by(i).unwrap();
+        assert_eq!(iter.advance_back_by(i), Ok(()));
         assert_eq!(iter.as_slice(), &v[..v.len() - i]);
     }
 
     let mut iter = v.iter();
-    assert_eq!(iter.advance_back_by(v.len() + 1), Err(v.len()));
+    assert_eq!(iter.advance_back_by(v.len() + 1), Err(NonZeroUsize::new(1).unwrap()));
     assert_eq!(iter.as_slice(), &[]);
 
     let mut iter = v.iter();
-    iter.advance_back_by(3).unwrap();
+    assert_eq!(iter.advance_back_by(3), Ok(()));
     assert_eq!(iter.as_slice(), &v[..v.len() - 3]);
-    iter.advance_back_by(2).unwrap();
+    assert_eq!(iter.advance_back_by(2), Ok(()));
     assert_eq!(iter.as_slice(), &[]);
-    iter.advance_back_by(0).unwrap();
+    assert_eq!(iter.advance_back_by(0), Ok(()));
 }
 
 #[test]
@@ -1488,7 +1489,7 @@ mod slice_index {
                 // optional:
                 //
                 // one or more similar inputs for which data[input] succeeds,
-                // and the corresponding output as an array.  This helps validate
+                // and the corresponding output as an array. This helps validate
                 // "critical points" where an input range straddles the boundary
                 // between valid and invalid.
                 // (such as the input `len..len`, which is just barely valid)
@@ -1805,7 +1806,7 @@ fn brute_force_rotate_test_1() {
 fn sort_unstable() {
     use core::cmp::Ordering::{Equal, Greater, Less};
     use core::slice::heapsort;
-    use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
+    use rand::{seq::SliceRandom, Rng};
 
     // Miri is too slow (but still need to `chain` to make the types match)
     let lens = if cfg!(miri) { (2..20).chain(0..0) } else { (2..25).chain(500..510) };
@@ -1813,7 +1814,7 @@ fn sort_unstable() {
 
     let mut v = [0; 600];
     let mut tmp = [0; 600];
-    let mut rng = StdRng::from_entropy();
+    let mut rng = crate::test_rng();
 
     for len in lens {
         let v = &mut v[0..len];
@@ -1879,11 +1880,10 @@ fn sort_unstable() {
 #[cfg_attr(miri, ignore)] // Miri is too slow
 fn select_nth_unstable() {
     use core::cmp::Ordering::{Equal, Greater, Less};
-    use rand::rngs::StdRng;
     use rand::seq::SliceRandom;
-    use rand::{Rng, SeedableRng};
+    use rand::Rng;
 
-    let mut rng = StdRng::from_entropy();
+    let mut rng = crate::test_rng();
 
     for len in (2..21).chain(500..501) {
         let mut orig = vec![0; len];

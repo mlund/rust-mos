@@ -1,10 +1,8 @@
 #![allow(non_camel_case_types)]
 
-use rustc_errors::struct_span_err;
 use rustc_hir::LangItem;
 use rustc_middle::mir::interpret::ConstValue;
 use rustc_middle::ty::{self, layout::TyAndLayout, Ty, TyCtxt};
-use rustc_session::Session;
 use rustc_span::Span;
 
 use crate::base;
@@ -134,7 +132,7 @@ pub fn build_langcall<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
 // all shifts). For 32- and 64-bit types, this matches the semantics
 // of Java. (See related discussion on #1877 and #10183.)
 
-pub fn build_unchecked_lshift<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
+pub fn build_masked_lshift<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     bx: &mut Bx,
     lhs: Bx::Value,
     rhs: Bx::Value,
@@ -145,7 +143,7 @@ pub fn build_unchecked_lshift<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     bx.shl(lhs, rhs)
 }
 
-pub fn build_unchecked_rshift<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
+pub fn build_masked_rshift<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     bx: &mut Bx,
     lhs_t: Ty<'tcx>,
     lhs: Bx::Value,
@@ -191,10 +189,6 @@ pub fn shift_mask_val<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         }
         _ => bug!("shift_mask_val: expected Integer or Vector, found {:?}", kind),
     }
-}
-
-pub fn span_invalid_monomorphization_error(a: &Session, b: Span, c: &str) {
-    struct_span_err!(a, b, E0511, "{}", c).emit();
 }
 
 pub fn asm_const_to_str<'tcx>(

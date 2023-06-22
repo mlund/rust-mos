@@ -1,6 +1,6 @@
 use crate::stable_hasher::{HashStable, StableHasher, StableOrd};
 use std::borrow::Borrow;
-use std::cmp::Ordering;
+use std::fmt::Debug;
 use std::mem;
 use std::ops::{Bound, Index, IndexMut, RangeBounds};
 
@@ -16,7 +16,7 @@ pub use index_map::SortedIndexMultiMap;
 /// stores data in a more compact way. It also supports accessing contiguous
 /// ranges of elements as a slice, and slices of already sorted elements can be
 /// inserted efficiently.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Encodable, Decodable)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Encodable, Decodable)]
 pub struct SortedMap<K, V> {
     data: Vec<(K, V)>,
 }
@@ -170,7 +170,7 @@ impl<K: Ord, V> SortedMap<K, V> {
     where
         F: Fn(&mut K),
     {
-        self.data.iter_mut().map(|&mut (ref mut k, _)| k).for_each(f);
+        self.data.iter_mut().map(|(k, _)| k).for_each(f);
     }
 
     /// Inserts a presorted range of elements into the map. If the range can be
@@ -231,10 +231,10 @@ impl<K: Ord, V> SortedMap<K, V> {
         R: RangeBounds<K>,
     {
         let start = match range.start_bound() {
-            Bound::Included(ref k) => match self.lookup_index_for(k) {
+            Bound::Included(k) => match self.lookup_index_for(k) {
                 Ok(index) | Err(index) => index,
             },
-            Bound::Excluded(ref k) => match self.lookup_index_for(k) {
+            Bound::Excluded(k) => match self.lookup_index_for(k) {
                 Ok(index) => index + 1,
                 Err(index) => index,
             },
@@ -242,11 +242,11 @@ impl<K: Ord, V> SortedMap<K, V> {
         };
 
         let end = match range.end_bound() {
-            Bound::Included(ref k) => match self.lookup_index_for(k) {
+            Bound::Included(k) => match self.lookup_index_for(k) {
                 Ok(index) => index + 1,
                 Err(index) => index,
             },
-            Bound::Excluded(ref k) => match self.lookup_index_for(k) {
+            Bound::Excluded(k) => match self.lookup_index_for(k) {
                 Ok(index) | Err(index) => index,
             },
             Bound::Unbounded => self.data.len(),
@@ -301,7 +301,7 @@ impl<K: Ord, V> FromIterator<(K, V)> for SortedMap<K, V> {
         let mut data: Vec<(K, V)> = iter.into_iter().collect();
 
         data.sort_unstable_by(|(k1, _), (k2, _)| k1.cmp(k2));
-        data.dedup_by(|&mut (ref k1, _), &mut (ref k2, _)| k1.cmp(k2) == Ordering::Equal);
+        data.dedup_by(|(k1, _), (k2, _)| k1 == k2);
 
         SortedMap { data }
     }
@@ -311,6 +311,12 @@ impl<K: HashStable<CTX> + StableOrd, V: HashStable<CTX>, CTX> HashStable<CTX> fo
     #[inline]
     fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
         self.data.hash_stable(ctx, hasher);
+    }
+}
+
+impl<K: Debug, V: Debug> Debug for SortedMap<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.data.iter().map(|(a, b)| (a, b))).finish()
     }
 }
 

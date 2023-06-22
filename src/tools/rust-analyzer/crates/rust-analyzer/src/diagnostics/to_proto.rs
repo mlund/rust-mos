@@ -79,36 +79,33 @@ fn position(
     position_encoding: &PositionEncoding,
     span: &DiagnosticSpan,
     line_offset: usize,
-    column_offset: usize,
+    column_offset_utf32: usize,
 ) -> lsp_types::Position {
     let line_index = line_offset - span.line_start;
 
-    let mut true_column_offset = column_offset;
-    if let Some(line) = span.text.get(line_index) {
-        if line.text.chars().count() == line.text.len() {
-            // all one byte utf-8 char
-            return lsp_types::Position {
-                line: (line_offset as u32).saturating_sub(1),
-                character: (column_offset as u32).saturating_sub(1),
-            };
-        }
-        let mut char_offset = 0;
-        let len_func = match position_encoding {
-            PositionEncoding::Utf8 => char::len_utf8,
-            PositionEncoding::Utf16 => char::len_utf16,
-        };
-        for c in line.text.chars() {
-            char_offset += 1;
-            if char_offset > column_offset {
-                break;
+    let column_offset_encoded = match span.text.get(line_index) {
+        // Fast path.
+        Some(line) if line.text.is_ascii() => column_offset_utf32,
+        Some(line) => {
+            let line_prefix_len = line
+                .text
+                .char_indices()
+                .take(column_offset_utf32)
+                .last()
+                .map(|(pos, c)| pos + c.len_utf8())
+                .unwrap_or(0);
+            let line_prefix = &line.text[..line_prefix_len];
+            match position_encoding {
+                PositionEncoding::Utf8 => line_prefix.len(),
+                PositionEncoding::Wide(enc) => enc.measure(line_prefix),
             }
-            true_column_offset += len_func(c) - 1;
         }
-    }
+        None => column_offset_utf32,
+    };
 
     lsp_types::Position {
         line: (line_offset as u32).saturating_sub(1),
-        character: (true_column_offset as u32).saturating_sub(1),
+        character: (column_offset_encoded as u32).saturating_sub(1),
     }
 }
 
@@ -161,7 +158,7 @@ fn resolve_path(
         .iter()
         .find_map(|(from, to)| file_name.strip_prefix(from).map(|file_name| (to, file_name)))
     {
-        Some((to, file_name)) => workspace_root.join(format!("{}{}", to, file_name)),
+        Some((to, file_name)) => workspace_root.join(format!("{to}{file_name}")),
         None => workspace_root.join(file_name),
     }
 }
@@ -191,6 +188,7 @@ fn map_rust_child_diagnostic(
 
     let mut edit_map: HashMap<lsp_types::Url, Vec<lsp_types::TextEdit>> = HashMap::new();
     let mut suggested_replacements = Vec::new();
+    let mut is_preferred = true;
     for &span in &spans {
         if let Some(suggested_replacement) = &span.suggested_replacement {
             if !suggested_replacement.is_empty() {
@@ -209,6 +207,8 @@ fn map_rust_child_diagnostic(
             ) {
                 edit_map.entry(location.uri).or_default().push(edit);
             }
+            is_preferred &=
+                matches!(span.suggestion_applicability, Some(Applicability::MachineApplicable));
         }
     }
 
@@ -218,7 +218,7 @@ fn map_rust_child_diagnostic(
     if !suggested_replacements.is_empty() {
         message.push_str(": ");
         let suggestions =
-            suggested_replacements.iter().map(|suggestion| format!("`{}`", suggestion)).join(", ");
+            suggested_replacements.iter().map(|suggestion| format!("`{suggestion}`")).join(", ");
         message.push_str(&suggestions);
     }
 
@@ -251,7 +251,7 @@ fn map_rust_child_diagnostic(
                         document_changes: None,
                         change_annotations: None,
                     }),
-                    is_preferred: Some(true),
+                    is_preferred: Some(is_preferred),
                     data: None,
                     command: None,
                 },
@@ -493,7 +493,7 @@ fn rustc_code_description(code: Option<&str>) -> Option<lsp_types::CodeDescripti
             && chars.next().is_none()
     })
     .and_then(|code| {
-        lsp_types::Url::parse(&format!("https://doc.rust-lang.org/error-index.html#{}", code))
+        lsp_types::Url::parse(&format!("https://doc.rust-lang.org/error-index.html#{code}"))
             .ok()
             .map(|href| lsp_types::CodeDescription { href })
     })
@@ -502,8 +502,7 @@ fn rustc_code_description(code: Option<&str>) -> Option<lsp_types::CodeDescripti
 fn clippy_code_description(code: Option<&str>) -> Option<lsp_types::CodeDescription> {
     code.and_then(|code| {
         lsp_types::Url::parse(&format!(
-            "https://rust-lang.github.io/rust-clippy/master/index.html#{}",
-            code
+            "https://rust-lang.github.io/rust-clippy/master/index.html#{code}"
         ))
         .ok()
         .map(|href| lsp_types::CodeDescription { href })
@@ -532,7 +531,7 @@ mod tests {
         let (sender, _) = crossbeam_channel::unbounded();
         let state = GlobalState::new(
             sender,
-            Config::new(workspace_root.to_path_buf(), ClientCapabilities::default()),
+            Config::new(workspace_root.to_path_buf(), ClientCapabilities::default(), Vec::new()),
         );
         let snap = state.snapshot();
         let mut actual = map_rust_diagnostic_to_lsp(&config, &diagnostic, workspace_root, &snap);

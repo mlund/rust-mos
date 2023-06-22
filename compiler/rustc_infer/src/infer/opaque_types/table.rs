@@ -1,5 +1,4 @@
 use rustc_data_structures::undo_log::UndoLogs;
-use rustc_hir::OpaqueTyOrigin;
 use rustc_middle::ty::{self, OpaqueHiddenType, OpaqueTypeKey, Ty};
 use rustc_span::DUMMY_SP;
 
@@ -29,11 +28,6 @@ impl<'tcx> OpaqueTypeStorage<'tcx> {
         }
     }
 
-    #[instrument(level = "debug", ret)]
-    pub fn take_opaque_types(&mut self) -> OpaqueTypeMap<'tcx> {
-        std::mem::take(&mut self.opaque_types)
-    }
-
     #[inline]
     pub(crate) fn with_log<'a>(
         &'a mut self,
@@ -47,7 +41,7 @@ impl<'tcx> Drop for OpaqueTypeStorage<'tcx> {
     fn drop(&mut self) {
         if !self.opaque_types.is_empty() {
             ty::tls::with(|tcx| {
-                tcx.sess.delay_span_bug(DUMMY_SP, &format!("{:?}", self.opaque_types))
+                tcx.sess.delay_span_bug(DUMMY_SP, format!("{:?}", self.opaque_types))
             });
         }
     }
@@ -65,14 +59,13 @@ impl<'a, 'tcx> OpaqueTypeTable<'a, 'tcx> {
         &mut self,
         key: OpaqueTypeKey<'tcx>,
         hidden_type: OpaqueHiddenType<'tcx>,
-        origin: OpaqueTyOrigin,
     ) -> Option<Ty<'tcx>> {
         if let Some(decl) = self.storage.opaque_types.get_mut(&key) {
             let prev = std::mem::replace(&mut decl.hidden_type, hidden_type);
             self.undo_log.push(UndoLog::OpaqueTypes(key, Some(prev)));
             return Some(prev.ty);
         }
-        let decl = OpaqueTypeDecl { hidden_type, origin };
+        let decl = OpaqueTypeDecl { hidden_type };
         self.storage.opaque_types.insert(key, decl);
         self.undo_log.push(UndoLog::OpaqueTypes(key, None));
         None

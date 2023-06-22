@@ -22,7 +22,7 @@ pub fn target() -> Target {
             // These arguments are not actually invoked - they just have
             // to look right to pass App Store validation.
             bitcode_llvm_cmdline: "-triple\0\
-                arm64-apple-ios14.0-macabi\0\
+                arm64-apple-ios-macabi\0\
                 -emit-obj\0\
                 -disable-llvm-passes\0\
                 -Os\0"

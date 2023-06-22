@@ -11,7 +11,6 @@ mod repr_unpacked;
 #[cfg(not(target_pointer_width = "64"))]
 use repr_unpacked::Repr;
 
-use crate::convert::From;
 use crate::error;
 use crate::fmt;
 use crate::result;
@@ -88,11 +87,22 @@ impl From<alloc::ffi::NulError> for Error {
 // doesn't accidentally get printed.
 #[cfg_attr(test, derive(Debug))]
 enum ErrorData<C> {
-    Os(i32),
+    Os(RawOsError),
     Simple(ErrorKind),
     SimpleMessage(&'static SimpleMessage),
     Custom(C),
 }
+
+/// The type of raw OS error codes returned by [`Error::raw_os_error`].
+///
+/// This is an [`i32`] on all currently supported platforms, but platforms
+/// added in the future (such as UEFI) may use a different primitive type like
+/// [`usize`]. Use `as`or [`into`] conversions where applicable to ensure maximum
+/// portability.
+///
+/// [`into`]: Into::into
+#[unstable(feature = "raw_os_error_ty", issue = "107792")]
+pub type RawOsError = i32;
 
 // `#[repr(align(4))]` is probably redundant, it should have that value or
 // higher already. We include it just because repr_bitpacked.rs's encoding
@@ -359,7 +369,7 @@ pub enum ErrorKind {
 
     // "Unusual" error kinds which do not correspond simply to (sets
     // of) OS error codes, should be added just above this comment.
-    // `Other` and `Uncategorised` should remain at the end:
+    // `Other` and `Uncategorized` should remain at the end:
     //
     /// A custom error that does not fall under any other I/O error kind.
     ///
@@ -579,7 +589,7 @@ impl Error {
     #[must_use]
     #[inline]
     pub fn last_os_error() -> Error {
-        Error::from_raw_os_error(sys::os::errno() as i32)
+        Error::from_raw_os_error(sys::os::errno())
     }
 
     /// Creates a new instance of an [`Error`] from a particular OS error code.
@@ -610,7 +620,7 @@ impl Error {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[must_use]
     #[inline]
-    pub fn from_raw_os_error(code: i32) -> Error {
+    pub fn from_raw_os_error(code: RawOsError) -> Error {
         Error { repr: Repr::new_os(code) }
     }
 
@@ -646,7 +656,7 @@ impl Error {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[must_use]
     #[inline]
-    pub fn raw_os_error(&self) -> Option<i32> {
+    pub fn raw_os_error(&self) -> Option<RawOsError> {
         match self.repr.data() {
             ErrorData::Os(i) => Some(i),
             ErrorData::Custom(..) => None,
@@ -871,6 +881,13 @@ impl Error {
 
     /// Returns the corresponding [`ErrorKind`] for this error.
     ///
+    /// This may be a value set by Rust code constructing custom `io::Error`s,
+    /// or if this `io::Error` was sourced from the operating system,
+    /// it will be a value inferred from the system's error encoding.
+    /// See [`last_os_error`] for more details.
+    ///
+    /// [`last_os_error`]: Error::last_os_error
+    ///
     /// # Examples
     ///
     /// ```
@@ -881,7 +898,8 @@ impl Error {
     /// }
     ///
     /// fn main() {
-    ///     // Will print "Uncategorized".
+    ///     // As no error has (visibly) occurred, this may print anything!
+    ///     // It likely prints a placeholder for unidentified (non-)errors.
     ///     print_error(Error::last_os_error());
     ///     // Will print "AddrInUse".
     ///     print_error(Error::new(ErrorKind::AddrInUse, "oh no!"));

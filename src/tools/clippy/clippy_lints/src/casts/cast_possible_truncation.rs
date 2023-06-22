@@ -1,17 +1,21 @@
 use clippy_utils::consts::{constant, Constant};
-use clippy_utils::diagnostics::span_lint;
+use clippy_utils::diagnostics::{span_lint, span_lint_and_then};
 use clippy_utils::expr_or_init;
+use clippy_utils::source::snippet;
+use clippy_utils::sugg::Sugg;
 use clippy_utils::ty::{get_discriminant_value, is_isize_or_usize};
+use rustc_errors::{Applicability, Diagnostic, SuggestionStyle};
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::{BinOpKind, Expr, ExprKind};
 use rustc_lint::LateContext;
 use rustc_middle::ty::{self, FloatTy, Ty};
+use rustc_span::Span;
 use rustc_target::abi::IntegerType;
 
 use super::{utils, CAST_ENUM_TRUNCATION, CAST_POSSIBLE_TRUNCATION};
 
 fn constant_int(cx: &LateContext<'_>, expr: &Expr<'_>) -> Option<u128> {
-    if let Some((Constant::Int(c), _)) = constant(cx, cx.typeck_results(), expr) {
+    if let Some(Constant::Int(c)) = constant(cx, cx.typeck_results(), expr) {
         Some(c)
     } else {
         None
@@ -74,7 +78,14 @@ fn apply_reductions(cx: &LateContext<'_>, nbits: u64, expr: &Expr<'_>, signed: b
     }
 }
 
-pub(super) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, cast_expr: &Expr<'_>, cast_from: Ty<'_>, cast_to: Ty<'_>) {
+pub(super) fn check(
+    cx: &LateContext<'_>,
+    expr: &Expr<'_>,
+    cast_expr: &Expr<'_>,
+    cast_from: Ty<'_>,
+    cast_to: Ty<'_>,
+    cast_to_span: Span,
+) {
     let msg = match (cast_from.kind(), cast_to.is_integral()) {
         (ty::Int(_) | ty::Uint(_), true) => {
             let from_nbits = apply_reductions(
@@ -139,7 +150,7 @@ pub(super) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, cast_expr: &Expr<'_>,
                 );
                 return;
             }
-            format!("casting `{cast_from}` to `{cast_to}` may truncate the value{suffix}",)
+            format!("casting `{cast_from}` to `{cast_to}` may truncate the value{suffix}")
         },
 
         (ty::Float(_), true) => {
@@ -153,5 +164,34 @@ pub(super) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, cast_expr: &Expr<'_>,
         _ => return,
     };
 
-    span_lint(cx, CAST_POSSIBLE_TRUNCATION, expr.span, &msg);
+    span_lint_and_then(cx, CAST_POSSIBLE_TRUNCATION, expr.span, &msg, |diag| {
+        diag.help("if this is intentional allow the lint with `#[allow(clippy::cast_possible_truncation)]` ...");
+        if !cast_from.is_floating_point() {
+            offer_suggestion(cx, expr, cast_expr, cast_to_span, diag);
+        }
+    });
+}
+
+fn offer_suggestion(
+    cx: &LateContext<'_>,
+    expr: &Expr<'_>,
+    cast_expr: &Expr<'_>,
+    cast_to_span: Span,
+    diag: &mut Diagnostic,
+) {
+    let cast_to_snip = snippet(cx, cast_to_span, "..");
+    let suggestion = if cast_to_snip == "_" {
+        format!("{}.try_into()", Sugg::hir(cx, cast_expr, "..").maybe_par())
+    } else {
+        format!("{cast_to_snip}::try_from({})", Sugg::hir(cx, cast_expr, ".."))
+    };
+
+    diag.span_suggestion_with_style(
+        expr.span,
+        "... or use `try_from` and handle the error accordingly",
+        suggestion,
+        Applicability::Unspecified,
+        // always show the suggestion in a separate line
+        SuggestionStyle::ShowAlways,
+    );
 }

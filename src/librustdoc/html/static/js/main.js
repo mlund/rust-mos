@@ -1,19 +1,15 @@
 // Local js definitions:
 /* global addClass, getSettingValue, hasClass, searchState */
-/* global onEach, onEachLazy, removeClass */
+/* global onEach, onEachLazy, removeClass, getVar */
 
 "use strict";
 
-// Get a value from the rustdoc-vars div, which is used to convey data from
-// Rust to the JS. If there is no such element, return null.
-function getVar(name) {
-    const el = document.getElementById("rustdoc-vars");
-    if (el) {
-        return el.attributes["data-" + name].value;
-    } else {
-        return null;
-    }
-}
+// The amount of time that the cursor must remain still over a hover target before
+// revealing a tooltip.
+//
+// https://www.nngroup.com/articles/timing-exposing-content/
+window.RUSTDOC_TOOLTIP_HOVER_MS = 300;
+window.RUSTDOC_TOOLTIP_HOVER_EXIT_MS = 450;
 
 // Given a basename (e.g. "storage") and an extension (e.g. ".js"), return a URL
 // for a resource under the root-path, with the resource-suffix.
@@ -180,11 +176,19 @@ function browserSupportsHistoryApi() {
     return window.history && typeof window.history.pushState === "function";
 }
 
-// eslint-disable-next-line no-unused-vars
 function loadCss(cssUrl) {
     const link = document.createElement("link");
     link.href = cssUrl;
     link.rel = "stylesheet";
+    document.getElementsByTagName("head")[0].appendChild(link);
+}
+
+function preLoadCss(cssUrl) {
+    // https://developer.mozilla.org/en-US/docs/Web/HTML/Link_types/preload
+    const link = document.createElement("link");
+    link.href = cssUrl;
+    link.rel = "preload";
+    link.as = "style";
     document.getElementsByTagName("head")[0].appendChild(link);
 }
 
@@ -208,6 +212,23 @@ function loadCss(cssUrl) {
         // hopefully be loaded when the JS will generate the settings content.
         loadCss(getVar("static-root-path") + getVar("settings-css"));
         loadScript(getVar("static-root-path") + getVar("settings-js"));
+        preLoadCss(getVar("static-root-path") + getVar("theme-light-css"));
+        preLoadCss(getVar("static-root-path") + getVar("theme-dark-css"));
+        preLoadCss(getVar("static-root-path") + getVar("theme-ayu-css"));
+        // Pre-load all theme CSS files, so that switching feels seamless.
+        //
+        // When loading settings.html as a standalone page, the equivalent HTML is
+        // generated in context.rs.
+        setTimeout(() => {
+            const themes = getVar("themes").split(",");
+            for (const theme of themes) {
+                // if there are no themes, do nothing
+                // "".split(",") == [""]
+                if (theme !== "") {
+                    preLoadCss(getVar("root-path") + theme + ".css");
+                }
+            }
+        }, 0);
     };
 
     window.searchState = {
@@ -256,14 +277,17 @@ function loadCss(cssUrl) {
             searchState.mouseMovedAfterSearch = false;
             document.title = searchState.title;
         },
+        removeQueryParameters: () => {
+            // We change the document title.
+            document.title = searchState.titleBeforeSearch;
+            if (browserSupportsHistoryApi()) {
+                history.replaceState(null, "", getNakedUrl() + window.location.hash);
+            }
+        },
         hideResults: () => {
             switchDisplayedElement(null);
-            document.title = searchState.titleBeforeSearch;
             // We also remove the query parameter from the URL.
-            if (browserSupportsHistoryApi()) {
-                history.replaceState(null, window.currentCrate + " - Rust",
-                    getNakedUrl() + window.location.hash);
-            }
+            searchState.removeQueryParameters();
         },
         getQueryStringParams: () => {
             const params = {};
@@ -312,16 +336,6 @@ function loadCss(cssUrl) {
         },
     };
 
-    function getPageId() {
-        if (window.location.hash) {
-            const tmp = window.location.hash.replace(/^#/, "");
-            if (tmp.length > 0) {
-                return tmp;
-            }
-        }
-        return null;
-    }
-
     const toggleAllDocsId = "toggle-all-docs";
     let savedHash = "";
 
@@ -342,12 +356,12 @@ function loadCss(cssUrl) {
             }
         }
         // This part is used in case an element is not visible.
-        if (savedHash !== window.location.hash) {
-            savedHash = window.location.hash;
-            if (savedHash.length === 0) {
-                return;
+        const pageId = window.location.hash.replace(/^#/, "");
+        if (savedHash !== pageId) {
+            savedHash = pageId;
+            if (pageId !== "") {
+                expandSection(pageId);
             }
-            expandSection(savedHash.slice(1)); // we remove the '#'
         }
     }
 
@@ -372,14 +386,10 @@ function loadCss(cssUrl) {
 
     function handleEscape(ev) {
         searchState.clearInputTimeout();
-        switchDisplayedElement(null);
-        if (browserSupportsHistoryApi()) {
-            history.replaceState(null, window.currentCrate + " - Rust",
-                getNakedUrl() + window.location.hash);
-        }
+        searchState.hideResults();
         ev.preventDefault();
         searchState.defocus();
-        window.hideAllModals(true); // true = reset focus for notable traits
+        window.hideAllModals(true); // true = reset focus for tooltips
     }
 
     function handleShortcut(ev) {
@@ -390,7 +400,8 @@ function loadCss(cssUrl) {
         }
 
         if (document.activeElement.tagName === "INPUT" &&
-            document.activeElement.type !== "checkbox") {
+            document.activeElement.type !== "checkbox" &&
+            document.activeElement.type !== "radio") {
             switch (getVirtualKey(ev)) {
             case "Escape":
                 handleEscape(ev);
@@ -455,10 +466,7 @@ function loadCss(cssUrl) {
             const ul = document.createElement("ul");
             ul.className = "block " + shortty;
 
-            for (const item of filtered) {
-                const name = item[0];
-                const desc = item[1]; // can be null
-
+            for (const name of filtered) {
                 let path;
                 if (shortty === "mod") {
                     path = name + "/index.html";
@@ -468,7 +476,6 @@ function loadCss(cssUrl) {
                 const current_page = document.location.href.split("/").pop();
                 const link = document.createElement("a");
                 link.href = path;
-                link.title = desc;
                 if (path === current_page) {
                     link.className = "current";
                 }
@@ -526,7 +533,7 @@ function loadCss(cssUrl) {
         }
 
         let currentNbImpls = implementors.getElementsByClassName("impl").length;
-        const traitName = document.querySelector("h1.fqn > .trait").textContent;
+        const traitName = document.querySelector(".main-heading h1 > .trait").textContent;
         const baseIdName = "impl-" + traitName + "-";
         const libs = Object.getOwnPropertyNames(imp);
         // We don't want to include impls from this JS file, when the HTML already has them.
@@ -534,9 +541,11 @@ function loadCss(cssUrl) {
         // ignored are included in the attribute `data-ignore-extern-crates`.
         const script = document
             .querySelector("script[data-ignore-extern-crates]");
-        const ignoreExternCrates = script ? script.getAttribute("data-ignore-extern-crates") : "";
+        const ignoreExternCrates = new Set(
+            (script ? script.getAttribute("data-ignore-extern-crates") : "").split(",")
+        );
         for (const lib of libs) {
-            if (lib === window.currentCrate || ignoreExternCrates.indexOf(lib) !== -1) {
+            if (lib === window.currentCrate || ignoreExternCrates.has(lib)) {
                 continue;
             }
             const structs = imp[lib];
@@ -563,7 +572,7 @@ function loadCss(cssUrl) {
                 onEachLazy(code.getElementsByTagName("a"), elem => {
                     const href = elem.getAttribute("href");
 
-                    if (href && href.indexOf("http") !== 0) {
+                    if (href && !/^(?:[a-z+]+:)?\/\//.test(href)) {
                         elem.setAttribute("href", window.rootPath + href);
                     }
                 });
@@ -620,7 +629,7 @@ function loadCss(cssUrl) {
     function expandAllDocs() {
         const innerToggle = document.getElementById(toggleAllDocsId);
         removeClass(innerToggle, "will-expand");
-        onEachLazy(document.getElementsByClassName("rustdoc-toggle"), e => {
+        onEachLazy(document.getElementsByClassName("toggle"), e => {
             if (!hasClass(e, "type-contents-toggle") && !hasClass(e, "more-examples-toggle")) {
                 e.open = true;
             }
@@ -632,7 +641,7 @@ function loadCss(cssUrl) {
     function collapseAllDocs() {
         const innerToggle = document.getElementById(toggleAllDocsId);
         addClass(innerToggle, "will-expand");
-        onEachLazy(document.getElementsByClassName("rustdoc-toggle"), e => {
+        onEachLazy(document.getElementsByClassName("toggle"), e => {
             if (e.parentNode.id !== "implementations-list" ||
                 (!hasClass(e, "implementors-toggle") &&
                  !hasClass(e, "type-contents-toggle"))
@@ -680,7 +689,7 @@ function loadCss(cssUrl) {
             setImplementorsTogglesOpen("blanket-implementations-list", false);
         }
 
-        onEachLazy(document.getElementsByClassName("rustdoc-toggle"), e => {
+        onEachLazy(document.getElementsByClassName("toggle"), e => {
             if (!hideLargeItemContents && hasClass(e, "type-contents-toggle")) {
                 e.open = true;
             }
@@ -689,11 +698,6 @@ function loadCss(cssUrl) {
             }
 
         });
-
-        const pageId = getPageId();
-        if (pageId !== null) {
-            expandSection(pageId);
-        }
     }());
 
     window.rustdoc_add_line_numbers_to_examples = () => {
@@ -729,89 +733,37 @@ function loadCss(cssUrl) {
         window.rustdoc_add_line_numbers_to_examples();
     }
 
-    let oldSidebarScrollPosition = null;
-
-    // Scroll locking used both here and in source-script.js
-
-    window.rustdocMobileScrollLock = function() {
-        const mobile_topbar = document.querySelector(".mobile-topbar");
-        if (window.innerWidth <= window.RUSTDOC_MOBILE_BREAKPOINT) {
-            // This is to keep the scroll position on mobile.
-            oldSidebarScrollPosition = window.scrollY;
-            document.body.style.width = `${document.body.offsetWidth}px`;
-            document.body.style.position = "fixed";
-            document.body.style.top = `-${oldSidebarScrollPosition}px`;
-            if (mobile_topbar) {
-                mobile_topbar.style.top = `${oldSidebarScrollPosition}px`;
-                mobile_topbar.style.position = "relative";
-            }
-        } else {
-            oldSidebarScrollPosition = null;
-        }
-    };
-
-    window.rustdocMobileScrollUnlock = function() {
-        const mobile_topbar = document.querySelector(".mobile-topbar");
-        if (oldSidebarScrollPosition !== null) {
-            // This is to keep the scroll position on mobile.
-            document.body.style.width = "";
-            document.body.style.position = "";
-            document.body.style.top = "";
-            if (mobile_topbar) {
-                mobile_topbar.style.top = "";
-                mobile_topbar.style.position = "";
-            }
-            // The scroll position is lost when resetting the style, hence why we store it in
-            // `oldSidebarScrollPosition`.
-            window.scrollTo(0, oldSidebarScrollPosition);
-            oldSidebarScrollPosition = null;
-        }
-    };
-
     function showSidebar() {
         window.hideAllModals(false);
-        window.rustdocMobileScrollLock();
         const sidebar = document.getElementsByClassName("sidebar")[0];
         addClass(sidebar, "shown");
     }
 
     function hideSidebar() {
-        window.rustdocMobileScrollUnlock();
         const sidebar = document.getElementsByClassName("sidebar")[0];
         removeClass(sidebar, "shown");
     }
 
     window.addEventListener("resize", () => {
-        if (window.innerWidth > window.RUSTDOC_MOBILE_BREAKPOINT &&
-            oldSidebarScrollPosition !== null) {
-            // If the user opens the sidebar in "mobile" mode, and then grows the browser window,
-            // we need to switch away from mobile mode and make the main content area scrollable.
-            hideSidebar();
-        }
-        if (window.CURRENT_NOTABLE_ELEMENT) {
-            // As a workaround to the behavior of `contains: layout` used in doc togglers, the
-            // notable traits popup is positioned using javascript.
+        if (window.CURRENT_TOOLTIP_ELEMENT) {
+            // As a workaround to the behavior of `contains: layout` used in doc togglers,
+            // tooltip popovers are positioned using javascript.
             //
             // This means when the window is resized, we need to redo the layout.
-            const base = window.CURRENT_NOTABLE_ELEMENT.NOTABLE_BASE;
-            const force_visible = base.NOTABLE_FORCE_VISIBLE;
-            hideNotable(false);
+            const base = window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE;
+            const force_visible = base.TOOLTIP_FORCE_VISIBLE;
+            hideTooltip(false);
             if (force_visible) {
-                showNotable(base);
-                base.NOTABLE_FORCE_VISIBLE = true;
+                showTooltip(base);
+                base.TOOLTIP_FORCE_VISIBLE = true;
             }
         }
     });
 
-    function handleClick(id, f) {
-        const elem = document.getElementById(id);
-        if (elem) {
-            elem.addEventListener("click", f);
-        }
+    const mainElem = document.getElementById(MAIN_ID);
+    if (mainElem) {
+        mainElem.addEventListener("click", hideSidebar);
     }
-    handleClick(MAIN_ID, () => {
-        hideSidebar();
-    });
 
     onEachLazy(document.querySelectorAll("a[href^='#']"), el => {
         // For clicks on internal links (<A> tags with a hash property), we expand the section we're
@@ -823,7 +775,7 @@ function loadCss(cssUrl) {
         });
     });
 
-    onEachLazy(document.querySelectorAll(".rustdoc-toggle > summary:not(.hideme)"), el => {
+    onEachLazy(document.querySelectorAll(".toggle > summary:not(.hideme)"), el => {
         el.addEventListener("click", e => {
             if (e.target.tagName !== "SUMMARY" && e.target.tagName !== "A") {
                 e.preventDefault();
@@ -831,27 +783,51 @@ function loadCss(cssUrl) {
         });
     });
 
-    function showNotable(e) {
-        if (!window.NOTABLE_TRAITS) {
+    /**
+     * Show a tooltip immediately.
+     *
+     * @param {DOMElement} e - The tooltip's anchor point. The DOM is consulted to figure
+     *                         out what the tooltip should contain, and where it should be
+     *                         positioned.
+     */
+    function showTooltip(e) {
+        const notable_ty = e.getAttribute("data-notable-ty");
+        if (!window.NOTABLE_TRAITS && notable_ty) {
             const data = document.getElementById("notable-traits-data");
             if (data) {
                 window.NOTABLE_TRAITS = JSON.parse(data.innerText);
             } else {
-                throw new Error("showNotable() called on page without any notable traits!");
+                throw new Error("showTooltip() called with notable without any notable traits!");
             }
         }
-        if (window.CURRENT_NOTABLE_ELEMENT && window.CURRENT_NOTABLE_ELEMENT.NOTABLE_BASE === e) {
-            // Make this function idempotent.
+        // Make this function idempotent. If the tooltip is already shown, avoid doing extra work
+        // and leave it alone.
+        if (window.CURRENT_TOOLTIP_ELEMENT && window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE === e) {
+            clearTooltipHoverTimeout(window.CURRENT_TOOLTIP_ELEMENT);
             return;
         }
         window.hideAllModals(false);
-        const ty = e.getAttribute("data-ty");
         const wrapper = document.createElement("div");
-        wrapper.innerHTML = "<div class=\"docblock\">" + window.NOTABLE_TRAITS[ty] + "</div>";
-        wrapper.className = "notable popover";
+        if (notable_ty) {
+            wrapper.innerHTML = "<div class=\"content\">" +
+                window.NOTABLE_TRAITS[notable_ty] + "</div>";
+        } else {
+            // Replace any `title` attribute with `data-title` to avoid double tooltips.
+            if (e.getAttribute("title") !== null) {
+                e.setAttribute("data-title", e.getAttribute("title"));
+                e.removeAttribute("title");
+            }
+            if (e.getAttribute("data-title") !== null) {
+                const titleContent = document.createElement("div");
+                titleContent.className = "content";
+                titleContent.appendChild(document.createTextNode(e.getAttribute("data-title")));
+                wrapper.appendChild(titleContent);
+            }
+        }
+        wrapper.className = "tooltip popover";
         const focusCatcher = document.createElement("div");
         focusCatcher.setAttribute("tabindex", "0");
-        focusCatcher.onfocus = hideNotable;
+        focusCatcher.onfocus = hideTooltip;
         wrapper.appendChild(focusCatcher);
         const pos = e.getBoundingClientRect();
         // 5px overlap so that the mouse can easily travel from place to place
@@ -873,62 +849,129 @@ function loadCss(cssUrl) {
             );
         }
         wrapper.style.visibility = "";
-        window.CURRENT_NOTABLE_ELEMENT = wrapper;
-        window.CURRENT_NOTABLE_ELEMENT.NOTABLE_BASE = e;
+        window.CURRENT_TOOLTIP_ELEMENT = wrapper;
+        window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE = e;
+        clearTooltipHoverTimeout(window.CURRENT_TOOLTIP_ELEMENT);
+        wrapper.onpointerenter = function(ev) {
+            // If this is a synthetic touch event, ignore it. A click event will be along shortly.
+            if (ev.pointerType !== "mouse") {
+                return;
+            }
+            clearTooltipHoverTimeout(e);
+        };
         wrapper.onpointerleave = function(ev) {
             // If this is a synthetic touch event, ignore it. A click event will be along shortly.
             if (ev.pointerType !== "mouse") {
                 return;
             }
-            if (!e.NOTABLE_FORCE_VISIBLE && !elemIsInParent(event.relatedTarget, e)) {
-                hideNotable(true);
+            if (!e.TOOLTIP_FORCE_VISIBLE && !elemIsInParent(ev.relatedTarget, e)) {
+                // See "Tooltip pointer leave gesture" below.
+                setTooltipHoverTimeout(e, false);
+                addClass(wrapper, "fade-out");
             }
         };
     }
 
-    function notableBlurHandler(event) {
-        if (window.CURRENT_NOTABLE_ELEMENT &&
-            !elemIsInParent(document.activeElement, window.CURRENT_NOTABLE_ELEMENT) &&
-            !elemIsInParent(event.relatedTarget, window.CURRENT_NOTABLE_ELEMENT) &&
-            !elemIsInParent(document.activeElement, window.CURRENT_NOTABLE_ELEMENT.NOTABLE_BASE) &&
-            !elemIsInParent(event.relatedTarget, window.CURRENT_NOTABLE_ELEMENT.NOTABLE_BASE)
+    /**
+     * Show or hide the tooltip after a timeout. If a timeout was already set before this function
+     * was called, that timeout gets cleared. If the tooltip is already in the requested state,
+     * this function will still clear any pending timeout, but otherwise do nothing.
+     *
+     * @param {DOMElement} element - The tooltip's anchor point. The DOM is consulted to figure
+     *                               out what the tooltip should contain, and where it should be
+     *                               positioned.
+     * @param {boolean}    show    - If true, the tooltip will be made visible. If false, it will
+     *                               be hidden.
+     */
+    function setTooltipHoverTimeout(element, show) {
+        clearTooltipHoverTimeout(element);
+        if (!show && !window.CURRENT_TOOLTIP_ELEMENT) {
+            // To "hide" an already hidden element, just cancel its timeout.
+            return;
+        }
+        if (show && window.CURRENT_TOOLTIP_ELEMENT) {
+            // To "show" an already visible element, just cancel its timeout.
+            return;
+        }
+        if (window.CURRENT_TOOLTIP_ELEMENT &&
+            window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE !== element) {
+            // Don't do anything if another tooltip is already visible.
+            return;
+        }
+        element.TOOLTIP_HOVER_TIMEOUT = setTimeout(() => {
+            if (show) {
+                showTooltip(element);
+            } else if (!element.TOOLTIP_FORCE_VISIBLE) {
+                hideTooltip(false);
+            }
+        }, show ? window.RUSTDOC_TOOLTIP_HOVER_MS : window.RUSTDOC_TOOLTIP_HOVER_EXIT_MS);
+    }
+
+    /**
+     * If a show/hide timeout was set by `setTooltipHoverTimeout`, cancel it. If none exists,
+     * do nothing.
+     *
+     * @param {DOMElement} element - The tooltip's anchor point,
+     *                               as passed to `setTooltipHoverTimeout`.
+     */
+    function clearTooltipHoverTimeout(element) {
+        if (element.TOOLTIP_HOVER_TIMEOUT !== undefined) {
+            removeClass(window.CURRENT_TOOLTIP_ELEMENT, "fade-out");
+            clearTimeout(element.TOOLTIP_HOVER_TIMEOUT);
+            delete element.TOOLTIP_HOVER_TIMEOUT;
+        }
+    }
+
+    function tooltipBlurHandler(event) {
+        if (window.CURRENT_TOOLTIP_ELEMENT &&
+            !elemIsInParent(document.activeElement, window.CURRENT_TOOLTIP_ELEMENT) &&
+            !elemIsInParent(event.relatedTarget, window.CURRENT_TOOLTIP_ELEMENT) &&
+            !elemIsInParent(document.activeElement, window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE) &&
+            !elemIsInParent(event.relatedTarget, window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE)
         ) {
             // Work around a difference in the focus behaviour between Firefox, Chrome, and Safari.
-            // When I click the button on an already-opened notable trait popover, Safari
+            // When I click the button on an already-opened tooltip popover, Safari
             // hides the popover and then immediately shows it again, while everyone else hides it
             // and it stays hidden.
             //
             // To work around this, make sure the click finishes being dispatched before
-            // hiding the popover. Since `hideNotable()` is idempotent, this makes Safari behave
+            // hiding the popover. Since `hideTooltip()` is idempotent, this makes Safari behave
             // consistently with the other two.
-            setTimeout(() => hideNotable(false), 0);
+            setTimeout(() => hideTooltip(false), 0);
         }
     }
 
-    function hideNotable(focus) {
-        if (window.CURRENT_NOTABLE_ELEMENT) {
-            if (window.CURRENT_NOTABLE_ELEMENT.NOTABLE_BASE.NOTABLE_FORCE_VISIBLE) {
+    /**
+     * Hide the current tooltip immediately.
+     *
+     * @param {boolean} focus - If set to `true`, move keyboard focus to the tooltip anchor point.
+     *                          If set to `false`, leave keyboard focus alone.
+     */
+    function hideTooltip(focus) {
+        if (window.CURRENT_TOOLTIP_ELEMENT) {
+            if (window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE.TOOLTIP_FORCE_VISIBLE) {
                 if (focus) {
-                    window.CURRENT_NOTABLE_ELEMENT.NOTABLE_BASE.focus();
+                    window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE.focus();
                 }
-                window.CURRENT_NOTABLE_ELEMENT.NOTABLE_BASE.NOTABLE_FORCE_VISIBLE = false;
+                window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE.TOOLTIP_FORCE_VISIBLE = false;
             }
             const body = document.getElementsByTagName("body")[0];
-            body.removeChild(window.CURRENT_NOTABLE_ELEMENT);
-            window.CURRENT_NOTABLE_ELEMENT = null;
+            body.removeChild(window.CURRENT_TOOLTIP_ELEMENT);
+            clearTooltipHoverTimeout(window.CURRENT_TOOLTIP_ELEMENT);
+            window.CURRENT_TOOLTIP_ELEMENT = null;
         }
     }
 
-    onEachLazy(document.getElementsByClassName("notable-traits"), e => {
+    onEachLazy(document.getElementsByClassName("tooltip"), e => {
         e.onclick = function() {
-            this.NOTABLE_FORCE_VISIBLE = this.NOTABLE_FORCE_VISIBLE ? false : true;
-            if (window.CURRENT_NOTABLE_ELEMENT && !this.NOTABLE_FORCE_VISIBLE) {
-                hideNotable(true);
+            this.TOOLTIP_FORCE_VISIBLE = this.TOOLTIP_FORCE_VISIBLE ? false : true;
+            if (window.CURRENT_TOOLTIP_ELEMENT && !this.TOOLTIP_FORCE_VISIBLE) {
+                hideTooltip(true);
             } else {
-                showNotable(this);
-                window.CURRENT_NOTABLE_ELEMENT.setAttribute("tabindex", "0");
-                window.CURRENT_NOTABLE_ELEMENT.focus();
-                window.CURRENT_NOTABLE_ELEMENT.onblur = notableBlurHandler;
+                showTooltip(this);
+                window.CURRENT_TOOLTIP_ELEMENT.setAttribute("tabindex", "0");
+                window.CURRENT_TOOLTIP_ELEMENT.focus();
+                window.CURRENT_TOOLTIP_ELEMENT.onblur = tooltipBlurHandler;
             }
             return false;
         };
@@ -937,16 +980,54 @@ function loadCss(cssUrl) {
             if (ev.pointerType !== "mouse") {
                 return;
             }
-            showNotable(this);
+            setTooltipHoverTimeout(this, true);
+        };
+        e.onpointermove = function(ev) {
+            // If this is a synthetic touch event, ignore it. A click event will be along shortly.
+            if (ev.pointerType !== "mouse") {
+                return;
+            }
+            setTooltipHoverTimeout(this, true);
         };
         e.onpointerleave = function(ev) {
             // If this is a synthetic touch event, ignore it. A click event will be along shortly.
             if (ev.pointerType !== "mouse") {
                 return;
             }
-            if (!this.NOTABLE_FORCE_VISIBLE &&
-                !elemIsInParent(event.relatedTarget, window.CURRENT_NOTABLE_ELEMENT)) {
-                hideNotable(true);
+            if (!this.TOOLTIP_FORCE_VISIBLE &&
+                !elemIsInParent(ev.relatedTarget, window.CURRENT_TOOLTIP_ELEMENT)) {
+                // Tooltip pointer leave gesture:
+                //
+                // Designing a good hover microinteraction is a matter of guessing user
+                // intent from what are, literally, vague gestures. In this case, guessing if
+                // hovering in or out of the tooltip base is intentional or not.
+                //
+                // To figure this out, a few different techniques are used:
+                //
+                // * When the mouse pointer enters a tooltip anchor point, its hitbox is grown
+                //   on the bottom, where the popover is/will appear. Search "hover tunnel" in
+                //   rustdoc.css for the implementation.
+                // * There's a delay when the mouse pointer enters the popover base anchor, in
+                //   case the mouse pointer was just passing through and the user didn't want
+                //   to open it.
+                // * Similarly, a delay is added when exiting the anchor, or the popover
+                //   itself, before hiding it.
+                // * A fade-out animation is layered onto the pointer exit delay to immediately
+                //   inform the user that they successfully dismissed the popover, while still
+                //   providing a way for them to cancel it if it was a mistake and they still
+                //   wanted to interact with it.
+                // * No animation is used for revealing it, because we don't want people to try
+                //   to interact with an element while it's in the middle of fading in: either
+                //   they're allowed to interact with it while it's fading in, meaning it can't
+                //   serve as mistake-proofing for the popover, or they can't, but
+                //   they might try and be frustrated.
+                //
+                // See also:
+                // * https://www.nngroup.com/articles/timing-exposing-content/
+                // * https://www.nngroup.com/articles/tooltip-guidelines/
+                // * https://bjk5.com/post/44698559168/breaking-down-amazons-mega-dropdown
+                setTooltipHoverTimeout(e, false);
+                addClass(window.CURRENT_TOOLTIP_ELEMENT, "fade-out");
             }
         };
     });
@@ -997,11 +1078,13 @@ function loadCss(cssUrl) {
              <code>enum</code>, <code>trait</code>, <code>type</code>, <code>macro</code>, \
              and <code>const</code>.",
             "Search functions by type signature (e.g., <code>vec -&gt; usize</code> or \
-             <code>-&gt; vec</code>)",
-            "Search multiple things at once by splitting your query with comma (e.g., \
-             <code>str,u8</code> or <code>String,struct:Vec,test</code>)",
+             <code>-&gt; vec</code> or <code>String, enum:Cow -&gt; bool</code>)",
             "You can look for items with an exact name by putting double quotes around \
              your request: <code>\"string\"</code>",
+             "Look for functions that accept or return \
+              <a href=\"https://doc.rust-lang.org/std/primitive.slice.html\">slices</a> and \
+              <a href=\"https://doc.rust-lang.org/std/primitive.array.html\">arrays</a> by writing \
+              square brackets (e.g., <code>-&gt; [u8]</code> or <code>[] -&gt; Option</code>)",
             "Look for items inside another one by searching for a path: <code>vec::Vec</code>",
         ].map(x => "<p>" + x + "</p>").join("");
         const div_infos = document.createElement("div");
@@ -1040,9 +1123,6 @@ function loadCss(cssUrl) {
             help_button.appendChild(container);
 
             container.onblur = helpBlurHandler;
-            container.onclick = event => {
-                event.preventDefault();
-            };
             help_button.onblur = helpBlurHandler;
             help_button.children[0].onblur = helpBlurHandler;
         }
@@ -1051,14 +1131,14 @@ function loadCss(cssUrl) {
     }
 
     /**
-     * Hide popover menus, notable trait tooltips, and the sidebar (if applicable).
+     * Hide popover menus, clickable tooltips, and the sidebar (if applicable).
      *
-     * Pass "true" to reset focus for notable traits.
+     * Pass "true" to reset focus for tooltip popovers.
      */
     window.hideAllModals = function(switchFocus) {
         hideSidebar();
         window.hidePopoverMenus();
-        hideNotable(switchFocus);
+        hideTooltip(switchFocus);
     };
 
     /**
@@ -1090,6 +1170,9 @@ function loadCss(cssUrl) {
      * Show the help popup menu.
      */
     function showHelp() {
+        // Prevent `blur` events from being dispatched as a result of closing
+        // other modals.
+        getHelpButton().querySelector("a").focus();
         const menu = getHelpMenu(true);
         if (menu.style.display === "none") {
             window.hideAllModals();
@@ -1146,7 +1229,11 @@ function loadCss(cssUrl) {
 (function() {
     let reset_button_timeout = null;
 
-    window.copy_path = but => {
+    const but = document.getElementById("copy-path");
+    if (!but) {
+        return;
+    }
+    but.onclick = () => {
         const parent = but.parentElement;
         const path = [];
 

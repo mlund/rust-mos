@@ -14,7 +14,7 @@ use rustc_middle::mir::interpret::ErrorHandled;
 
 use rustc_middle::traits::ObligationCause;
 use rustc_middle::ty::abstract_const::NotConstEvaluatable;
-use rustc_middle::ty::{self, TyCtxt, TypeVisitable, TypeVisitor};
+use rustc_middle::ty::{self, TyCtxt, TypeVisitable, TypeVisitableExt, TypeVisitor};
 
 use rustc_span::Span;
 use std::ops::ControlFlow;
@@ -44,7 +44,7 @@ pub fn is_const_evaluatable<'tcx>(
         let ct = tcx.expand_abstract_consts(unexpanded_ct);
 
         let is_anon_ct = if let ty::ConstKind::Unevaluated(uv) = ct.kind() {
-            tcx.def_kind(uv.def.did) == DefKind::AnonConst
+            tcx.def_kind(uv.def) == DefKind::AnonConst
         } else {
             false
         };
@@ -79,7 +79,7 @@ pub fn is_const_evaluatable<'tcx>(
                             "Missing value for constant, but no error reported?",
                         )))
                     }
-                    Err(ErrorHandled::Reported(e)) => Err(NotConstEvaluatable::Error(e)),
+                    Err(ErrorHandled::Reported(e)) => Err(NotConstEvaluatable::Error(e.into())),
                     Ok(_) => Ok(()),
                 }
             }
@@ -119,7 +119,7 @@ pub fn is_const_evaluatable<'tcx>(
                 tcx.sess
                     .struct_span_fatal(
                         // Slightly better span than just using `span` alone
-                        if span == rustc_span::DUMMY_SP { tcx.def_span(uv.def.did) } else { span },
+                        if span == rustc_span::DUMMY_SP { tcx.def_span(uv.def) } else { span },
                         "failed to evaluate generic const expression",
                     )
                     .note("the crate this constant originates from uses `#![feature(generic_const_exprs)]`")
@@ -147,7 +147,7 @@ pub fn is_const_evaluatable<'tcx>(
 
                 Err(err)
             }
-            Err(ErrorHandled::Reported(e)) => Err(NotConstEvaluatable::Error(e)),
+            Err(ErrorHandled::Reported(e)) => Err(NotConstEvaluatable::Error(e.into())),
             Ok(_) => Ok(()),
         }
     }
@@ -168,24 +168,27 @@ fn satisfied_from_param_env<'tcx>(
         param_env: ty::ParamEnv<'tcx>,
 
         infcx: &'a InferCtxt<'tcx>,
+        single_match: Option<Result<ty::Const<'tcx>, ()>>,
     }
-    impl<'a, 'tcx> TypeVisitor<'tcx> for Visitor<'a, 'tcx> {
+
+    impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for Visitor<'a, 'tcx> {
         type BreakTy = ();
         fn visit_const(&mut self, c: ty::Const<'tcx>) -> ControlFlow<Self::BreakTy> {
             debug!("is_const_evaluatable: candidate={:?}", c);
-            if let Ok(()) = self.infcx.commit_if_ok(|_| {
+            if self.infcx.probe(|_| {
                 let ocx = ObligationCtxt::new_in_snapshot(self.infcx);
-                if let Ok(()) = ocx.eq(&ObligationCause::dummy(), self.param_env, c.ty(), self.ct.ty())
-                    && let Ok(()) = ocx.eq(&ObligationCause::dummy(), self.param_env, c, self.ct)
+                ocx.eq(&ObligationCause::dummy(), self.param_env, c.ty(), self.ct.ty()).is_ok()
+                    && ocx.eq(&ObligationCause::dummy(), self.param_env, c, self.ct).is_ok()
                     && ocx.select_all_or_error().is_empty()
-                {
-                    Ok(())
-                } else {
-                    Err(())
-                }
             }) {
-                ControlFlow::BREAK
-            } else if let ty::ConstKind::Expr(e) = c.kind() {
+                self.single_match = match self.single_match {
+                    None => Some(Ok(c)),
+                    Some(Ok(o)) if o == c => Some(Ok(c)),
+                    Some(_) => Some(Err(())),
+                };
+            }
+
+            if let ty::ConstKind::Expr(e) = c.kind() {
                 e.visit_with(self)
             } else {
                 // FIXME(generic_const_exprs): This doesn't recurse into `<T as Trait<U>>::ASSOC`'s substs.
@@ -195,25 +198,32 @@ fn satisfied_from_param_env<'tcx>(
                 // If we start allowing directly writing `ConstKind::Expr` without an intermediate anon const
                 // this will be incorrect. It might be worth investigating making `predicates_of` elaborate
                 // all of the `ConstEvaluatable` bounds rather than having a visitor here.
-                ControlFlow::CONTINUE
+                ControlFlow::Continue(())
             }
         }
     }
 
+    let mut single_match: Option<Result<ty::Const<'tcx>, ()>> = None;
+
     for pred in param_env.caller_bounds() {
         match pred.kind().skip_binder() {
-            ty::PredicateKind::ConstEvaluatable(ce) => {
+            ty::PredicateKind::Clause(ty::ClauseKind::ConstEvaluatable(ce)) => {
                 let b_ct = tcx.expand_abstract_consts(ce);
-                let mut v = Visitor { ct, infcx, param_env };
-                let result = b_ct.visit_with(&mut v);
+                let mut v = Visitor { ct, infcx, param_env, single_match };
+                let _ = b_ct.visit_with(&mut v);
 
-                if let ControlFlow::Break(()) = result {
-                    debug!("is_const_evaluatable: yes");
-                    return true;
-                }
+                single_match = v.single_match;
             }
             _ => {} // don't care
         }
+    }
+
+    if let Some(Ok(c)) = single_match {
+        let ocx = ObligationCtxt::new_in_snapshot(infcx);
+        assert!(ocx.eq(&ObligationCause::dummy(), param_env, c.ty(), ct.ty()).is_ok());
+        assert!(ocx.eq(&ObligationCause::dummy(), param_env, c, ct).is_ok());
+        assert!(ocx.select_all_or_error().is_empty());
+        return true;
     }
 
     debug!("is_const_evaluatable: no");

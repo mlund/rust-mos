@@ -1,4 +1,5 @@
-target
+/target
+/build_system/target
 **/*.rs.bk
 *.rlib
 *.o
@@ -11,9 +12,7 @@ perf.data.old
 /y.exe
 /y.pdb
 /build
-/build_sysroot/sysroot_src
-/build_sysroot/compiler-builtins
-/build_sysroot/rustc_version
 /dist
 /rust
 /download
+/git-fixed-subtree.sh

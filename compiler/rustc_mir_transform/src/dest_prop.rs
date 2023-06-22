@@ -69,7 +69,7 @@
 //!   of this is that such liveness analysis can report more accurate results about whole locals at
 //!   a time. For example, consider:
 //!
-//!   ```ignore (syntax-highliting-only)
+//!   ```ignore (syntax-highlighting-only)
 //!   _1 = u;
 //!   // unrelated code
 //!   _1.f1 = v;
@@ -83,7 +83,7 @@
 //!   that ever have their address taken. Of course that requires actually having alias analysis
 //!   (and a model to build it on), so this might be a bit of a ways off.
 //!
-//! * Various perf improvents. There are a bunch of comments in here marked `PERF` with ideas for
+//! * Various perf improvements. There are a bunch of comments in here marked `PERF` with ideas for
 //!   how to do things more efficiently. However, the complexity of the pass as a whole should be
 //!   kept in mind.
 //!
@@ -136,8 +136,8 @@ use rustc_index::bit_set::BitSet;
 use rustc_middle::mir::visit::{MutVisitor, PlaceContext, Visitor};
 use rustc_middle::mir::{dump_mir, PassWhere};
 use rustc_middle::mir::{
-    traversal, BasicBlock, Body, InlineAsmOperand, Local, LocalKind, Location, Operand, Place,
-    Rvalue, Statement, StatementKind, TerminatorKind,
+    traversal, Body, InlineAsmOperand, Local, LocalKind, Location, Operand, Place, Rvalue,
+    Statement, StatementKind, TerminatorKind,
 };
 use rustc_middle::ty::TyCtxt;
 use rustc_mir_dataflow::impls::MaybeLiveLocals;
@@ -328,7 +328,8 @@ impl<'a, 'tcx> MutVisitor<'tcx> for Merger<'a, 'tcx> {
         match &statement.kind {
             StatementKind::Assign(box (dest, rvalue)) => {
                 match rvalue {
-                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place)) => {
+                    Rvalue::CopyForDeref(place)
+                    | Rvalue::Use(Operand::Copy(place) | Operand::Move(place)) => {
                         // These might've been turned into self-assignments by the replacement
                         // (this includes the original statement we wanted to eliminate).
                         if dest == place {
@@ -359,7 +360,7 @@ struct FilterInformation<'a, 'body, 'alloc, 'tcx> {
 }
 
 // We first implement some utility functions which we will expose removing candidates according to
-// different needs. Throughout the livenss filtering, the `candidates` are only ever accessed
+// different needs. Throughout the liveness filtering, the `candidates` are only ever accessed
 // through these methods, and not directly.
 impl<'alloc> Candidates<'alloc> {
     /// Just `Vec::retain`, but the condition is inverted and we add debugging output
@@ -467,7 +468,7 @@ impl<'a, 'body, 'alloc, 'tcx> FilterInformation<'a, 'body, 'alloc, 'tcx> {
             // to reuse the allocation.
             write_info: write_info_alloc,
             // Doesn't matter what we put here, will be overwritten before being used
-            at: Location { block: BasicBlock::from_u32(0), statement_index: 0 },
+            at: Location::START,
         };
         this.internal_filter_liveness();
     }
@@ -577,10 +578,12 @@ impl WriteInfo {
                 self.add_place(**place);
             }
             StatementKind::Intrinsic(_)
+            | StatementKind::ConstEvalCounter
             | StatementKind::Nop
             | StatementKind::Coverage(_)
             | StatementKind::StorageLive(_)
-            | StatementKind::StorageDead(_) => (),
+            | StatementKind::StorageDead(_)
+            | StatementKind::PlaceMention(_) => (),
             StatementKind::FakeRead(_) | StatementKind::AscribeUserType(_, _) => {
                 bug!("{:?} not found in this MIR phase", statement)
             }
@@ -641,15 +644,14 @@ impl WriteInfo {
                 }
             }
             TerminatorKind::Goto { .. }
-            | TerminatorKind::Resume { .. }
-            | TerminatorKind::Abort { .. }
+            | TerminatorKind::Resume
+            | TerminatorKind::Terminate
             | TerminatorKind::Return
             | TerminatorKind::Unreachable { .. } => (),
             TerminatorKind::Drop { .. } => {
                 // `Drop`s create a `&mut` and so are not considered
             }
-            TerminatorKind::DropAndReplace { .. }
-            | TerminatorKind::Yield { .. }
+            TerminatorKind::Yield { .. }
             | TerminatorKind::GeneratorDrop
             | TerminatorKind::FalseEdge { .. }
             | TerminatorKind::FalseUnwind { .. } => {
@@ -754,7 +756,7 @@ impl<'tcx> Visitor<'tcx> for FindAssignments<'_, '_, 'tcx> {
     fn visit_statement(&mut self, statement: &Statement<'tcx>, _: Location) {
         if let StatementKind::Assign(box (
             lhs,
-            Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs)),
+            Rvalue::CopyForDeref(rhs) | Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs)),
         )) = &statement.kind
         {
             let Some((src, dest)) = places_to_candidate_pair(*lhs, *rhs, self.body) else {
@@ -785,7 +787,7 @@ impl<'tcx> Visitor<'tcx> for FindAssignments<'_, '_, 'tcx> {
 fn is_local_required(local: Local, body: &Body<'_>) -> bool {
     match body.local_kind(local) {
         LocalKind::Arg | LocalKind::ReturnPointer => true,
-        LocalKind::Var | LocalKind::Temp => false,
+        LocalKind::Temp => false,
     }
 }
 

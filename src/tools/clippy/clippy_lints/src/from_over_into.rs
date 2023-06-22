@@ -76,7 +76,7 @@ impl<'tcx> LateLintPass<'tcx> for FromOverInto {
             && let Some(into_trait_seg) = hir_trait_ref.path.segments.last()
             // `impl Into<target_ty> for self_ty`
             && let Some(GenericArgs { args: [GenericArg::Type(target_ty)], .. }) = into_trait_seg.args
-            && let Some(middle_trait_ref) = cx.tcx.impl_trait_ref(item.owner_id)
+            && let Some(middle_trait_ref) = cx.tcx.impl_trait_ref(item.owner_id).map(ty::EarlyBinder::subst_identity)
             && cx.tcx.is_diagnostic_item(sym::Into, middle_trait_ref.def_id)
             && !matches!(middle_trait_ref.substs.type_at(1).kind(), ty::Alias(ty::Opaque, _))
         {
@@ -94,7 +94,7 @@ impl<'tcx> LateLintPass<'tcx> for FromOverInto {
                         );
                     }
 
-                    let message = format!("replace the `Into` implentation with `From<{}>`", middle_trait_ref.self_ty());
+                    let message = format!("replace the `Into` implementation with `From<{}>`", middle_trait_ref.self_ty());
                     if let Some(suggestions) = convert_to_from(cx, into_trait_seg, target_ty, self_ty, impl_item_ref) {
                         diag.multipart_suggestion(message, suggestions, Applicability::MachineApplicable);
                     } else {

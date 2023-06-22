@@ -70,6 +70,7 @@ fn generate_record_deref(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<(
         target,
         |edit| {
             generate_edit(
+                ctx.db(),
                 edit,
                 strukt,
                 field_type.syntax(),
@@ -85,8 +86,7 @@ fn generate_tuple_deref(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()
     let strukt = ctx.find_node_at_offset::<ast::Struct>()?;
     let field = ctx.find_node_at_offset::<ast::TupleField>()?;
     let field_list = ctx.find_node_at_offset::<ast::TupleFieldList>()?;
-    let field_list_index =
-        field_list.syntax().children().into_iter().position(|s| &s == field.syntax())?;
+    let field_list_index = field_list.syntax().children().position(|s| &s == field.syntax())?;
 
     let deref_type_to_generate = match existing_deref_impl(&ctx.sema, &strukt) {
         None => DerefType::Deref,
@@ -110,6 +110,7 @@ fn generate_tuple_deref(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()
         target,
         |edit| {
             generate_edit(
+                ctx.db(),
                 edit,
                 strukt,
                 field_type.syntax(),
@@ -122,6 +123,7 @@ fn generate_tuple_deref(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()
 }
 
 fn generate_edit(
+    db: &RootDatabase,
     edit: &mut SourceChangeBuilder,
     strukt: ast::Struct,
     field_type_syntax: &SyntaxNode,
@@ -145,7 +147,8 @@ fn generate_edit(
         ),
     };
     let strukt_adt = ast::Adt::Struct(strukt);
-    let deref_impl = generate_trait_impl_text(&strukt_adt, &trait_path.to_string(), &impl_code);
+    let deref_impl =
+        generate_trait_impl_text(&strukt_adt, &trait_path.display(db).to_string(), &impl_code);
     edit.insert(start_offset, deref_impl);
 }
 

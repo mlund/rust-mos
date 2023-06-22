@@ -53,6 +53,8 @@ pub fn eliminate<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>, borrowed: &BitS
                 | StatementKind::StorageDead(_)
                 | StatementKind::Coverage(_)
                 | StatementKind::Intrinsic(_)
+                | StatementKind::ConstEvalCounter
+                | StatementKind::PlaceMention(_)
                 | StatementKind::Nop => (),
 
                 StatementKind::FakeRead(_) | StatementKind::AscribeUserType(_, _) => {
@@ -71,7 +73,7 @@ pub fn eliminate<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>, borrowed: &BitS
         bbs[block].statements[statement_index].make_nop();
     }
 
-    crate::simplify::SimplifyLocals.run_pass(tcx, body)
+    crate::simplify::simplify_locals(body, tcx)
 }
 
 pub struct DeadStoreElimination;

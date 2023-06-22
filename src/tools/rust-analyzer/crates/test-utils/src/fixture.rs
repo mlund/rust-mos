@@ -78,6 +78,7 @@ pub struct Fixture {
     pub edition: Option<String>,
     pub env: FxHashMap<String, String>,
     pub introduce_new_source_root: Option<String>,
+    pub target_data_layout: Option<String>,
 }
 
 pub struct MiniCore {
@@ -85,7 +86,14 @@ pub struct MiniCore {
     valid_flags: Vec<String>,
 }
 
-impl Fixture {
+pub struct FixtureWithProjectMeta {
+    pub fixture: Vec<Fixture>,
+    pub mini_core: Option<MiniCore>,
+    pub proc_macro_names: Vec<String>,
+    pub toolchain: Option<String>,
+}
+
+impl FixtureWithProjectMeta {
     /// Parses text which looks like this:
     ///
     ///  ```not_rust
@@ -95,37 +103,41 @@ impl Fixture {
     ///  //- other meta
     ///  ```
     ///
-    /// Fixture can also start with a proc_macros and minicore declaration(in that order):
+    /// Fixture can also start with a proc_macros and minicore declaration (in that order):
     ///
     /// ```
+    /// //- toolchain: nightly
     /// //- proc_macros: identity
     /// //- minicore: sized
     /// ```
     ///
-    /// That will include predefined proc macros and a subset of `libcore` into the fixture, see
-    /// `minicore.rs` for what's available.
-    pub fn parse(ra_fixture: &str) -> (Option<MiniCore>, Vec<String>, Vec<Fixture>) {
+    /// That will set toolchain to nightly and include predefined proc macros and a subset of
+    /// `libcore` into the fixture, see `minicore.rs` for what's available. Note that toolchain
+    /// defaults to stable.
+    pub fn parse(ra_fixture: &str) -> Self {
         let fixture = trim_indent(ra_fixture);
         let mut fixture = fixture.as_str();
+        let mut toolchain = None;
         let mut mini_core = None;
         let mut res: Vec<Fixture> = Vec::new();
-        let mut test_proc_macros = vec![];
+        let mut proc_macro_names = vec![];
 
-        if fixture.starts_with("//- proc_macros:") {
-            let first_line = fixture.split_inclusive('\n').next().unwrap();
-            test_proc_macros = first_line
-                .strip_prefix("//- proc_macros:")
-                .unwrap()
-                .split(',')
-                .map(|it| it.trim().to_string())
-                .collect();
-            fixture = &fixture[first_line.len()..];
+        if let Some(meta) = fixture.strip_prefix("//- toolchain:") {
+            let (meta, remain) = meta.split_once('\n').unwrap();
+            toolchain = Some(meta.trim().to_string());
+            fixture = remain;
         }
 
-        if fixture.starts_with("//- minicore:") {
-            let first_line = fixture.split_inclusive('\n').next().unwrap();
-            mini_core = Some(MiniCore::parse(first_line));
-            fixture = &fixture[first_line.len()..];
+        if let Some(meta) = fixture.strip_prefix("//- proc_macros:") {
+            let (meta, remain) = meta.split_once('\n').unwrap();
+            proc_macro_names = meta.split(',').map(|it| it.trim().to_string()).collect();
+            fixture = remain;
+        }
+
+        if let Some(meta) = fixture.strip_prefix("//- minicore:") {
+            let (meta, remain) = meta.split_once('\n').unwrap();
+            mini_core = Some(MiniCore::parse(meta));
+            fixture = remain;
         }
 
         let default = if fixture.contains("//-") { None } else { Some("//- /main.rs") };
@@ -134,16 +146,14 @@ impl Fixture {
             if line.contains("//-") {
                 assert!(
                     line.starts_with("//-"),
-                    "Metadata line {} has invalid indentation. \
+                    "Metadata line {ix} has invalid indentation. \
                      All metadata lines need to have the same indentation.\n\
-                     The offending line: {:?}",
-                    ix,
-                    line
+                     The offending line: {line:?}"
                 );
             }
 
             if line.starts_with("//-") {
-                let meta = Fixture::parse_meta_line(line);
+                let meta = Self::parse_meta_line(line);
                 res.push(meta);
             } else {
                 if line.starts_with("// ")
@@ -152,7 +162,7 @@ impl Fixture {
                     && !line.contains('.')
                     && line.chars().all(|it| !it.is_uppercase())
                 {
-                    panic!("looks like invalid metadata line: {:?}", line);
+                    panic!("looks like invalid metadata line: {line:?}");
                 }
 
                 if let Some(entry) = res.last_mut() {
@@ -161,7 +171,7 @@ impl Fixture {
             }
         }
 
-        (mini_core, test_proc_macros, res)
+        Self { fixture: res, mini_core, proc_macro_names, toolchain }
     }
 
     //- /lib.rs crate:foo deps:bar,baz cfg:foo=a,bar=b env:OUTDIR=path/to,OTHER=foo
@@ -171,7 +181,7 @@ impl Fixture {
         let components = meta.split_ascii_whitespace().collect::<Vec<_>>();
 
         let path = components[0].to_string();
-        assert!(path.starts_with('/'), "fixture path does not start with `/`: {:?}", path);
+        assert!(path.starts_with('/'), "fixture path does not start with `/`: {path:?}");
 
         let mut krate = None;
         let mut deps = Vec::new();
@@ -181,10 +191,12 @@ impl Fixture {
         let mut cfg_key_values = Vec::new();
         let mut env = FxHashMap::default();
         let mut introduce_new_source_root = None;
+        let mut target_data_layout = Some(
+            "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128".to_string(),
+        );
         for component in components[1..].iter() {
-            let (key, value) = component
-                .split_once(':')
-                .unwrap_or_else(|| panic!("invalid meta line: {:?}", meta));
+            let (key, value) =
+                component.split_once(':').unwrap_or_else(|| panic!("invalid meta line: {meta:?}"));
             match key {
                 "crate" => krate = Some(value.to_string()),
                 "deps" => deps = value.split(',').map(|it| it.to_string()).collect(),
@@ -213,16 +225,15 @@ impl Fixture {
                     }
                 }
                 "new_source_root" => introduce_new_source_root = Some(value.to_string()),
-                _ => panic!("bad component: {:?}", component),
+                "target_data_layout" => target_data_layout = Some(value.to_string()),
+                _ => panic!("bad component: {component:?}"),
             }
         }
 
         for prelude_dep in extern_prelude.iter().flatten() {
             assert!(
                 deps.contains(prelude_dep),
-                "extern-prelude {:?} must be a subset of deps {:?}",
-                extern_prelude,
-                deps
+                "extern-prelude {extern_prelude:?} must be a subset of deps {deps:?}"
             );
         }
 
@@ -237,29 +248,38 @@ impl Fixture {
             edition,
             env,
             introduce_new_source_root,
+            target_data_layout,
         }
     }
 }
 
 impl MiniCore {
+    const RAW_SOURCE: &str = include_str!("./minicore.rs");
+
     fn has_flag(&self, flag: &str) -> bool {
         self.activated_flags.iter().any(|it| it == flag)
+    }
+
+    pub fn from_flags<'a>(flags: impl IntoIterator<Item = &'a str>) -> Self {
+        MiniCore {
+            activated_flags: flags.into_iter().map(|x| x.to_owned()).collect(),
+            valid_flags: Vec::new(),
+        }
     }
 
     #[track_caller]
     fn assert_valid_flag(&self, flag: &str) {
         if !self.valid_flags.iter().any(|it| it == flag) {
-            panic!("invalid flag: {:?}, valid flags: {:?}", flag, self.valid_flags);
+            panic!("invalid flag: {flag:?}, valid flags: {:?}", self.valid_flags);
         }
     }
 
     fn parse(line: &str) -> MiniCore {
         let mut res = MiniCore { activated_flags: Vec::new(), valid_flags: Vec::new() };
 
-        let line = line.strip_prefix("//- minicore:").unwrap().trim();
-        for entry in line.split(", ") {
+        for entry in line.trim().split(", ") {
             if res.has_flag(entry) {
-                panic!("duplicate minicore flag: {:?}", entry);
+                panic!("duplicate minicore flag: {entry:?}");
             }
             res.activated_flags.push(entry.to_owned());
         }
@@ -267,13 +287,21 @@ impl MiniCore {
         res
     }
 
+    pub fn available_flags() -> impl Iterator<Item = &'static str> {
+        let lines = MiniCore::RAW_SOURCE.split_inclusive('\n');
+        lines
+            .map_while(|x| x.strip_prefix("//!"))
+            .skip_while(|line| !line.contains("Available flags:"))
+            .skip(1)
+            .map(|x| x.split_once(':').unwrap().0.trim())
+    }
+
     /// Strips parts of minicore.rs which are flagged by inactive flags.
     ///
     /// This is probably over-engineered to support flags dependencies.
     pub fn source_code(mut self) -> String {
         let mut buf = String::new();
-        let raw_mini_core = include_str!("./minicore.rs");
-        let mut lines = raw_mini_core.split_inclusive('\n');
+        let mut lines = MiniCore::RAW_SOURCE.split_inclusive('\n');
 
         let mut implications = Vec::new();
 
@@ -345,11 +373,7 @@ impl MiniCore {
 
             let mut keep = true;
             for &region in &active_regions {
-                assert!(
-                    !region.starts_with(' '),
-                    "region marker starts with a space: {:?}",
-                    region
-                );
+                assert!(!region.starts_with(' '), "region marker starts with a space: {region:?}");
                 self.assert_valid_flag(region);
                 seen_regions.push(region);
                 keep &= self.has_flag(region);
@@ -363,9 +387,13 @@ impl MiniCore {
             }
         }
 
+        if !active_regions.is_empty() {
+            panic!("unclosed regions: {:?} Add an `endregion` comment", active_regions);
+        }
+
         for flag in &self.valid_flags {
             if !seen_regions.iter().any(|it| it == flag) {
-                panic!("unused minicore flag: {:?}", flag);
+                panic!("unused minicore flag: {flag:?}");
             }
         }
         buf
@@ -375,7 +403,7 @@ impl MiniCore {
 #[test]
 #[should_panic]
 fn parse_fixture_checks_further_indented_metadata() {
-    Fixture::parse(
+    FixtureWithProjectMeta::parse(
         r"
         //- /lib.rs
           mod bar;
@@ -389,15 +417,18 @@ fn parse_fixture_checks_further_indented_metadata() {
 
 #[test]
 fn parse_fixture_gets_full_meta() {
-    let (mini_core, proc_macros, parsed) = Fixture::parse(
-        r#"
+    let FixtureWithProjectMeta { fixture: parsed, mini_core, proc_macro_names, toolchain } =
+        FixtureWithProjectMeta::parse(
+            r#"
+//- toolchain: nightly
 //- proc_macros: identity
 //- minicore: coerce_unsized
 //- /lib.rs crate:foo deps:bar,baz cfg:foo=a,bar=b,atom env:OUTDIR=path/to,OTHER=foo
 mod m;
 "#,
-    );
-    assert_eq!(proc_macros, vec!["identity".to_string()]);
+        );
+    assert_eq!(toolchain, Some("nightly".to_string()));
+    assert_eq!(proc_macro_names, vec!["identity".to_string()]);
     assert_eq!(mini_core.unwrap().activated_flags, vec!["coerce_unsized".to_string()]);
     assert_eq!(1, parsed.len());
 

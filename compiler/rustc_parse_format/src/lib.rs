@@ -14,13 +14,12 @@
 // We want to be able to build this crate with a stable compiler, so no
 // `#![feature]` attributes should be added.
 
+use rustc_lexer::unescape;
 pub use Alignment::*;
 pub use Count::*;
-pub use Flag::*;
 pub use Piece::*;
 pub use Position::*;
 
-use rustc_lexer::unescape;
 use std::iter;
 use std::str;
 use std::string;
@@ -112,8 +111,14 @@ pub struct FormatSpec<'a> {
     pub fill: Option<char>,
     /// Optionally specified alignment.
     pub align: Alignment,
-    /// Packed version of various flags provided.
-    pub flags: u32,
+    /// The `+` or `-` flag.
+    pub sign: Option<Sign>,
+    /// The `#` flag.
+    pub alternate: bool,
+    /// The `0` flag.
+    pub zero_pad: bool,
+    /// The `x` or `X` flag. (Only for `Debug`.)
+    pub debug_hex: Option<DebugHex>,
     /// The integer precision to use.
     pub precision: Count<'a>,
     /// The span of the precision formatting flag (for diagnostics).
@@ -163,24 +168,22 @@ pub enum Alignment {
     AlignUnknown,
 }
 
-/// Various flags which can be applied to format strings. The meaning of these
-/// flags is defined by the formatters themselves.
+/// Enum for the sign flags.
 #[derive(Copy, Clone, Debug, PartialEq)]
-pub enum Flag {
-    /// A `+` will be used to denote positive numbers.
-    FlagSignPlus,
-    /// A `-` will be used to denote negative numbers. This is the default.
-    FlagSignMinus,
-    /// An alternate form will be used for the value. In the case of numbers,
-    /// this means that the number will be prefixed with the supplied string.
-    FlagAlternate,
-    /// For numbers, this means that the number will be padded with zeroes,
-    /// and the sign (`+` or `-`) will precede them.
-    FlagSignAwareZeroPad,
-    /// For Debug / `?`, format integers in lower-case hexadecimal.
-    FlagDebugLowerHex,
-    /// For Debug / `?`, format integers in upper-case hexadecimal.
-    FlagDebugUpperHex,
+pub enum Sign {
+    /// The `+` flag.
+    Plus,
+    /// The `-` flag.
+    Minus,
+}
+
+/// Enum for the debug hex flags.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum DebugHex {
+    /// The `x` flag in `{:x?}`.
+    Lower,
+    /// The `X` flag in `{:X?}`.
+    Upper,
 }
 
 /// A count is used for the precision and width parameters of an integer, and
@@ -232,8 +235,10 @@ pub struct Parser<'a> {
     last_opening_brace: Option<InnerSpan>,
     /// Whether the source string is comes from `println!` as opposed to `format!` or `print!`
     append_newline: bool,
-    /// Whether this formatting string is a literal or it comes from a macro.
-    pub is_literal: bool,
+    /// Whether this formatting string was written directly in the source. This controls whether we
+    /// can use spans to refer into it and give better error messages.
+    /// N.B: This does _not_ control whether implicit argument captures can be used.
+    pub is_source_literal: bool,
     /// Start position of the current line.
     cur_line_start: usize,
     /// Start and end byte offset of every line of the format string. Excludes
@@ -260,7 +265,7 @@ impl<'a> Iterator for Parser<'a> {
                     } else {
                         let arg = self.argument(lbrace_end);
                         if let Some(rbrace_pos) = self.must_consume('}') {
-                            if self.is_literal {
+                            if self.is_source_literal {
                                 let lbrace_byte_pos = self.to_span_index(pos);
                                 let rbrace_byte_pos = self.to_span_index(rbrace_pos);
 
@@ -271,7 +276,13 @@ impl<'a> Iterator for Parser<'a> {
                                 );
                             }
                         } else {
-                            self.suggest_positional_arg_instead_of_captured_arg(arg);
+                            if let Some(&(_, maybe)) = self.cur.peek() {
+                                if maybe == '?' {
+                                    self.suggest_format();
+                                } else {
+                                    self.suggest_positional_arg_instead_of_captured_arg(arg);
+                                }
+                            }
                         }
                         Some(NextArgument(Box::new(arg)))
                     }
@@ -294,7 +305,7 @@ impl<'a> Iterator for Parser<'a> {
                 _ => Some(String(self.string(pos))),
             }
         } else {
-            if self.is_literal {
+            if self.is_source_literal {
                 let span = self.span(self.cur_line_start, self.input.len());
                 if self.line_spans.last() != Some(&span) {
                     self.line_spans.push(span);
@@ -315,10 +326,11 @@ impl<'a> Parser<'a> {
         mode: ParseMode,
     ) -> Parser<'a> {
         let input_string_kind = find_width_map_from_snippet(s, snippet, style);
-        let (width_map, is_literal) = match input_string_kind {
+        let (width_map, is_source_literal) = match input_string_kind {
             InputStringKind::Literal { width_mappings } => (width_mappings, true),
             InputStringKind::NotALiteral => (Vec::new(), false),
         };
+
         Parser {
             mode,
             input: s,
@@ -330,7 +342,7 @@ impl<'a> Parser<'a> {
             width_map,
             last_opening_brace: None,
             append_newline,
-            is_literal,
+            is_source_literal,
             cur_line_start: 0,
             line_spans: vec![],
         }
@@ -447,7 +459,7 @@ impl<'a> Parser<'a> {
                 Some(pos)
             } else {
                 let pos = self.to_span_index(pos);
-                let description = format!("expected `'}}'`, found `{:?}`", maybe);
+                let description = format!("expected `'}}'`, found `{maybe:?}`");
                 let label = "expected `}`".to_owned();
                 let (note, secondary_label) = if c == '}' {
                     (
@@ -471,12 +483,12 @@ impl<'a> Parser<'a> {
                 None
             }
         } else {
-            let description = format!("expected `{:?}` but string was terminated", c);
+            let description = format!("expected `{c:?}` but string was terminated");
             // point at closing `"`
             let pos = self.input.len() - if self.append_newline { 1 } else { 0 };
             let pos = self.to_span_index(pos);
             if c == '}' {
-                let label = format!("expected `{:?}`", c);
+                let label = format!("expected `{c:?}`");
                 let (note, secondary_label) = if c == '}' {
                     (
                         Some(
@@ -497,7 +509,7 @@ impl<'a> Parser<'a> {
                     should_be_replaced_with_positional_argument: false,
                 });
             } else {
-                self.err(description, format!("expected `{:?}`", c), pos.to(pos));
+                self.err(description, format!("expected `{c:?}`"), pos.to(pos));
             }
             None
         }
@@ -523,13 +535,13 @@ impl<'a> Parser<'a> {
                 '{' | '}' => {
                     return &self.input[start..pos];
                 }
-                '\n' if self.is_literal => {
+                '\n' if self.is_source_literal => {
                     self.line_spans.push(self.span(self.cur_line_start, pos));
                     self.cur_line_start = pos + 1;
                     self.cur.next();
                 }
                 _ => {
-                    if self.is_literal && pos == self.cur_line_start && c.is_whitespace() {
+                    if self.is_source_literal && pos == self.cur_line_start && c.is_whitespace() {
                         self.cur_line_start = pos + c.len_utf8();
                     }
                     self.cur.next();
@@ -597,7 +609,10 @@ impl<'a> Parser<'a> {
         let mut spec = FormatSpec {
             fill: None,
             align: AlignUnknown,
-            flags: 0,
+            sign: None,
+            alternate: false,
+            zero_pad: false,
+            debug_hex: None,
             precision: CountImplied,
             precision_span: None,
             width: CountImplied,
@@ -626,13 +641,13 @@ impl<'a> Parser<'a> {
         }
         // Sign flags
         if self.consume('+') {
-            spec.flags |= 1 << (FlagSignPlus as u32);
+            spec.sign = Some(Sign::Plus);
         } else if self.consume('-') {
-            spec.flags |= 1 << (FlagSignMinus as u32);
+            spec.sign = Some(Sign::Minus);
         }
         // Alternate marker
         if self.consume('#') {
-            spec.flags |= 1 << (FlagAlternate as u32);
+            spec.alternate = true;
         }
         // Width and precision
         let mut havewidth = false;
@@ -647,7 +662,7 @@ impl<'a> Parser<'a> {
                 spec.width_span = Some(self.span(end - 1, end + 1));
                 havewidth = true;
             } else {
-                spec.flags |= 1 << (FlagSignAwareZeroPad as u32);
+                spec.zero_pad = true;
             }
         }
 
@@ -678,14 +693,14 @@ impl<'a> Parser<'a> {
         // Optional radix followed by the actual format specifier
         if self.consume('x') {
             if self.consume('?') {
-                spec.flags |= 1 << (FlagDebugLowerHex as u32);
+                spec.debug_hex = Some(DebugHex::Lower);
                 spec.ty = "?";
             } else {
                 spec.ty = "x";
             }
         } else if self.consume('X') {
             if self.consume('?') {
-                spec.flags |= 1 << (FlagDebugUpperHex as u32);
+                spec.debug_hex = Some(DebugHex::Upper);
                 spec.ty = "?";
             } else {
                 spec.ty = "X";
@@ -708,7 +723,10 @@ impl<'a> Parser<'a> {
         let mut spec = FormatSpec {
             fill: None,
             align: AlignUnknown,
-            flags: 0,
+            sign: None,
+            alternate: false,
+            zero_pad: false,
+            debug_hex: None,
             precision: CountImplied,
             precision_span: None,
             width: CountImplied,
@@ -820,7 +838,26 @@ impl<'a> Parser<'a> {
             );
         }
 
-        if found { Some(cur) } else { None }
+        found.then_some(cur)
+    }
+
+    fn suggest_format(&mut self) {
+        if let (Some(pos), Some(_)) = (self.consume_pos('?'), self.consume_pos(':')) {
+            let word = self.word();
+            let _end = self.current_pos();
+            let pos = self.to_span_index(pos);
+            self.errors.insert(
+                0,
+                ParseError {
+                    description: "expected format parameter to occur after `:`".to_owned(),
+                    note: Some(format!("`?` comes after `:`, try `{}:{}` instead", word, "?")),
+                    label: "expected `?` to occur after `:`".to_owned(),
+                    span: pos.to(pos),
+                    secondary_label: None,
+                    should_be_replaced_with_positional_argument: false,
+                },
+            );
+        }
     }
 
     fn suggest_positional_arg_instead_of_captured_arg(&mut self, arg: Argument<'a>) {
@@ -872,13 +909,13 @@ fn find_width_map_from_snippet(
     // Strip quotes.
     let snippet = &snippet[1..snippet.len() - 1];
 
-    // Macros like `println` add a newline at the end. That technically doens't make them "literals" anymore, but it's fine
+    // Macros like `println` add a newline at the end. That technically doesn't make them "literals" anymore, but it's fine
     // since we will never need to point our spans there, so we lie about it here by ignoring it.
     // Since there might actually be newlines in the source code, we need to normalize away all trailing newlines.
     // If we only trimmed it off the input, `format!("\n")` would cause a mismatch as here we they actually match up.
     // Alternatively, we could just count the trailing newlines and only trim one from the input if they don't match up.
     let input_no_nl = input.trim_end_matches('\n');
-    let Ok(unescaped) = unescape_string(snippet) else {
+    let Some(unescaped) = unescape_string(snippet) else {
         return InputStringKind::NotALiteral;
     };
 
@@ -972,17 +1009,17 @@ fn find_width_map_from_snippet(
     InputStringKind::Literal { width_mappings }
 }
 
-fn unescape_string(string: &str) -> Result<string::String, unescape::EscapeError> {
+fn unescape_string(string: &str) -> Option<string::String> {
     let mut buf = string::String::new();
-    let mut error = Ok(());
+    let mut ok = true;
     unescape::unescape_literal(string, unescape::Mode::Str, &mut |_, unescaped_char| {
         match unescaped_char {
             Ok(c) => buf.push(c),
-            Err(err) => error = Err(err),
+            Err(_) => ok = false,
         }
     });
 
-    error.map(|_| buf)
+    ok.then_some(buf)
 }
 
 // Assert a reasonable size for `Piece`

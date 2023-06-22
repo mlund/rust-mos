@@ -5,8 +5,6 @@
 #![allow(clippy::match_like_matches_macro)]
 #![allow(unreachable_pub)]
 
-#[macro_use]
-extern crate derive_new;
 #[cfg(test)]
 #[macro_use]
 extern crate lazy_static;
@@ -23,6 +21,12 @@ extern crate rustc_expand;
 extern crate rustc_parse;
 extern crate rustc_session;
 extern crate rustc_span;
+extern crate thin_vec;
+
+// Necessary to pull in object code as the rest of the rustc crates are shipped only as rmeta
+// files.
+#[allow(unused_extern_crates)]
+extern crate rustc_driver;
 
 use std::cell::RefCell;
 use std::collections::HashMap;

@@ -174,6 +174,32 @@ fn div() {
 }
 
 #[test]
+fn div_duration_f32() {
+    assert_eq!(Duration::ZERO.div_duration_f32(Duration::MAX), 0.0);
+    assert_eq!(Duration::MAX.div_duration_f32(Duration::ZERO), f32::INFINITY);
+    assert_eq!((Duration::SECOND * 2).div_duration_f32(Duration::SECOND), 2.0);
+    assert!(Duration::ZERO.div_duration_f32(Duration::ZERO).is_nan());
+    // These tests demonstrate it doesn't panic with extreme values.
+    // Accuracy of the computed value is not a huge concern, we know floats don't work well
+    // at these extremes.
+    assert!((Duration::MAX).div_duration_f32(Duration::NANOSECOND) > 10.0f32.powf(28.0));
+    assert!((Duration::NANOSECOND).div_duration_f32(Duration::MAX) < 0.1);
+}
+
+#[test]
+fn div_duration_f64() {
+    assert_eq!(Duration::ZERO.div_duration_f64(Duration::MAX), 0.0);
+    assert_eq!(Duration::MAX.div_duration_f64(Duration::ZERO), f64::INFINITY);
+    assert_eq!((Duration::SECOND * 2).div_duration_f64(Duration::SECOND), 2.0);
+    assert!(Duration::ZERO.div_duration_f64(Duration::ZERO).is_nan());
+    // These tests demonstrate it doesn't panic with extreme values.
+    // Accuracy of the computed value is not a huge concern, we know floats don't work well
+    // at these extremes.
+    assert!((Duration::MAX).div_duration_f64(Duration::NANOSECOND) > 10.0f64.powf(28.0));
+    assert!((Duration::NANOSECOND).div_duration_f64(Duration::MAX) < 0.1);
+}
+
+#[test]
 fn checked_div() {
     assert_eq!(Duration::new(2, 0).checked_div(2), Some(Duration::new(1, 0)));
     assert_eq!(Duration::new(1, 0).checked_div(2), Some(Duration::new(0, 500_000_000)));
@@ -399,14 +425,16 @@ fn duration_const() {
     const SECONDS_F32: f32 = Duration::SECOND.as_secs_f32();
     assert_eq!(SECONDS_F32, 1.0);
 
-    const FROM_SECONDS_F32: Duration = Duration::from_secs_f32(1.0);
-    assert_eq!(FROM_SECONDS_F32, Duration::SECOND);
+    // FIXME(#110395)
+    // const FROM_SECONDS_F32: Duration = Duration::from_secs_f32(1.0);
+    // assert_eq!(FROM_SECONDS_F32, Duration::SECOND);
 
     const SECONDS_F64: f64 = Duration::SECOND.as_secs_f64();
     assert_eq!(SECONDS_F64, 1.0);
 
-    const FROM_SECONDS_F64: Duration = Duration::from_secs_f64(1.0);
-    assert_eq!(FROM_SECONDS_F64, Duration::SECOND);
+    // FIXME(#110395)
+    // const FROM_SECONDS_F64: Duration = Duration::from_secs_f64(1.0);
+    // assert_eq!(FROM_SECONDS_F64, Duration::SECOND);
 
     const MILLIS: u128 = Duration::SECOND.as_millis();
     assert_eq!(MILLIS, 1_000);
@@ -437,6 +465,7 @@ fn duration_const() {
     const CHECKED_MUL: Option<Duration> = Duration::SECOND.checked_mul(1);
     assert_eq!(CHECKED_MUL, Some(Duration::SECOND));
 
+/*  FIXME(#110395)
     const MUL_F32: Duration = Duration::SECOND.mul_f32(1.0);
     assert_eq!(MUL_F32, Duration::SECOND);
 
@@ -451,6 +480,7 @@ fn duration_const() {
 
     const DIV_F64: Duration = Duration::SECOND.div_f64(1.0);
     assert_eq!(DIV_F64, Duration::SECOND);
+*/
 
     const DIV_DURATION_F32: f32 = Duration::SECOND.div_duration_f32(Duration::SECOND);
     assert_eq!(DIV_DURATION_F32, 1.0);

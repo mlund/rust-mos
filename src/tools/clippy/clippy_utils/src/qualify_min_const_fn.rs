@@ -27,15 +27,17 @@ pub fn is_min_const_fn<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, msrv: &Msrv) 
         for (predicate, _) in predicates.predicates {
             match predicate.kind().skip_binder() {
                 ty::PredicateKind::Clause(
-                    ty::Clause::RegionOutlives(_)
-                    | ty::Clause::TypeOutlives(_)
-                    | ty::Clause::Projection(_)
-                    | ty::Clause::Trait(..),
+                    ty::ClauseKind::RegionOutlives(_)
+                    | ty::ClauseKind::TypeOutlives(_)
+                    | ty::ClauseKind::Projection(_)
+                    | ty::ClauseKind::Trait(..)
+                    | ty::ClauseKind::ConstArgHasType(..),
                 )
-                | ty::PredicateKind::WellFormed(_)
-                | ty::PredicateKind::ConstEvaluatable(..)
+                | ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(_))
+                | ty::PredicateKind::Clause(ty::ClauseKind::ConstEvaluatable(..))
                 | ty::PredicateKind::ConstEquate(..)
                 | ty::PredicateKind::TypeWellFormedFromEnv(..) => continue,
+                ty::PredicateKind::AliasRelate(..) => panic!("alias relate predicate on function: {predicate:#?}"),
                 ty::PredicateKind::ObjectSafe(_) => panic!("object safe predicate on function: {predicate:#?}"),
                 ty::PredicateKind::ClosureKind(..) => panic!("closure kind predicate on function: {predicate:#?}"),
                 ty::PredicateKind::Subtype(_) => panic!("subtype predicate on function: {predicate:#?}"),
@@ -55,7 +57,7 @@ pub fn is_min_const_fn<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, msrv: &Msrv) 
     // impl trait is gone in MIR, so check the return type manually
     check_ty(
         tcx,
-        tcx.fn_sig(def_id).output().skip_binder(),
+        tcx.fn_sig(def_id).subst_identity().output().skip_binder(),
         body.local_decls.iter().next().unwrap().source_info.span,
     )?;
 
@@ -174,6 +176,10 @@ fn check_rvalue<'tcx>(
             // FIXME(dyn-star)
             unimplemented!()
         },
+        Rvalue::Cast(CastKind::Transmute, _, _) => Err((
+            span,
+            "transmute can attempt to turn pointers into integers, so is unstable in const fn".into(),
+        )),
         // binops are fine on integers
         Rvalue::BinaryOp(_, box (lhs, rhs)) | Rvalue::CheckedBinaryOp(_, box (lhs, rhs)) => {
             check_operand(tcx, lhs, span, body)?;
@@ -188,7 +194,9 @@ fn check_rvalue<'tcx>(
                 ))
             }
         },
-        Rvalue::NullaryOp(NullOp::SizeOf | NullOp::AlignOf, _) | Rvalue::ShallowInitBox(_, _) => Ok(()),
+        Rvalue::NullaryOp(NullOp::SizeOf | NullOp::AlignOf | NullOp::OffsetOf(_), _) | Rvalue::ShallowInitBox(_, _) => {
+            Ok(())
+        },
         Rvalue::UnaryOp(_, operand) => {
             let ty = operand.ty(body, tcx);
             if ty.is_integral() || ty.is_bool() {
@@ -239,7 +247,9 @@ fn check_statement<'tcx>(
         | StatementKind::StorageDead(_)
         | StatementKind::Retag { .. }
         | StatementKind::AscribeUserType(..)
+        | StatementKind::PlaceMention(..)
         | StatementKind::Coverage(..)
+        | StatementKind::ConstEvalCounter
         | StatementKind::Nop => Ok(()),
     }
 }
@@ -293,17 +303,13 @@ fn check_terminator<'tcx>(
         | TerminatorKind::Goto { .. }
         | TerminatorKind::Return
         | TerminatorKind::Resume
+        | TerminatorKind::Terminate
         | TerminatorKind::Unreachable => Ok(()),
 
         TerminatorKind::Drop { place, .. } => check_place(tcx, *place, span, body),
-        TerminatorKind::DropAndReplace { place, value, .. } => {
-            check_place(tcx, *place, span, body)?;
-            check_operand(tcx, value, span, body)
-        },
 
         TerminatorKind::SwitchInt { discr, targets: _ } => check_operand(tcx, discr, span, body),
 
-        TerminatorKind::Abort => Err((span, "abort is not stable in const fn".into())),
         TerminatorKind::GeneratorDrop | TerminatorKind::Yield { .. } => {
             Err((span, "const fn generators are unstable".into()))
         },
@@ -311,10 +317,10 @@ fn check_terminator<'tcx>(
         TerminatorKind::Call {
             func,
             args,
-            from_hir_call: _,
+            call_source: _,
             destination: _,
             target: _,
-            cleanup: _,
+            unwind: _,
             fn_span: _,
         } => {
             let fn_ty = func.ty(body, tcx);
@@ -357,7 +363,7 @@ fn check_terminator<'tcx>(
             expected: _,
             msg: _,
             target: _,
-            cleanup: _,
+            unwind: _,
         } => check_operand(tcx, cond, span, body),
 
         TerminatorKind::InlineAsm { .. } => Err((span, "cannot use inline assembly in const fn".into())),

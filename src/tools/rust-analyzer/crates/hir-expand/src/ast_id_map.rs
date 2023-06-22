@@ -20,7 +20,7 @@ use syntax::{ast, AstNode, AstPtr, SyntaxNode, SyntaxNodePtr};
 /// `AstId` points to an AST node in a specific file.
 pub struct FileAstId<N: AstNode> {
     raw: ErasedFileAstId,
-    _ty: PhantomData<fn() -> N>,
+    covariant: PhantomData<fn() -> N>,
 }
 
 impl<N: AstNode> Clone for FileAstId<N> {
@@ -54,7 +54,7 @@ impl<N: AstNode> FileAstId<N> {
     where
         N: Into<M>,
     {
-        FileAstId { raw: self.raw, _ty: PhantomData }
+        FileAstId { raw: self.raw, covariant: PhantomData }
     }
 }
 
@@ -98,6 +98,7 @@ impl AstIdMap {
                 || ast::Variant::can_cast(kind)
                 || ast::RecordField::can_cast(kind)
                 || ast::TupleField::can_cast(kind)
+                || ast::ConstArg::can_cast(kind)
             {
                 res.alloc(&it);
                 true
@@ -115,12 +116,17 @@ impl AstIdMap {
                 }
             }
         }
+        res.arena.shrink_to_fit();
         res
     }
 
     pub fn ast_id<N: AstNode>(&self, item: &N) -> FileAstId<N> {
         let raw = self.erased_ast_id(item.syntax());
-        FileAstId { raw, _ty: PhantomData }
+        FileAstId { raw, covariant: PhantomData }
+    }
+
+    pub fn get<N: AstNode>(&self, id: FileAstId<N>) -> AstPtr<N> {
+        AstPtr::try_from_raw(self.arena[id.raw].clone()).unwrap()
     }
 
     fn erased_ast_id(&self, item: &SyntaxNode) -> ErasedFileAstId {
@@ -134,10 +140,6 @@ impl AstIdMap {
                 self.arena.iter().map(|(_id, i)| i).collect::<Vec<_>>(),
             ),
         }
-    }
-
-    pub fn get<N: AstNode>(&self, id: FileAstId<N>) -> AstPtr<N> {
-        AstPtr::try_from_raw(self.arena[id.raw].clone()).unwrap()
     }
 
     fn alloc(&mut self, item: &SyntaxNode) -> ErasedFileAstId {

@@ -3,7 +3,7 @@ use rustc_middle::hir;
 use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::MirSpanview;
-use rustc_span::{BytePos, Pos, Span, SyntaxContext};
+use rustc_span::{BytePos, Pos, Span};
 
 use std::cmp;
 use std::io::{self, Write};
@@ -11,12 +11,13 @@ use std::io::{self, Write};
 pub const TOOLTIP_INDENT: &str = "    ";
 
 const CARET: char = '\u{2038}'; // Unicode `CARET`
-const ANNOTATION_LEFT_BRACKET: char = '\u{298a}'; // Unicode `Z NOTATION RIGHT BINDING BRACKET
+const ANNOTATION_LEFT_BRACKET: char = '\u{298a}'; // Unicode `Z NOTATION RIGHT BINDING BRACKET`
 const ANNOTATION_RIGHT_BRACKET: char = '\u{2989}'; // Unicode `Z NOTATION LEFT BINDING BRACKET`
 const NEW_LINE_SPAN: &str = "</span>\n<span class=\"line\">";
 const HEADER: &str = r#"<!DOCTYPE html>
-<html>
-<head>"#;
+<html lang="en">
+<head>
+<meta charset="utf-8">"#;
 const START_BODY: &str = r#"</head>
 <body>"#;
 const FOOTER: &str = r#"</body>
@@ -247,9 +248,11 @@ pub fn statement_kind_name(statement: &Statement<'_>) -> &'static str {
         StorageLive(..) => "StorageLive",
         StorageDead(..) => "StorageDead",
         Retag(..) => "Retag",
+        PlaceMention(..) => "PlaceMention",
         AscribeUserType(..) => "AscribeUserType",
         Coverage(..) => "Coverage",
         Intrinsic(..) => "Intrinsic",
+        ConstEvalCounter => "ConstEvalCounter",
         Nop => "Nop",
     }
 }
@@ -260,11 +263,10 @@ pub fn terminator_kind_name(term: &Terminator<'_>) -> &'static str {
         Goto { .. } => "Goto",
         SwitchInt { .. } => "SwitchInt",
         Resume => "Resume",
-        Abort => "Abort",
+        Terminate => "Terminate",
         Return => "Return",
         Unreachable => "Unreachable",
         Drop { .. } => "Drop",
-        DropAndReplace { .. } => "DropAndReplace",
         Call { .. } => "Call",
         Assert { .. } => "Assert",
         Yield { .. } => "Yield",
@@ -326,7 +328,7 @@ fn compute_block_span(data: &BasicBlockData<'_>, body_span: Span) -> Span {
     let mut span = data.terminator().source_info.span;
     for statement_span in data.statements.iter().map(|statement| statement.source_info.span) {
         // Only combine Spans from the root context, and within the function's body_span.
-        if statement_span.ctxt() == SyntaxContext::root() && body_span.contains(statement_span) {
+        if statement_span.ctxt().is_root() && body_span.contains(statement_span) {
             span = span.to(statement_span);
         }
     }
@@ -670,7 +672,7 @@ fn fn_span(tcx: TyCtxt<'_>, def_id: DefId) -> Span {
 
 fn hir_body(tcx: TyCtxt<'_>, def_id: DefId) -> Option<&rustc_hir::Body<'_>> {
     let hir_node = tcx.hir().get_if_local(def_id).expect("expected DefId is local");
-    hir::map::associated_body(hir_node).map(|fn_body_id| tcx.hir().body(fn_body_id))
+    hir::map::associated_body(hir_node).map(|(_, fn_body_id)| tcx.hir().body(fn_body_id))
 }
 
 fn escape_html(s: &str) -> String {

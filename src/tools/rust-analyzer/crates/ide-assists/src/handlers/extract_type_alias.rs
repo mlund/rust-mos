@@ -2,7 +2,7 @@ use either::Either;
 use ide_db::syntax_helpers::node_ext::walk_ty;
 use syntax::{
     ast::{self, edit::IndentLevel, make, AstNode, HasGenericParams, HasName},
-    match_ast,
+    ted,
 };
 
 use crate::{AssistContext, AssistId, AssistKind, Assists};
@@ -31,27 +31,22 @@ pub(crate) fn extract_type_alias(acc: &mut Assists, ctx: &AssistContext<'_>) -> 
 
     let ty = ctx.find_node_at_range::<ast::Type>()?;
     let item = ty.syntax().ancestors().find_map(ast::Item::cast)?;
-    let assoc_owner = item.syntax().ancestors().nth(2).and_then(|it| {
-        match_ast! {
-            match it {
-                ast::Trait(tr) => Some(Either::Left(tr)),
-                ast::Impl(impl_) => Some(Either::Right(impl_)),
-                _ => None,
-            }
-        }
-    });
+    let assoc_owner =
+        item.syntax().ancestors().nth(2).and_then(Either::<ast::Trait, ast::Impl>::cast);
     let node = assoc_owner.as_ref().map_or_else(
         || item.syntax(),
         |impl_| impl_.as_ref().either(AstNode::syntax, AstNode::syntax),
     );
-    let insert_pos = node.text_range().start();
     let target = ty.syntax().text_range();
 
     acc.add(
         AssistId("extract_type_alias", AssistKind::RefactorExtract),
         "Extract type as type alias",
         target,
-        |builder| {
+        |edit| {
+            let node = edit.make_syntax_mut(node.clone());
+            let target_ty = edit.make_mut(ty.clone());
+
             let mut known_generics = match item.generic_param_list() {
                 Some(it) => it.generic_params().collect(),
                 None => Vec::new(),
@@ -66,27 +61,29 @@ pub(crate) fn extract_type_alias(acc: &mut Assists, ctx: &AssistContext<'_>) -> 
             let generic_params =
                 generics.map(|it| make::generic_param_list(it.into_iter().cloned()));
 
+            // Replace original type with the alias
             let ty_args = generic_params
                 .as_ref()
                 .map_or(String::new(), |it| it.to_generic_args().to_string());
-            let replacement = format!("Type{ty_args}");
-            builder.replace(target, replacement);
+            // FIXME: replace with a `ast::make` constructor
+            let new_ty = make::ty(&format!("Type{ty_args}")).clone_for_update();
+            ted::replace(target_ty.syntax(), new_ty.syntax());
 
-            let indent = IndentLevel::from_node(node);
-            let generic_params = generic_params.map_or(String::new(), |it| it.to_string());
-            match ctx.config.snippet_cap {
-                Some(cap) => {
-                    builder.insert_snippet(
-                        cap,
-                        insert_pos,
-                        format!("type $0Type{generic_params} = {ty};\n\n{indent}"),
-                    );
-                }
-                None => {
-                    builder.insert(
-                        insert_pos,
-                        format!("type Type{generic_params} = {ty};\n\n{indent}"),
-                    );
+            // Insert new alias
+            let indent = IndentLevel::from_node(&node);
+            let ty_alias = make::ty_alias("Type", generic_params, None, None, Some((ty, None)))
+                .clone_for_update();
+            ted::insert_all(
+                ted::Position::before(node),
+                vec![
+                    ty_alias.syntax().clone().into(),
+                    make::tokens::whitespace(&format!("\n\n{indent}")).into(),
+                ],
+            );
+
+            if let Some(cap) = ctx.config.snippet_cap {
+                if let Some(name) = ty_alias.name() {
+                    edit.add_tabstop_before(cap, name);
                 }
             }
         },
@@ -108,59 +105,60 @@ fn collect_used_generics<'gp>(
     }
 
     let mut generics = Vec::new();
-    walk_ty(ty, &mut |ty| match ty {
-        ast::Type::PathType(ty) => {
-            if let Some(path) = ty.path() {
-                if let Some(name_ref) = path.as_single_name_ref() {
-                    if let Some(param) = known_generics.iter().find(|gp| {
-                        match gp {
-                            ast::GenericParam::ConstParam(cp) => cp.name(),
-                            ast::GenericParam::TypeParam(tp) => tp.name(),
-                            _ => None,
-                        }
-                        .map_or(false, |n| n.text() == name_ref.text())
-                    }) {
-                        generics.push(param);
-                    }
-                }
-                generics.extend(
-                    path.segments()
-                        .filter_map(|seg| seg.generic_arg_list())
-                        .flat_map(|it| it.generic_args())
-                        .filter_map(|it| match it {
-                            ast::GenericArg::LifetimeArg(lt) => {
-                                let lt = lt.lifetime()?;
-                                known_generics.iter().find(find_lifetime(&lt.text()))
+    walk_ty(ty, &mut |ty| {
+        match ty {
+            ast::Type::PathType(ty) => {
+                if let Some(path) = ty.path() {
+                    if let Some(name_ref) = path.as_single_name_ref() {
+                        if let Some(param) = known_generics.iter().find(|gp| {
+                            match gp {
+                                ast::GenericParam::ConstParam(cp) => cp.name(),
+                                ast::GenericParam::TypeParam(tp) => tp.name(),
+                                _ => None,
                             }
-                            _ => None,
-                        }),
-                );
+                            .map_or(false, |n| n.text() == name_ref.text())
+                        }) {
+                            generics.push(param);
+                        }
+                    }
+                    generics.extend(
+                        path.segments()
+                            .filter_map(|seg| seg.generic_arg_list())
+                            .flat_map(|it| it.generic_args())
+                            .filter_map(|it| match it {
+                                ast::GenericArg::LifetimeArg(lt) => {
+                                    let lt = lt.lifetime()?;
+                                    known_generics.iter().find(find_lifetime(&lt.text()))
+                                }
+                                _ => None,
+                            }),
+                    );
+                }
             }
-        }
-        ast::Type::ImplTraitType(impl_ty) => {
-            if let Some(it) = impl_ty.type_bound_list() {
-                generics.extend(
-                    it.bounds()
-                        .filter_map(|it| it.lifetime())
-                        .filter_map(|lt| known_generics.iter().find(find_lifetime(&lt.text()))),
-                );
+            ast::Type::ImplTraitType(impl_ty) => {
+                if let Some(it) = impl_ty.type_bound_list() {
+                    generics.extend(
+                        it.bounds()
+                            .filter_map(|it| it.lifetime())
+                            .filter_map(|lt| known_generics.iter().find(find_lifetime(&lt.text()))),
+                    );
+                }
             }
-        }
-        ast::Type::DynTraitType(dyn_ty) => {
-            if let Some(it) = dyn_ty.type_bound_list() {
-                generics.extend(
-                    it.bounds()
-                        .filter_map(|it| it.lifetime())
-                        .filter_map(|lt| known_generics.iter().find(find_lifetime(&lt.text()))),
-                );
+            ast::Type::DynTraitType(dyn_ty) => {
+                if let Some(it) = dyn_ty.type_bound_list() {
+                    generics.extend(
+                        it.bounds()
+                            .filter_map(|it| it.lifetime())
+                            .filter_map(|lt| known_generics.iter().find(find_lifetime(&lt.text()))),
+                    );
+                }
             }
-        }
-        ast::Type::RefType(ref_) => generics.extend(
-            ref_.lifetime().and_then(|lt| known_generics.iter().find(find_lifetime(&lt.text()))),
-        ),
-        ast::Type::ArrayType(ar) => {
-            if let Some(expr) = ar.expr() {
-                if let ast::Expr::PathExpr(p) = expr {
+            ast::Type::RefType(ref_) => generics.extend(
+                ref_.lifetime()
+                    .and_then(|lt| known_generics.iter().find(find_lifetime(&lt.text()))),
+            ),
+            ast::Type::ArrayType(ar) => {
+                if let Some(ast::Expr::PathExpr(p)) = ar.const_arg().and_then(|x| x.expr()) {
                     if let Some(path) = p.path() {
                         if let Some(name_ref) = path.as_single_name_ref() {
                             if let Some(param) = known_generics.iter().find(|gp| {
@@ -176,8 +174,9 @@ fn collect_used_generics<'gp>(
                     }
                 }
             }
-        }
-        _ => (),
+            _ => (),
+        };
+        false
     });
     // stable resort to lifetime, type, const
     generics.sort_by_key(|gp| match gp {

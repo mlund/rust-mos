@@ -12,16 +12,17 @@ mod vec_box;
 use rustc_hir as hir;
 use rustc_hir::intravisit::FnKind;
 use rustc_hir::{
-    Body, FnDecl, FnRetTy, GenericArg, HirId, ImplItem, ImplItemKind, Item, ItemKind, Local, MutTy, QPath, TraitItem,
+    Body, FnDecl, FnRetTy, GenericArg, ImplItem, ImplItemKind, Item, ItemKind, Local, MutTy, QPath, TraitItem,
     TraitItemKind, TyKind,
 };
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::{declare_tool_lint, impl_lint_pass};
+use rustc_span::def_id::LocalDefId;
 use rustc_span::source_map::Span;
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for use of `Box<T>` where T is a collection such as Vec anywhere in the code.
+    /// Checks for usage of `Box<T>` where T is a collection such as Vec anywhere in the code.
     /// Check the [Box documentation](https://doc.rust-lang.org/std/boxed/index.html) for more information.
     ///
     /// ### Why is this bad?
@@ -51,7 +52,7 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for use of `Vec<Box<T>>` where T: Sized anywhere in the code.
+    /// Checks for usage of `Vec<Box<T>>` where T: Sized anywhere in the code.
     /// Check the [Box documentation](https://doc.rust-lang.org/std/boxed/index.html) for more information.
     ///
     /// ### Why is this bad?
@@ -84,13 +85,13 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for use of `Option<Option<_>>` in function signatures and type
+    /// Checks for usage of `Option<Option<_>>` in function signatures and type
     /// definitions
     ///
     /// ### Why is this bad?
     /// `Option<_>` represents an optional value. `Option<Option<_>>`
-    /// represents an optional optional value which is logically the same thing as an optional
-    /// value but has an unneeded extra level of wrapping.
+    /// represents an optional value which itself wraps an optional. This is logically the
+    /// same thing as an optional value but has an unneeded extra level of wrapping.
     ///
     /// If you have a case where `Some(Some(_))`, `Some(None)` and `None` are distinct cases,
     /// consider a custom `enum` instead, with clear names for each case.
@@ -127,7 +128,7 @@ declare_clippy_lint! {
     /// `Vec` or a `VecDeque` (formerly called `RingBuf`).
     ///
     /// ### Why is this bad?
-    /// Gankro says:
+    /// Gankra says:
     ///
     /// > The TL;DR of `LinkedList` is that it's built on a massive amount of
     /// pointers and indirection.
@@ -163,7 +164,7 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for use of `&Box<T>` anywhere in the code.
+    /// Checks for usage of `&Box<T>` anywhere in the code.
     /// Check the [Box documentation](https://doc.rust-lang.org/std/boxed/index.html) for more information.
     ///
     /// ### Why is this bad?
@@ -189,7 +190,7 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for use of redundant allocations anywhere in the code.
+    /// Checks for usage of redundant allocations anywhere in the code.
     ///
     /// ### Why is this bad?
     /// Expressions such as `Rc<&T>`, `Rc<Rc<T>>`, `Rc<Arc<T>>`, `Rc<Box<T>>`, `Arc<&T>`, `Arc<Rc<T>>`,
@@ -311,15 +312,27 @@ pub struct Types {
 impl_lint_pass!(Types => [BOX_COLLECTION, VEC_BOX, OPTION_OPTION, LINKEDLIST, BORROWED_BOX, REDUNDANT_ALLOCATION, RC_BUFFER, RC_MUTEX, TYPE_COMPLEXITY]);
 
 impl<'tcx> LateLintPass<'tcx> for Types {
-    fn check_fn(&mut self, cx: &LateContext<'_>, _: FnKind<'_>, decl: &FnDecl<'_>, _: &Body<'_>, _: Span, id: HirId) {
-        let is_in_trait_impl =
-            if let Some(hir::Node::Item(item)) = cx.tcx.hir().find_by_def_id(cx.tcx.hir().get_parent_item(id).def_id) {
-                matches!(item.kind, ItemKind::Impl(hir::Impl { of_trait: Some(_), .. }))
-            } else {
-                false
-            };
+    fn check_fn(
+        &mut self,
+        cx: &LateContext<'_>,
+        _: FnKind<'_>,
+        decl: &FnDecl<'_>,
+        _: &Body<'_>,
+        _: Span,
+        def_id: LocalDefId,
+    ) {
+        let is_in_trait_impl = if let Some(hir::Node::Item(item)) = cx.tcx.hir().find_by_def_id(
+            cx.tcx
+                .hir()
+                .get_parent_item(cx.tcx.hir().local_def_id_to_hir_id(def_id))
+                .def_id,
+        ) {
+            matches!(item.kind, ItemKind::Impl(hir::Impl { of_trait: Some(_), .. }))
+        } else {
+            false
+        };
 
-        let is_exported = cx.effective_visibilities.is_exported(cx.tcx.hir().local_def_id(id));
+        let is_exported = cx.effective_visibilities.is_exported(def_id);
 
         self.check_fn_decl(
             cx,
@@ -379,9 +392,7 @@ impl<'tcx> LateLintPass<'tcx> for Types {
     }
 
     fn check_field_def(&mut self, cx: &LateContext<'_>, field: &hir::FieldDef<'_>) {
-        let is_exported = cx
-            .effective_visibilities
-            .is_exported(cx.tcx.hir().local_def_id(field.hir_id));
+        let is_exported = cx.effective_visibilities.is_exported(field.def_id);
 
         self.check_ty(
             cx,

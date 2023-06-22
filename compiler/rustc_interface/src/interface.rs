@@ -1,23 +1,25 @@
-pub use crate::passes::BoxedResolver;
 use crate::util;
 
 use rustc_ast::token;
 use rustc_ast::{self as ast, LitKind, MetaItemKind};
 use rustc_codegen_ssa::traits::CodegenBackend;
+use rustc_data_structures::defer;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::sync::Lrc;
-use rustc_data_structures::OnDrop;
 use rustc_errors::registry::Registry;
 use rustc_errors::{ErrorGuaranteed, Handler};
 use rustc_lint::LintStore;
-use rustc_middle::ty;
+use rustc_middle::query::{ExternProviders, Providers};
+use rustc_middle::{bug, ty};
 use rustc_parse::maybe_new_parser_from_source_str;
 use rustc_query_impl::QueryCtxt;
-use rustc_session::config::{self, CheckCfg, ErrorOutputType, Input, OutputFilenames};
-use rustc_session::early_error;
+use rustc_query_system::query::print_query_stack;
+use rustc_session::config::{self, ErrorOutputType, Input, OutFileName, OutputFilenames};
+use rustc_session::config::{CheckCfg, ExpectedValues};
 use rustc_session::lint;
 use rustc_session::parse::{CrateConfig, ParseSess};
 use rustc_session::Session;
+use rustc_session::{early_error, CompilerIO};
 use rustc_span::source_map::{FileLoader, FileName};
 use rustc_span::symbol::sym;
 use std::path::PathBuf;
@@ -35,14 +37,8 @@ pub type Result<T> = result::Result<T, ErrorGuaranteed>;
 pub struct Compiler {
     pub(crate) sess: Lrc<Session>,
     codegen_backend: Lrc<Box<dyn CodegenBackend>>,
-    pub(crate) input: Input,
-    pub(crate) input_path: Option<PathBuf>,
-    pub(crate) output_dir: Option<PathBuf>,
-    pub(crate) output_file: Option<PathBuf>,
-    pub(crate) temps_dir: Option<PathBuf>,
     pub(crate) register_lints: Option<Box<dyn Fn(&Session, &mut LintStore) + Send + Sync>>,
-    pub(crate) override_queries:
-        Option<fn(&Session, &mut ty::query::Providers, &mut ty::query::ExternProviders)>,
+    pub(crate) override_queries: Option<fn(&Session, &mut Providers, &mut ExternProviders)>,
 }
 
 impl Compiler {
@@ -52,18 +48,6 @@ impl Compiler {
     pub fn codegen_backend(&self) -> &Lrc<Box<dyn CodegenBackend>> {
         &self.codegen_backend
     }
-    pub fn input(&self) -> &Input {
-        &self.input
-    }
-    pub fn output_dir(&self) -> &Option<PathBuf> {
-        &self.output_dir
-    }
-    pub fn output_file(&self) -> &Option<PathBuf> {
-        &self.output_file
-    }
-    pub fn temps_dir(&self) -> &Option<PathBuf> {
-        &self.temps_dir
-    }
     pub fn register_lints(&self) -> &Option<Box<dyn Fn(&Session, &mut LintStore) + Send + Sync>> {
         &self.register_lints
     }
@@ -72,15 +56,13 @@ impl Compiler {
         sess: &Session,
         attrs: &[ast::Attribute],
     ) -> OutputFilenames {
-        util::build_output_filenames(
-            &self.input,
-            &self.output_dir,
-            &self.output_file,
-            &self.temps_dir,
-            attrs,
-            sess,
-        )
+        util::build_output_filenames(attrs, sess)
     }
+}
+
+#[allow(rustc::bad_opt_access)]
+pub fn set_thread_safe_mode(sopts: &config::UnstableOptions) {
+    rustc_data_structures::sync::set_dyn_thread_safe_mode(sopts.threads > 1);
 }
 
 /// Converts strings provided as `--cfg [cfgspec]` into a `crate_cfg`.
@@ -90,8 +72,7 @@ pub fn parse_cfgspecs(cfgspecs: Vec<String>) -> FxHashSet<(String, Option<String
             .into_iter()
             .map(|s| {
                 let sess = ParseSess::with_silent_emitter(Some(format!(
-                    "this error occurred on the command line: `--cfg={}`",
-                    s
+                    "this error occurred on the command line: `--cfg={s}`"
                 )));
                 let filename = FileName::cfg_spec_source_code(&s);
 
@@ -99,7 +80,7 @@ pub fn parse_cfgspecs(cfgspecs: Vec<String>) -> FxHashSet<(String, Option<String
                     ($reason: expr) => {
                         early_error(
                             ErrorOutputType::default(),
-                            &format!(concat!("invalid `--cfg` argument: `{}` (", $reason, ")"), s),
+                            format!(concat!("invalid `--cfg` argument: `{}` (", $reason, ")"), s),
                         );
                     };
                 }
@@ -146,12 +127,11 @@ pub fn parse_cfgspecs(cfgspecs: Vec<String>) -> FxHashSet<(String, Option<String
 /// Converts strings provided as `--check-cfg [specs]` into a `CheckCfg`.
 pub fn parse_check_cfg(specs: Vec<String>) -> CheckCfg {
     rustc_span::create_default_session_if_not_set_then(move |_| {
-        let mut cfg = CheckCfg::default();
+        let mut check_cfg = CheckCfg::default();
 
-        'specs: for s in specs {
+        for s in specs {
             let sess = ParseSess::with_silent_emitter(Some(format!(
-                "this error occurred on the command line: `--check-cfg={}`",
-                s
+                "this error occurred on the command line: `--check-cfg={s}`"
             )));
             let filename = FileName::cfg_spec_source_code(&s);
 
@@ -159,44 +139,64 @@ pub fn parse_check_cfg(specs: Vec<String>) -> CheckCfg {
                 ($reason: expr) => {
                     early_error(
                         ErrorOutputType::default(),
-                        &format!(
-                            concat!("invalid `--check-cfg` argument: `{}` (", $reason, ")"),
-                            s
-                        ),
-                    );
+                        format!(concat!("invalid `--check-cfg` argument: `{}` (", $reason, ")"), s),
+                    )
                 };
             }
+
+            let expected_error = || {
+                error!(
+                    "expected `names(name1, name2, ... nameN)` or \
+                        `values(name, \"value1\", \"value2\", ... \"valueN\")`"
+                )
+            };
 
             match maybe_new_parser_from_source_str(&sess, filename, s.to_string()) {
                 Ok(mut parser) => match parser.parse_meta_item() {
                     Ok(meta_item) if parser.token == token::Eof => {
                         if let Some(args) = meta_item.meta_item_list() {
                             if meta_item.has_name(sym::names) {
-                                let names_valid =
-                                    cfg.names_valid.get_or_insert_with(|| FxHashSet::default());
+                                check_cfg.exhaustive_names = true;
                                 for arg in args {
                                     if arg.is_word() && arg.ident().is_some() {
                                         let ident = arg.ident().expect("multi-segment cfg key");
-                                        names_valid.insert(ident.name.to_string());
+                                        check_cfg
+                                            .expecteds
+                                            .entry(ident.name.to_string())
+                                            .or_insert(ExpectedValues::Any);
                                     } else {
                                         error!("`names()` arguments must be simple identifiers");
                                     }
                                 }
-                                continue 'specs;
                             } else if meta_item.has_name(sym::values) {
                                 if let Some((name, values)) = args.split_first() {
                                     if name.is_word() && name.ident().is_some() {
                                         let ident = name.ident().expect("multi-segment cfg key");
-                                        let ident_values = cfg
-                                            .values_valid
+                                        let expected_values = check_cfg
+                                            .expecteds
                                             .entry(ident.name.to_string())
-                                            .or_insert_with(|| FxHashSet::default());
+                                            .and_modify(|expected_values| match expected_values {
+                                                ExpectedValues::Some(_) => {}
+                                                ExpectedValues::Any => {
+                                                    // handle the case where names(...) was done
+                                                    // before values by changing to a list
+                                                    *expected_values =
+                                                        ExpectedValues::Some(FxHashSet::default());
+                                                }
+                                            })
+                                            .or_insert_with(|| {
+                                                ExpectedValues::Some(FxHashSet::default())
+                                            });
+
+                                        let ExpectedValues::Some(expected_values) = expected_values else {
+                                            bug!("`expected_values` should be a list a values")
+                                        };
 
                                         for val in values {
                                             if let Some(LitKind::Str(s, _)) =
                                                 val.lit().map(|lit| &lit.kind)
                                             {
-                                                ident_values.insert(s.to_string());
+                                                expected_values.insert(Some(s.to_string()));
                                             } else {
                                                 error!(
                                                     "`values()` arguments must be string literals"
@@ -204,35 +204,40 @@ pub fn parse_check_cfg(specs: Vec<String>) -> CheckCfg {
                                             }
                                         }
 
-                                        continue 'specs;
+                                        if values.is_empty() {
+                                            expected_values.insert(None);
+                                        }
                                     } else {
                                         error!(
                                             "`values()` first argument must be a simple identifier"
                                         );
                                     }
                                 } else if args.is_empty() {
-                                    cfg.well_known_values = true;
-                                    continue 'specs;
+                                    check_cfg.exhaustive_values = true;
+                                } else {
+                                    expected_error();
                                 }
+                            } else {
+                                expected_error();
                             }
+                        } else {
+                            expected_error();
                         }
                     }
-                    Ok(..) => {}
-                    Err(err) => err.cancel(),
+                    Ok(..) => expected_error(),
+                    Err(err) => {
+                        err.cancel();
+                        expected_error();
+                    }
                 },
-                Err(errs) => drop(errs),
+                Err(errs) => {
+                    drop(errs);
+                    expected_error();
+                }
             }
-
-            error!(
-                "expected `names(name1, name2, ... nameN)` or \
-                `values(name, \"value1\", \"value2\", ... \"valueN\")`"
-            );
         }
 
-        if let Some(names_valid) = &mut cfg.names_valid {
-            names_valid.extend(cfg.values_valid.keys().cloned());
-        }
-        cfg
+        check_cfg
     })
 }
 
@@ -246,10 +251,10 @@ pub struct Config {
     pub crate_check_cfg: CheckCfg,
 
     pub input: Input,
-    pub input_path: Option<PathBuf>,
     pub output_dir: Option<PathBuf>,
-    pub output_file: Option<PathBuf>,
+    pub output_file: Option<OutFileName>,
     pub file_loader: Option<Box<dyn FileLoader + Send + Sync>>,
+    pub locale_resources: &'static [&'static str],
 
     pub lint_caps: FxHashMap<lint::LintId, lint::Level>,
 
@@ -267,8 +272,7 @@ pub struct Config {
     /// the list of queries.
     ///
     /// The second parameter is local providers and the third parameter is external providers.
-    pub override_queries:
-        Option<fn(&Session, &mut ty::query::Providers, &mut ty::query::ExternProviders)>,
+    pub override_queries: Option<fn(&Session, &mut Providers, &mut ExternProviders)>,
 
     /// This is a callback from the driver that is called to create a codegen backend.
     pub make_codegen_backend:
@@ -289,12 +293,20 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
             crate::callbacks::setup_callbacks();
 
             let registry = &config.registry;
+
+            let temps_dir = config.opts.unstable_opts.temps_dir.as_deref().map(PathBuf::from);
             let (mut sess, codegen_backend) = util::create_session(
                 config.opts,
                 config.crate_cfg,
                 config.crate_check_cfg,
+                config.locale_resources,
                 config.file_loader,
-                config.input_path.clone(),
+                CompilerIO {
+                    input: config.input,
+                    output_dir: config.output_dir,
+                    output_file: config.output_file,
+                    temps_dir,
+                },
                 config.lint_caps,
                 config.make_codegen_backend,
                 registry.clone(),
@@ -304,23 +316,16 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
                 parse_sess_created(&mut sess.parse_sess);
             }
 
-            let temps_dir = sess.opts.unstable_opts.temps_dir.as_deref().map(PathBuf::from);
-
             let compiler = Compiler {
                 sess: Lrc::new(sess),
                 codegen_backend: Lrc::new(codegen_backend),
-                input: config.input,
-                input_path: config.input_path,
-                output_dir: config.output_dir,
-                output_file: config.output_file,
-                temps_dir,
                 register_lints: config.register_lints,
                 override_queries: config.override_queries,
             };
 
-            rustc_span::with_source_map(compiler.sess.parse_sess.clone_source_map(), move || {
+            rustc_span::set_source_map(compiler.sess.parse_sess.clone_source_map(), move || {
                 let r = {
-                    let _sess_abort_error = OnDrop(|| {
+                    let _sess_abort_error = defer(|| {
                         compiler.sess.finish_diagnostics(registry);
                     });
 
@@ -328,6 +333,7 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
                 };
 
                 let prof = compiler.sess.prof.clone();
+
                 prof.generic_activity("drop_compiler").run(move || drop(compiler));
                 r
             })
@@ -343,7 +349,7 @@ pub fn try_print_query_stack(handler: &Handler, num_frames: Option<usize>) {
     // state if it was responsible for triggering the panic.
     let i = ty::tls::with_context_opt(|icx| {
         if let Some(icx) = icx {
-            QueryCtxt::from_tcx(icx.tcx).try_print_query_stack(icx.query, handler, num_frames)
+            print_query_stack(QueryCtxt::new(icx.tcx), icx.query, handler, num_frames)
         } else {
             0
         }

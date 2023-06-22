@@ -30,7 +30,7 @@ pub fn check_live_drops<'tcx>(tcx: TyCtxt<'tcx>, body: &mir::Body<'tcx>) {
         return;
     }
 
-    if tcx.has_attr(def_id.to_def_id(), sym::rustc_do_not_const_check) {
+    if tcx.has_attr(def_id, sym::rustc_do_not_const_check) {
         return;
     }
 
@@ -80,8 +80,7 @@ impl<'tcx> Visitor<'tcx> for CheckLiveDrops<'_, 'tcx> {
         trace!("visit_terminator: terminator={:?} location={:?}", terminator, location);
 
         match &terminator.kind {
-            mir::TerminatorKind::Drop { place: dropped_place, .. }
-            | mir::TerminatorKind::DropAndReplace { place: dropped_place, .. } => {
+            mir::TerminatorKind::Drop { place: dropped_place, .. } => {
                 let dropped_ty = dropped_place.ty(self.body, self.tcx).ty;
                 if !NeedsNonConstDrop::in_any_value_of_ty(self.ccx, dropped_ty) {
                     // Instead of throwing a bug, we just return here. This is because we have to
@@ -95,7 +94,7 @@ impl<'tcx> Visitor<'tcx> for CheckLiveDrops<'_, 'tcx> {
                 }
 
                 // Drop elaboration is not precise enough to accept code like
-                // `src/test/ui/consts/control-flow/drop-pass.rs`; e.g., when an `Option<Vec<T>>` is
+                // `tests/ui/consts/control-flow/drop-pass.rs`; e.g., when an `Option<Vec<T>>` is
                 // initialized with `None` and never changed, it still emits drop glue.
                 // Hence we additionally check the qualifs here to allow more code to pass.
                 if self.qualifs.needs_non_const_drop(self.ccx, dropped_place.local, location) {
@@ -105,7 +104,7 @@ impl<'tcx> Visitor<'tcx> for CheckLiveDrops<'_, 'tcx> {
                 }
             }
 
-            mir::TerminatorKind::Abort
+            mir::TerminatorKind::Terminate
             | mir::TerminatorKind::Call { .. }
             | mir::TerminatorKind::Assert { .. }
             | mir::TerminatorKind::FalseEdge { .. }

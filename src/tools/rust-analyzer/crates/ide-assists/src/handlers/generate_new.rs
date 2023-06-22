@@ -1,5 +1,5 @@
 use ide_db::{
-    imports::import_assets::item_for_path_search, use_trivial_contructor::use_trivial_constructor,
+    imports::import_assets::item_for_path_search, use_trivial_constructor::use_trivial_constructor,
 };
 use itertools::Itertools;
 use stdx::format_to;
@@ -70,7 +70,7 @@ pub(crate) fn generate_new(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option
                 )?;
 
                 let expr = use_trivial_constructor(
-                    &ctx.sema.db,
+                    ctx.sema.db,
                     ide_db::helpers::mod_path_to_ast(&type_path),
                     &ty,
                 )?;
@@ -98,9 +98,9 @@ pub(crate) fn generate_new(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option
             .fields()
             .enumerate()
             .filter_map(|(i, f)| {
-                let contructor = trivial_constructors[i].clone();
-                if contructor.is_some() {
-                    contructor
+                let constructor = trivial_constructors[i].clone();
+                if constructor.is_some() {
+                    constructor
                 } else {
                     Some(f.name()?.to_string())
                 }

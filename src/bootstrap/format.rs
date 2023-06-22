@@ -2,6 +2,8 @@
 
 use crate::builder::Builder;
 use crate::util::{output, program_out_of_date, t};
+use build_helper::ci::CiEnv;
+use build_helper::git::get_git_modified_files;
 use ignore::WalkBuilder;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -38,7 +40,7 @@ fn rustfmt(src: &Path, rustfmt: &Path, paths: &[PathBuf], check: bool) -> impl F
                         code, run `./x.py fmt` instead.",
                 cmd_debug,
             );
-            crate::detail_exit(1);
+            crate::detail_exit_macro!(1);
         }
         true
     }
@@ -78,53 +80,15 @@ fn update_rustfmt_version(build: &Builder<'_>) {
 /// rust-lang/master and what is now on the disk.
 ///
 /// Returns `None` if all files should be formatted.
-fn get_modified_rs_files(build: &Builder<'_>) -> Option<Vec<String>> {
-    let Ok(remote) = get_rust_lang_rust_remote() else { return None; };
+fn get_modified_rs_files(build: &Builder<'_>) -> Result<Option<Vec<String>>, String> {
     if !verify_rustfmt_version(build) {
-        return None;
+        return Ok(None);
     }
 
-    let merge_base =
-        output(build.config.git().arg("merge-base").arg(&format!("{remote}/master")).arg("HEAD"));
-    Some(
-        output(build.config.git().arg("diff-index").arg("--name-only").arg(merge_base.trim()))
-            .lines()
-            .map(|s| s.trim().to_owned())
-            .filter(|f| Path::new(f).extension().map_or(false, |ext| ext == "rs"))
-            .collect(),
-    )
+    get_git_modified_files(Some(&build.config.src), &vec!["rs"])
 }
 
-/// Finds the remote for rust-lang/rust.
-/// For example for these remotes it will return `upstream`.
-/// ```text
-/// origin  https://github.com/Nilstrieb/rust.git (fetch)
-/// origin  https://github.com/Nilstrieb/rust.git (push)
-/// upstream        https://github.com/rust-lang/rust (fetch)
-/// upstream        https://github.com/rust-lang/rust (push)
-/// ```
-fn get_rust_lang_rust_remote() -> Result<String, String> {
-    let mut git = Command::new("git");
-    git.args(["config", "--local", "--get-regex", "remote\\..*\\.url"]);
-
-    let output = git.output().map_err(|err| format!("{err:?}"))?;
-    if !output.status.success() {
-        return Err("failed to execute git config command".to_owned());
-    }
-
-    let stdout = String::from_utf8(output.stdout).map_err(|err| format!("{err:?}"))?;
-
-    let rust_lang_remote = stdout
-        .lines()
-        .find(|remote| remote.contains("rust-lang"))
-        .ok_or_else(|| "rust-lang/rust remote not found".to_owned())?;
-
-    let remote_name =
-        rust_lang_remote.split('.').nth(1).ok_or_else(|| "remote name not found".to_owned())?;
-    Ok(remote_name.into())
-}
-
-#[derive(serde::Deserialize)]
+#[derive(serde_derive::Deserialize)]
 struct RustfmtConfig {
     ignore: Vec<String>,
 }
@@ -158,6 +122,9 @@ pub fn format(build: &Builder<'_>, check: bool, paths: &[PathBuf]) {
         Ok(status) => status.success(),
         Err(_) => false,
     };
+
+    let mut paths = paths.to_vec();
+
     if git_available {
         let in_working_tree = match build
             .config
@@ -190,11 +157,31 @@ pub fn format(build: &Builder<'_>, check: bool, paths: &[PathBuf]) {
                 // preventing the latter from being formatted.
                 ignore_fmt.add(&format!("!/{}", untracked_path)).expect(&untracked_path);
             }
-            if !check && paths.is_empty() {
-                if let Some(files) = get_modified_rs_files(build) {
-                    for file in files {
-                        println!("formatting modified file {file}");
-                        ignore_fmt.add(&format!("/{file}")).expect(&file);
+            // Only check modified files locally to speed up runtime.
+            // We still check all files in CI to avoid bugs in `get_modified_rs_files` letting regressions slip through;
+            // we also care about CI time less since this is still very fast compared to building the compiler.
+            if !CiEnv::is_ci() && paths.is_empty() {
+                match get_modified_rs_files(build) {
+                    Ok(Some(files)) => {
+                        if files.len() <= 10 {
+                            for file in &files {
+                                println!("formatting modified file {file}");
+                            }
+                        } else {
+                            println!("formatting {} modified files", files.len());
+                        }
+                        for file in files {
+                            ignore_fmt.add(&format!("/{file}")).expect(&file);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        println!(
+                            "WARN: Something went wrong when running git commands:\n{err}\n\
+                            Falling back to formatting all files."
+                        );
+                        // Something went wrong when getting the version. Just format all the files.
+                        paths.push(".".into());
                     }
                 }
             }
@@ -204,21 +191,58 @@ pub fn format(build: &Builder<'_>, check: bool, paths: &[PathBuf]) {
     } else {
         println!("Could not find usable git. Skipping git-aware format checks");
     }
+
     let ignore_fmt = ignore_fmt.build().unwrap();
 
     let rustfmt_path = build.initial_rustfmt().unwrap_or_else(|| {
         eprintln!("./x.py fmt is not supported on this channel");
-        crate::detail_exit(1);
+        crate::detail_exit_macro!(1);
     });
     assert!(rustfmt_path.exists(), "{}", rustfmt_path.display());
     let src = build.src.clone();
     let (tx, rx): (SyncSender<PathBuf>, _) = std::sync::mpsc::sync_channel(128);
     let walker = match paths.get(0) {
         Some(first) => {
-            let mut walker = WalkBuilder::new(first);
+            let find_shortcut_candidates = |p: &PathBuf| {
+                let mut candidates = Vec::new();
+                for candidate in WalkBuilder::new(src.clone()).max_depth(Some(3)).build() {
+                    if let Ok(entry) = candidate {
+                        if let Some(dir_name) = p.file_name() {
+                            if entry.path().is_dir() && entry.file_name() == dir_name {
+                                candidates.push(entry.into_path());
+                            }
+                        }
+                    }
+                }
+                candidates
+            };
+
+            // Only try to look for shortcut candidates for single component paths like
+            // `std` and not for e.g. relative paths like `../library/std`.
+            let should_look_for_shortcut_dir = |p: &PathBuf| p.components().count() == 1;
+
+            let mut walker = if should_look_for_shortcut_dir(first) {
+                if let [single_candidate] = &find_shortcut_candidates(first)[..] {
+                    WalkBuilder::new(single_candidate)
+                } else {
+                    WalkBuilder::new(first)
+                }
+            } else {
+                WalkBuilder::new(src.join(first))
+            };
+
             for path in &paths[1..] {
-                walker.add(path);
+                if should_look_for_shortcut_dir(path) {
+                    if let [single_candidate] = &find_shortcut_candidates(path)[..] {
+                        walker.add(single_candidate);
+                    } else {
+                        walker.add(path);
+                    }
+                } else {
+                    walker.add(src.join(path));
+                }
             }
+
             walker
         }
         None => WalkBuilder::new(src.clone()),

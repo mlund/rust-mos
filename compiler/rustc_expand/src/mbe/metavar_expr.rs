@@ -1,5 +1,5 @@
 use rustc_ast::token::{self, Delimiter};
-use rustc_ast::tokenstream::{CursorRef, TokenStream, TokenTree};
+use rustc_ast::tokenstream::{RefTokenTreeCursor, TokenStream, TokenTree};
 use rustc_ast::{LitIntType, LitKind};
 use rustc_ast_pretty::pprust;
 use rustc_errors::{Applicability, PResult};
@@ -41,7 +41,7 @@ impl MetaVarExpr {
         };
         check_trailing_token(&mut tts, sess)?;
         let mut iter = args.trees();
-        let rslt = match &*ident.as_str() {
+        let rslt = match ident.as_str() {
             "count" => parse_count(&mut iter, sess, ident.span)?,
             "ignore" => MetaVarExpr::Ignore(parse_ident(&mut iter, sess, ident.span)?),
             "index" => MetaVarExpr::Index(parse_depth(&mut iter, sess, ident.span)?),
@@ -72,13 +72,13 @@ impl MetaVarExpr {
 
 // Checks if there are any remaining tokens. For example, `${ignore(ident ... a b c ...)}`
 fn check_trailing_token<'sess>(
-    iter: &mut CursorRef<'_>,
+    iter: &mut RefTokenTreeCursor<'_>,
     sess: &'sess ParseSess,
 ) -> PResult<'sess, ()> {
     if let Some(tt) = iter.next() {
         let mut diag = sess
             .span_diagnostic
-            .struct_span_err(tt.span(), &format!("unexpected token: {}", pprust::tt_to_string(tt)));
+            .struct_span_err(tt.span(), format!("unexpected token: {}", pprust::tt_to_string(tt)));
         diag.span_note(tt.span(), "meta-variable expression must not have trailing tokens");
         Err(diag)
     } else {
@@ -88,7 +88,7 @@ fn check_trailing_token<'sess>(
 
 /// Parse a meta-variable `count` expression: `count(ident[, depth])`
 fn parse_count<'sess>(
-    iter: &mut CursorRef<'_>,
+    iter: &mut RefTokenTreeCursor<'_>,
     sess: &'sess ParseSess,
     span: Span,
 ) -> PResult<'sess, MetaVarExpr> {
@@ -99,7 +99,7 @@ fn parse_count<'sess>(
 
 /// Parses the depth used by index(depth) and length(depth).
 fn parse_depth<'sess>(
-    iter: &mut CursorRef<'_>,
+    iter: &mut RefTokenTreeCursor<'_>,
     sess: &'sess ParseSess,
     span: Span,
 ) -> PResult<'sess, usize> {
@@ -126,7 +126,7 @@ fn parse_depth<'sess>(
 
 /// Parses an generic ident
 fn parse_ident<'sess>(
-    iter: &mut CursorRef<'_>,
+    iter: &mut RefTokenTreeCursor<'_>,
     sess: &'sess ParseSess,
     span: Span,
 ) -> PResult<'sess, Ident> {
@@ -137,11 +137,11 @@ fn parse_ident<'sess>(
         let token_str = pprust::token_to_string(token);
         let mut err = sess.span_diagnostic.struct_span_err(
             span,
-            &format!("expected identifier, found `{}`", &token_str)
+            format!("expected identifier, found `{}`", &token_str)
         );
         err.span_suggestion(
             token.span,
-            &format!("try removing `{}`", &token_str),
+            format!("try removing `{}`", &token_str),
             "",
             Applicability::MaybeIncorrect,
         );
@@ -152,7 +152,7 @@ fn parse_ident<'sess>(
 
 /// Tries to move the iterator forward returning `true` if there is a comma. If not, then the
 /// iterator is not modified and the result is `false`.
-fn try_eat_comma(iter: &mut CursorRef<'_>) -> bool {
+fn try_eat_comma(iter: &mut RefTokenTreeCursor<'_>) -> bool {
     if let Some(TokenTree::Token(token::Token { kind: token::Comma, .. }, _)) = iter.look_ahead(0) {
         let _ = iter.next();
         return true;

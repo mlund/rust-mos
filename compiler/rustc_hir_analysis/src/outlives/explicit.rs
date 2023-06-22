@@ -30,7 +30,7 @@ impl<'tcx> ExplicitPredicatesMap<'tcx> {
             // process predicates and convert to `RequiredPredicates` entry, see below
             for &(predicate, span) in predicates.predicates {
                 match predicate.kind().skip_binder() {
-                    ty::PredicateKind::Clause(ty::Clause::TypeOutlives(OutlivesPredicate(
+                    ty::PredicateKind::Clause(ty::ClauseKind::TypeOutlives(OutlivesPredicate(
                         ty,
                         reg,
                     ))) => insert_outlives_predicate(
@@ -41,10 +41,9 @@ impl<'tcx> ExplicitPredicatesMap<'tcx> {
                         &mut required_predicates,
                     ),
 
-                    ty::PredicateKind::Clause(ty::Clause::RegionOutlives(OutlivesPredicate(
-                        reg1,
-                        reg2,
-                    ))) => insert_outlives_predicate(
+                    ty::PredicateKind::Clause(ty::ClauseKind::RegionOutlives(
+                        OutlivesPredicate(reg1, reg2),
+                    )) => insert_outlives_predicate(
                         tcx,
                         reg1.into(),
                         reg2,
@@ -52,21 +51,23 @@ impl<'tcx> ExplicitPredicatesMap<'tcx> {
                         &mut required_predicates,
                     ),
 
-                    ty::PredicateKind::Clause(ty::Clause::Trait(..))
-                    | ty::PredicateKind::Clause(ty::Clause::Projection(..))
-                    | ty::PredicateKind::WellFormed(..)
+                    ty::PredicateKind::Clause(ty::ClauseKind::Trait(..))
+                    | ty::PredicateKind::Clause(ty::ClauseKind::Projection(..))
+                    | ty::PredicateKind::Clause(ty::ClauseKind::ConstArgHasType(..))
+                    | ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(..))
+                    | ty::PredicateKind::AliasRelate(..)
                     | ty::PredicateKind::ObjectSafe(..)
                     | ty::PredicateKind::ClosureKind(..)
                     | ty::PredicateKind::Subtype(..)
                     | ty::PredicateKind::Coerce(..)
-                    | ty::PredicateKind::ConstEvaluatable(..)
+                    | ty::PredicateKind::Clause(ty::ClauseKind::ConstEvaluatable(..))
                     | ty::PredicateKind::ConstEquate(..)
                     | ty::PredicateKind::Ambiguous
                     | ty::PredicateKind::TypeWellFormedFromEnv(..) => (),
                 }
             }
 
-            ty::EarlyBinder(required_predicates)
+            ty::EarlyBinder::bind(required_predicates)
         })
     }
 }

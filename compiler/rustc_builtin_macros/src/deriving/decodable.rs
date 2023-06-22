@@ -3,12 +3,12 @@
 use crate::deriving::generic::ty::*;
 use crate::deriving::generic::*;
 use crate::deriving::pathvec_std;
-
 use rustc_ast::ptr::P;
 use rustc_ast::{self as ast, Expr, MetaItem, Mutability};
 use rustc_expand::base::{Annotatable, ExtCtxt};
 use rustc_span::symbol::{sym, Ident, Symbol};
 use rustc_span::Span;
+use thin_vec::{thin_vec, ThinVec};
 
 pub fn expand_deriving_rustc_decodable(
     cx: &mut ExtCtxt<'_>,
@@ -25,6 +25,7 @@ pub fn expand_deriving_rustc_decodable(
         span,
         path: Path::new_(vec![krate, sym::Decodable], vec![], PathKind::Global),
         skip_path_as_bound: false,
+        needs_copy_as_bound_if_packed: true,
         additional_bounds: Vec::new(),
         supports_unions: false,
         methods: vec![MethodDef {
@@ -49,7 +50,7 @@ pub fn expand_deriving_rustc_decodable(
                 PathKind::Std,
             )),
             attributes: ast::AttrVec::new(),
-            unify_fieldless_variants: false,
+            fieldless_variants_strategy: FieldlessVariantsStrategy::Default,
             combine_substructure: combine_substructure(Box::new(|a, b, c| {
                 decodable_substructure(a, b, c, krate)
             })),
@@ -95,7 +96,7 @@ fn decodable_substructure(
                         cx.expr_call_global(
                             span,
                             fn_read_struct_field_path.clone(),
-                            vec![
+                            thin_vec![
                                 blkdecoder.clone(),
                                 cx.expr_str(span, name),
                                 cx.expr_usize(span, field),
@@ -111,7 +112,7 @@ fn decodable_substructure(
             cx.expr_call_global(
                 trait_span,
                 fn_read_struct_path,
-                vec![
+                thin_vec![
                     decoder,
                     cx.expr_str(trait_span, substr.type_ident.name),
                     cx.expr_usize(trait_span, nfields),
@@ -122,8 +123,8 @@ fn decodable_substructure(
         StaticEnum(_, fields) => {
             let variant = Ident::new(sym::i, trait_span);
 
-            let mut arms = Vec::with_capacity(fields.len() + 1);
-            let mut variants = Vec::with_capacity(fields.len());
+            let mut arms = ThinVec::with_capacity(fields.len() + 1);
+            let mut variants = ThinVec::with_capacity(fields.len());
 
             let fn_read_enum_variant_arg_path: Vec<_> =
                 cx.def_site_path(&[sym::rustc_serialize, sym::Decoder, sym::read_enum_variant_arg]);
@@ -140,7 +141,7 @@ fn decodable_substructure(
                             cx.expr_call_global(
                                 span,
                                 fn_read_enum_variant_arg_path.clone(),
-                                vec![blkdecoder.clone(), idx, exprdecode.clone()],
+                                thin_vec![blkdecoder.clone(), idx, exprdecode.clone()],
                             ),
                         )
                     });
@@ -161,7 +162,7 @@ fn decodable_substructure(
             let result = cx.expr_call_global(
                 trait_span,
                 fn_read_enum_variant_path,
-                vec![blkdecoder, variant_array_ref, lambda],
+                thin_vec![blkdecoder, variant_array_ref, lambda],
             );
             let fn_read_enum_path: Vec<_> =
                 cx.def_site_path(&[sym::rustc_serialize, sym::Decoder, sym::read_enum]);
@@ -169,7 +170,7 @@ fn decodable_substructure(
             cx.expr_call_global(
                 trait_span,
                 fn_read_enum_path,
-                vec![
+                thin_vec![
                     decoder,
                     cx.expr_str(trait_span, substr.type_ident.name),
                     cx.lambda1(trait_span, result, blkarg),

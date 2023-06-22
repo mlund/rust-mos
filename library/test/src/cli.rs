@@ -309,7 +309,8 @@ fn parse_opts_impl(matches: getopts::Matches) -> OptRes {
 // FIXME: Copied from librustc_ast until linkage errors are resolved. Issue #47566
 fn is_nightly() -> bool {
     // Whether this is a feature-staged build, i.e., on the beta or stable channel
-    let disable_unstable_features = option_env!("CFG_DISABLE_UNSTABLE_FEATURES").is_some();
+    let disable_unstable_features =
+        option_env!("CFG_DISABLE_UNSTABLE_FEATURES").map(|s| s != "0").unwrap_or(false);
     // Whether we should enable unstable features for bootstrapping
     let bootstrap = env::var("RUSTC_BOOTSTRAP").is_ok();
 
@@ -403,13 +404,13 @@ fn get_format(
         Some("terse") => OutputFormat::Terse,
         Some("json") => {
             if !allow_unstable {
-                return Err("The \"json\" format is only accepted on the nightly compiler".into());
+                return Err("The \"json\" format is only accepted on the nightly compiler with -Z unstable-options".into());
             }
             OutputFormat::Json
         }
         Some("junit") => {
             if !allow_unstable {
-                return Err("The \"junit\" format is only accepted on the nightly compiler".into());
+                return Err("The \"junit\" format is only accepted on the nightly compiler with -Z unstable-options".into());
             }
             OutputFormat::Junit
         }

@@ -84,13 +84,13 @@ mod prelude {
     pub(crate) use rustc_middle::ty::layout::{self, LayoutOf, TyAndLayout};
     pub(crate) use rustc_middle::ty::{
         self, FloatTy, Instance, InstanceDef, IntTy, ParamEnv, Ty, TyCtxt, TypeAndMut,
-        TypeFoldable, TypeVisitable, UintTy,
+        TypeFoldable, TypeVisitableExt, UintTy,
     };
-    pub(crate) use rustc_target::abi::{Abi, Scalar, Size, VariantIdx};
+    pub(crate) use rustc_target::abi::{Abi, FieldIdx, Scalar, Size, VariantIdx, FIRST_VARIANT};
 
-    pub(crate) use rustc_data_structures::fx::FxHashMap;
+    pub(crate) use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
 
-    pub(crate) use rustc_index::vec::Idx;
+    pub(crate) use rustc_index::Idx;
 
     pub(crate) use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
     pub(crate) use cranelift_codegen::ir::function::Function;
@@ -102,7 +102,7 @@ mod prelude {
     pub(crate) use cranelift_codegen::isa::{self, CallConv};
     pub(crate) use cranelift_codegen::Context;
     pub(crate) use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
-    pub(crate) use cranelift_module::{self, DataContext, FuncId, Linkage, Module};
+    pub(crate) use cranelift_module::{self, DataDescription, FuncId, Linkage, Module};
 
     pub(crate) use crate::abi::*;
     pub(crate) use crate::base::{codegen_operand, codegen_place};
@@ -110,7 +110,7 @@ mod prelude {
     pub(crate) use crate::common::*;
     pub(crate) use crate::debuginfo::{DebugContext, UnwindContext};
     pub(crate) use crate::pointer::Pointer;
-    pub(crate) use crate::value_and_place::{CPlace, CPlaceInner, CValue};
+    pub(crate) use crate::value_and_place::{CPlace, CValue};
 }
 
 struct PrintOnPanic<F: Fn() -> String>(F);
@@ -170,6 +170,11 @@ pub struct CraneliftCodegenBackend {
 }
 
 impl CodegenBackend for CraneliftCodegenBackend {
+    fn locale_resource(&self) -> &'static str {
+        // FIXME(rust-lang/rust#100717) - cranelift codegen backend is not yet translated
+        ""
+    }
+
     fn init(&self, sess: &Session) {
         use rustc_session::config::Lto;
         match sess.lto() {
@@ -180,7 +185,7 @@ impl CodegenBackend for CraneliftCodegenBackend {
         let mut config = self.config.borrow_mut();
         if config.is_none() {
             let new_config = BackendConfig::from_opts(&sess.opts.cg.llvm_args)
-                .unwrap_or_else(|err| sess.fatal(&err));
+                .unwrap_or_else(|err| sess.fatal(err));
             *config = Some(new_config);
         }
     }
@@ -218,7 +223,7 @@ impl CodegenBackend for CraneliftCodegenBackend {
         ongoing_codegen: Box<dyn Any>,
         sess: &Session,
         _outputs: &OutputFilenames,
-    ) -> Result<(CodegenResults, FxHashMap<WorkProductId, WorkProduct>), ErrorGuaranteed> {
+    ) -> Result<(CodegenResults, FxIndexMap<WorkProductId, WorkProduct>), ErrorGuaranteed> {
         Ok(ongoing_codegen
             .downcast::<driver::aot::OngoingCodegen>()
             .unwrap()
@@ -240,11 +245,11 @@ impl CodegenBackend for CraneliftCodegenBackend {
 fn target_triple(sess: &Session) -> target_lexicon::Triple {
     match sess.target.llvm_target.parse() {
         Ok(triple) => triple,
-        Err(err) => sess.fatal(&format!("target not recognized: {}", err)),
+        Err(err) => sess.fatal(format!("target not recognized: {}", err)),
     }
 }
 
-fn build_isa(sess: &Session, backend_config: &BackendConfig) -> Box<dyn isa::TargetIsa + 'static> {
+fn build_isa(sess: &Session, backend_config: &BackendConfig) -> Arc<dyn isa::TargetIsa + 'static> {
     use target_lexicon::BinaryFormat;
 
     let target_triple = crate::target_triple(sess);
@@ -278,12 +283,17 @@ fn build_isa(sess: &Session, backend_config: &BackendConfig) -> Box<dyn isa::Tar
         }
     }
 
-    if target_triple.architecture == target_lexicon::Architecture::X86_64 {
-        // Windows depends on stack probes to grow the committed part of the stack
+    if let target_lexicon::Architecture::Aarch64(_)
+    | target_lexicon::Architecture::Riscv64(_)
+    | target_lexicon::Architecture::X86_64 = target_triple.architecture
+    {
+        // Windows depends on stack probes to grow the committed part of the stack.
+        // On other platforms it helps prevents stack smashing.
         flags_builder.enable("enable_probestack").unwrap();
         flags_builder.set("probestack_strategy", "inline").unwrap();
     } else {
-        // __cranelift_probestack is not provided and inline stack probes are only supported on x86_64
+        // __cranelift_probestack is not provided and inline stack probes are only supported on
+        // AArch64, Riscv64 and x86_64.
         flags_builder.set("enable_probestack", "false").unwrap();
     }
 
@@ -297,7 +307,7 @@ fn build_isa(sess: &Session, backend_config: &BackendConfig) -> Box<dyn isa::Tar
         Some(value) => {
             let mut builder =
                 cranelift_codegen::isa::lookup(target_triple.clone()).unwrap_or_else(|err| {
-                    sess.fatal(&format!("can't compile for {}: {}", target_triple, err));
+                    sess.fatal(format!("can't compile for {}: {}", target_triple, err));
                 });
             if let Err(_) = builder.enable(value) {
                 sess.fatal("the specified target cpu isn't currently supported by Cranelift.");
@@ -307,7 +317,7 @@ fn build_isa(sess: &Session, backend_config: &BackendConfig) -> Box<dyn isa::Tar
         None => {
             let mut builder =
                 cranelift_codegen::isa::lookup(target_triple.clone()).unwrap_or_else(|err| {
-                    sess.fatal(&format!("can't compile for {}: {}", target_triple, err));
+                    sess.fatal(format!("can't compile for {}: {}", target_triple, err));
                 });
             if target_triple.architecture == target_lexicon::Architecture::X86_64 {
                 // Don't use "haswell" as the default, as it implies `has_lzcnt`.
@@ -320,7 +330,7 @@ fn build_isa(sess: &Session, backend_config: &BackendConfig) -> Box<dyn isa::Tar
 
     match isa_builder.finish(flags) {
         Ok(target_isa) => target_isa,
-        Err(err) => sess.fatal(&format!("failed to build TargetIsa: {}", err)),
+        Err(err) => sess.fatal(format!("failed to build TargetIsa: {}", err)),
     }
 }
 

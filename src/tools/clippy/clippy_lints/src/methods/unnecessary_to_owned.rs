@@ -14,7 +14,7 @@ use rustc_lint::LateContext;
 use rustc_middle::mir::Mutability;
 use rustc_middle::ty::adjustment::{Adjust, Adjustment, OverloadedDeref};
 use rustc_middle::ty::subst::{GenericArg, GenericArgKind, SubstsRef};
-use rustc_middle::ty::{self, Clause, EarlyBinder, ParamTy, PredicateKind, ProjectionPredicate, TraitPredicate, Ty};
+use rustc_middle::ty::{self, ClauseKind, EarlyBinder, ParamTy, PredicateKind, ProjectionPredicate, TraitPredicate, Ty};
 use rustc_span::{sym, Symbol};
 use rustc_trait_selection::traits::{query::evaluate_obligation::InferCtxtExt as _, Obligation, ObligationCause};
 
@@ -246,7 +246,7 @@ fn check_other_call_arg<'tcx>(
     if_chain! {
         if let Some((maybe_call, maybe_arg)) = skip_addr_of_ancestors(cx, expr);
         if let Some((callee_def_id, _, recv, call_args)) = get_callee_substs_and_args(cx, maybe_call);
-        let fn_sig = cx.tcx.fn_sig(callee_def_id).skip_binder();
+        let fn_sig = cx.tcx.fn_sig(callee_def_id).subst_identity().skip_binder();
         if let Some(i) = recv.into_iter().chain(call_args).position(|arg| arg.hir_id == maybe_arg.hir_id);
         if let Some(input) = fn_sig.inputs().get(i);
         let (input, n_refs) = peel_mid_ty_refs(*input);
@@ -345,12 +345,12 @@ fn get_input_traits_and_projections<'tcx>(
     let mut projection_predicates = Vec::new();
     for predicate in cx.tcx.param_env(callee_def_id).caller_bounds() {
         match predicate.kind().skip_binder() {
-            PredicateKind::Clause(Clause::Trait(trait_predicate)) => {
+            PredicateKind::Clause(ClauseKind::Trait(trait_predicate)) => {
                 if trait_predicate.trait_ref.self_ty() == input {
                     trait_predicates.push(trait_predicate);
                 }
             },
-            PredicateKind::Clause(Clause::Projection(projection_predicate)) => {
+            PredicateKind::Clause(ClauseKind::Projection(projection_predicate)) => {
                 if projection_predicate.projection_ty.self_ty() == input {
                     projection_predicates.push(projection_predicate);
                 }
@@ -368,12 +368,11 @@ fn can_change_type<'a>(cx: &LateContext<'a>, mut expr: &'a Expr<'a>, mut ty: Ty<
             Node::Block(..) => continue,
             Node::Item(item) => {
                 if let ItemKind::Fn(_, _, body_id) = &item.kind
-                && let output_ty = return_ty(cx, item.hir_id())
-                && let local_def_id = cx.tcx.hir().local_def_id(item.hir_id())
-                && Inherited::build(cx.tcx, local_def_id).enter(|inherited| {
-                    let fn_ctxt = FnCtxt::new(inherited, cx.param_env, item.hir_id());
-                    fn_ctxt.can_coerce(ty, output_ty)
-                }) {
+                && let output_ty = return_ty(cx, item.owner_id)
+                && let inherited = Inherited::new(cx.tcx, item.owner_id.def_id)
+                && let fn_ctxt = FnCtxt::new(&inherited, cx.param_env, item.owner_id.def_id)
+                && fn_ctxt.can_coerce(ty, output_ty)
+                {
                     if has_lifetime(output_ty) && has_lifetime(ty) {
                         return false;
                     }
@@ -386,7 +385,10 @@ fn can_change_type<'a>(cx: &LateContext<'a>, mut expr: &'a Expr<'a>, mut ty: Ty<
             Node::Expr(parent_expr) => {
                 if let Some((callee_def_id, call_substs, recv, call_args)) = get_callee_substs_and_args(cx, parent_expr)
                 {
-                    let fn_sig = cx.tcx.fn_sig(callee_def_id).skip_binder();
+                    // FIXME: the `subst_identity()` below seems incorrect, since we eventually
+                    // call `tcx.try_subst_and_normalize_erasing_regions` further down
+                    // (i.e., we are explicitly not in the identity context).
+                    let fn_sig = cx.tcx.fn_sig(callee_def_id).subst_identity().skip_binder();
                     if let Some(arg_index) = recv.into_iter().chain(call_args).position(|arg| arg.hir_id == expr.hir_id)
                         && let Some(param_ty) = fn_sig.inputs().get(arg_index)
                         && let ty::Param(ParamTy { index: param_index , ..}) = param_ty.kind()
@@ -405,7 +407,7 @@ fn can_change_type<'a>(cx: &LateContext<'a>, mut expr: &'a Expr<'a>, mut ty: Ty<
 
                         let mut trait_predicates = cx.tcx.param_env(callee_def_id)
                             .caller_bounds().iter().filter(|predicate| {
-                            if let PredicateKind::Clause(Clause::Trait(trait_predicate))
+                            if let PredicateKind::Clause(ClauseKind::Trait(trait_predicate))
                                     = predicate.kind().skip_binder()
                                 && trait_predicate.trait_ref.self_ty() == *param_ty
                             {
@@ -415,7 +417,7 @@ fn can_change_type<'a>(cx: &LateContext<'a>, mut expr: &'a Expr<'a>, mut ty: Ty<
                             }
                         });
 
-                        let new_subst = cx.tcx.mk_substs(
+                        let new_subst = cx.tcx.mk_substs_from_iter(
                             call_substs.iter()
                                 .enumerate()
                                 .map(|(i, t)|
@@ -426,7 +428,7 @@ fn can_change_type<'a>(cx: &LateContext<'a>, mut expr: &'a Expr<'a>, mut ty: Ty<
                                      }));
 
                         if trait_predicates.any(|predicate| {
-                            let predicate = EarlyBinder(predicate).subst(cx.tcx, new_subst);
+                            let predicate = EarlyBinder::bind(predicate).subst(cx.tcx, new_subst);
                             let obligation = Obligation::new(cx.tcx, ObligationCause::dummy(), cx.param_env, predicate);
                             !cx.tcx.infer_ctxt().build().predicate_must_hold_modulo_regions(&obligation)
                         }) {
@@ -436,7 +438,7 @@ fn can_change_type<'a>(cx: &LateContext<'a>, mut expr: &'a Expr<'a>, mut ty: Ty<
                         let output_ty = fn_sig.output();
                         if output_ty.contains(*param_ty) {
                             if let Ok(new_ty)  = cx.tcx.try_subst_and_normalize_erasing_regions(
-                                new_subst, cx.param_env, output_ty) {
+                                new_subst, cx.param_env, EarlyBinder::bind(output_ty)) {
                                 expr = parent_expr;
                                 ty = new_ty;
                                 continue;

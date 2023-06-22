@@ -253,7 +253,7 @@ pub(crate) mod printf {
     #[derive(Copy, Clone, PartialEq, Debug)]
     pub enum Num {
         // The range of these values is technically bounded by `NL_ARGMAX`... but, at least for GNU
-        // libc, it apparently has no real fixed limit.  A `u16` is used here on the basis that it
+        // libc, it apparently has no real fixed limit. A `u16` is used here on the basis that it
         // is *vanishingly* unlikely that *anyone* is going to try formatting something wider, or
         // with more precision, than 32 thousand positions which is so wide it couldn't possibly fit
         // on a screen.
@@ -562,15 +562,13 @@ pub(crate) mod printf {
         }
 
         if let Type = state {
-            drop(c);
             type_ = at.slice_between(next).unwrap();
 
             // Don't use `move_to!` here, as we *can* be at the end of the input.
             at = next;
         }
 
-        drop(c);
-        drop(next);
+        let _ = c; // to avoid never used value
 
         end = at;
         let position = InnerSpan::new(start.at, end.at);

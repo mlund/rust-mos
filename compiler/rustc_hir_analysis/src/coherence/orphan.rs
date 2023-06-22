@@ -6,9 +6,10 @@ use rustc_errors::{struct_span_err, DelayDm};
 use rustc_errors::{Diagnostic, ErrorGuaranteed};
 use rustc_hir as hir;
 use rustc_middle::ty::subst::InternalSubsts;
-use rustc_middle::ty::util::IgnoreRegions;
+use rustc_middle::ty::util::CheckRegions;
 use rustc_middle::ty::{
-    self, ImplPolarity, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitor,
+    self, AliasKind, ImplPolarity, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitableExt,
+    TypeVisitor,
 };
 use rustc_session::lint;
 use rustc_span::def_id::{DefId, LocalDefId};
@@ -21,7 +22,7 @@ pub(crate) fn orphan_check_impl(
     tcx: TyCtxt<'_>,
     impl_def_id: LocalDefId,
 ) -> Result<(), ErrorGuaranteed> {
-    let trait_ref = tcx.impl_trait_ref(impl_def_id).unwrap();
+    let trait_ref = tcx.impl_trait_ref(impl_def_id).unwrap().subst_identity();
     trait_ref.error_reported()?;
 
     let ret = do_orphan_check_impl(tcx, trait_ref, impl_def_id);
@@ -39,25 +40,27 @@ fn do_orphan_check_impl<'tcx>(
 ) -> Result<(), ErrorGuaranteed> {
     let trait_def_id = trait_ref.def_id;
 
-    let item = tcx.hir().expect_item(def_id);
-    let hir::ItemKind::Impl(ref impl_) = item.kind else {
-        bug!("{:?} is not an impl: {:?}", def_id, item);
-    };
-    let sp = tcx.def_span(def_id);
-    let tr = impl_.of_trait.as_ref().unwrap();
-
-    match traits::orphan_check(tcx, item.owner_id.to_def_id()) {
+    match traits::orphan_check(tcx, def_id.to_def_id()) {
         Ok(()) => {}
-        Err(err) => emit_orphan_check_error(
-            tcx,
-            sp,
-            item.span,
-            tr.path.span,
-            trait_ref.self_ty(),
-            impl_.self_ty.span,
-            &impl_.generics,
-            err,
-        )?,
+        Err(err) => {
+            let item = tcx.hir().expect_item(def_id);
+            let hir::ItemKind::Impl(impl_) = item.kind else {
+                bug!("{:?} is not an impl: {:?}", def_id, item);
+            };
+            let tr = impl_.of_trait.as_ref().unwrap();
+            let sp = tcx.def_span(def_id);
+
+            emit_orphan_check_error(
+                tcx,
+                sp,
+                item.span,
+                tr.path.span,
+                trait_ref,
+                impl_.self_ty.span,
+                &impl_.generics,
+                err,
+            )?
+        }
     }
 
     // In addition to the above rules, we restrict impls of auto traits
@@ -86,7 +89,7 @@ fn do_orphan_check_impl<'tcx>(
     // struct B { }
     // impl Foo for A { }
     // impl Foo for B { }
-    // impl !Send for (A, B) { }
+    // impl !Foo for (A, B) { }
     // ```
     //
     // This final impl is legal according to the orphan
@@ -99,50 +102,208 @@ fn do_orphan_check_impl<'tcx>(
         tcx.trait_is_auto(trait_def_id)
     );
 
-    if tcx.trait_is_auto(trait_def_id) && !trait_def_id.is_local() {
+    if tcx.trait_is_auto(trait_def_id) {
         let self_ty = trait_ref.self_ty();
-        let opt_self_def_id = match *self_ty.kind() {
-            ty::Adt(self_def, _) => Some(self_def.did()),
-            ty::Foreign(did) => Some(did),
-            _ => None,
+
+        // If the impl is in the same crate as the auto-trait, almost anything
+        // goes.
+        //
+        //     impl MyAuto for Rc<Something> {}  // okay
+        //     impl<T> !MyAuto for *const T {}   // okay
+        //     impl<T> MyAuto for T {}           // okay
+        //
+        // But there is one important exception: implementing for a trait object
+        // is not allowed.
+        //
+        //     impl MyAuto for dyn Trait {}      // NOT OKAY
+        //     impl<T: ?Sized> MyAuto for T {}   // NOT OKAY
+        //
+        // With this restriction, it's guaranteed that an auto-trait is
+        // implemented for a trait object if and only if the auto-trait is one
+        // of the trait object's trait bounds (or a supertrait of a bound). In
+        // other words `dyn Trait + AutoTrait` always implements AutoTrait,
+        // while `dyn Trait` never implements AutoTrait.
+        //
+        // This is necessary in order for autotrait bounds on methods of trait
+        // objects to be sound.
+        //
+        //     auto trait AutoTrait {}
+        //
+        //     trait ObjectSafeTrait {
+        //         fn f(&self) where Self: AutoTrait;
+        //     }
+        //
+        // We can allow f to be called on `dyn ObjectSafeTrait + AutoTrait`.
+        //
+        // If we didn't deny `impl AutoTrait for dyn Trait`, it would be unsound
+        // for the ObjectSafeTrait shown above to be object safe because someone
+        // could take some type implementing ObjectSafeTrait but not AutoTrait,
+        // unsize it to `dyn ObjectSafeTrait`, and call .f() which has no
+        // concrete implementation (issue #50781).
+        enum LocalImpl {
+            Allow,
+            Disallow { problematic_kind: &'static str },
+        }
+
+        // If the auto-trait is from a dependency, it must only be getting
+        // implemented for a nominal type, and specifically one local to the
+        // current crate.
+        //
+        //     impl<T> Sync for MyStruct<T> {}   // okay
+        //
+        //     impl Sync for Rc<MyStruct> {}     // NOT OKAY
+        enum NonlocalImpl {
+            Allow,
+            DisallowBecauseNonlocal,
+            DisallowOther,
+        }
+
+        // Exhaustive match considering that this logic is essential for
+        // soundness.
+        let (local_impl, nonlocal_impl) = match self_ty.kind() {
+            // struct Struct<T>;
+            // impl AutoTrait for Struct<Foo> {}
+            ty::Adt(self_def, _) => (
+                LocalImpl::Allow,
+                if self_def.did().is_local() {
+                    NonlocalImpl::Allow
+                } else {
+                    NonlocalImpl::DisallowBecauseNonlocal
+                },
+            ),
+
+            // extern { type OpaqueType; }
+            // impl AutoTrait for OpaqueType {}
+            ty::Foreign(did) => (
+                LocalImpl::Allow,
+                if did.is_local() {
+                    NonlocalImpl::Allow
+                } else {
+                    NonlocalImpl::DisallowBecauseNonlocal
+                },
+            ),
+
+            // impl AutoTrait for dyn Trait {}
+            ty::Dynamic(..) => (
+                LocalImpl::Disallow { problematic_kind: "trait object" },
+                NonlocalImpl::DisallowOther,
+            ),
+
+            // impl<T> AutoTrait for T {}
+            // impl<T: ?Sized> AutoTrait for T {}
+            ty::Param(..) => (
+                if self_ty.is_sized(tcx, tcx.param_env(def_id)) {
+                    LocalImpl::Allow
+                } else {
+                    LocalImpl::Disallow { problematic_kind: "generic type" }
+                },
+                NonlocalImpl::DisallowOther,
+            ),
+
+            ty::Alias(kind, _) => {
+                let problematic_kind = match kind {
+                    // trait Id { type This: ?Sized; }
+                    // impl<T: ?Sized> Id for T {
+                    //     type This = T;
+                    // }
+                    // impl<T: ?Sized> AutoTrait for <T as Id>::This {}
+                    AliasKind::Projection => "associated type",
+                    // type Foo = (impl Sized, bool)
+                    // impl AutoTrait for Foo {}
+                    AliasKind::Weak => "type alias",
+                    // type Opaque = impl Trait;
+                    // impl AutoTrait for Opaque {}
+                    AliasKind::Opaque => "opaque type",
+                    // ```
+                    // struct S<T>(T);
+                    // impl<T: ?Sized> S<T> {
+                    //     type This = T;
+                    // }
+                    // impl<T: ?Sized> AutoTrait for S<T>::This {}
+                    // ```
+                    // FIXME(inherent_associated_types): The example code above currently leads to a cycle
+                    AliasKind::Inherent => "associated type",
+                };
+                (LocalImpl::Disallow { problematic_kind }, NonlocalImpl::DisallowOther)
+            }
+
+            ty::Bool
+            | ty::Char
+            | ty::Int(..)
+            | ty::Uint(..)
+            | ty::Float(..)
+            | ty::Str
+            | ty::Array(..)
+            | ty::Slice(..)
+            | ty::RawPtr(..)
+            | ty::Ref(..)
+            | ty::FnDef(..)
+            | ty::FnPtr(..)
+            | ty::Never
+            | ty::Tuple(..) => (LocalImpl::Allow, NonlocalImpl::DisallowOther),
+
+            ty::Closure(..)
+            | ty::Generator(..)
+            | ty::GeneratorWitness(..)
+            | ty::GeneratorWitnessMIR(..)
+            | ty::Bound(..)
+            | ty::Placeholder(..)
+            | ty::Infer(..) => {
+                let sp = tcx.def_span(def_id);
+                span_bug!(sp, "weird self type for autotrait impl")
+            }
+
+            ty::Error(..) => (LocalImpl::Allow, NonlocalImpl::Allow),
         };
 
-        let msg = match opt_self_def_id {
-            // We only want to permit nominal types, but not *all* nominal types.
-            // They must be local to the current crate, so that people
-            // can't do `unsafe impl Send for Rc<SomethingLocal>` or
-            // `impl !Send for Box<SomethingLocalAndSend>`.
-            Some(self_def_id) => {
-                if self_def_id.is_local() {
-                    None
-                } else {
-                    Some((
-                        format!(
-                            "cross-crate traits with a default impl, like `{}`, \
-                                    can only be implemented for a struct/enum type \
-                                    defined in the current crate",
-                            tcx.def_path_str(trait_def_id)
-                        ),
-                        "can't implement cross-crate trait for type in another crate",
-                    ))
+        if trait_def_id.is_local() {
+            match local_impl {
+                LocalImpl::Allow => {}
+                LocalImpl::Disallow { problematic_kind } => {
+                    let msg = format!(
+                        "traits with a default impl, like `{trait}`, \
+                                cannot be implemented for {problematic_kind} `{self_ty}`",
+                        trait = tcx.def_path_str(trait_def_id),
+                    );
+                    let label = format!(
+                        "a trait object implements `{trait}` if and only if `{trait}` \
+                                is one of the trait object's trait bounds",
+                        trait = tcx.def_path_str(trait_def_id),
+                    );
+                    let sp = tcx.def_span(def_id);
+                    let reported =
+                        struct_span_err!(tcx.sess, sp, E0321, "{}", msg).note(label).emit();
+                    return Err(reported);
                 }
             }
-            _ => Some((
-                format!(
-                    "cross-crate traits with a default impl, like `{}`, can \
+        } else {
+            if let Some((msg, label)) = match nonlocal_impl {
+                NonlocalImpl::Allow => None,
+                NonlocalImpl::DisallowBecauseNonlocal => Some((
+                    format!(
+                        "cross-crate traits with a default impl, like `{}`, \
+                                can only be implemented for a struct/enum type \
+                                defined in the current crate",
+                        tcx.def_path_str(trait_def_id)
+                    ),
+                    "can't implement cross-crate trait for type in another crate",
+                )),
+                NonlocalImpl::DisallowOther => Some((
+                    format!(
+                        "cross-crate traits with a default impl, like `{}`, can \
                                 only be implemented for a struct/enum type, not `{}`",
-                    tcx.def_path_str(trait_def_id),
-                    self_ty
-                ),
-                "can't implement cross-crate trait with a default impl for \
-                        non-struct/enum type",
-            )),
-        };
-
-        if let Some((msg, label)) = msg {
-            let reported =
-                struct_span_err!(tcx.sess, sp, E0321, "{}", msg).span_label(sp, label).emit();
-            return Err(reported);
+                        tcx.def_path_str(trait_def_id),
+                        self_ty
+                    ),
+                    "can't implement cross-crate trait with a default impl for \
+                            non-struct/enum type",
+                )),
+            } {
+                let sp = tcx.def_span(def_id);
+                let reported =
+                    struct_span_err!(tcx.sess, sp, E0321, "{}", msg).span_label(sp, label).emit();
+                return Err(reported);
+            }
         }
     }
 
@@ -154,11 +315,12 @@ fn emit_orphan_check_error<'tcx>(
     sp: Span,
     full_impl_span: Span,
     trait_span: Span,
-    self_ty: Ty<'tcx>,
+    trait_ref: ty::TraitRef<'tcx>,
     self_ty_span: Span,
     generics: &hir::Generics<'tcx>,
     err: traits::OrphanCheckErr<'tcx>,
 ) -> Result<!, ErrorGuaranteed> {
+    let self_ty = trait_ref.self_ty();
     Err(match err {
         traits::OrphanCheckErr::NonLocalInputType(tys) => {
             let msg = match self_ty.kind() {
@@ -187,7 +349,14 @@ fn emit_orphan_check_error<'tcx>(
                 let msg = |ty: &str, postfix: &str| {
                     format!("{ty} is not defined in the current crate{postfix}")
                 };
-                let this = |name: &str| msg("this", &format!(" because {name} are always foreign"));
+
+                let this = |name: &str| {
+                    if !trait_ref.def_id.is_local() && !is_target_ty {
+                        msg("this", &format!(" because this is a foreign trait"))
+                    } else {
+                        msg("this", &format!(" because {name} are always foreign"))
+                    }
+                };
                 let msg = match &ty.kind() {
                     ty::Slice(_) => this("slices"),
                     ty::Array(..) => this("arrays"),
@@ -213,10 +382,10 @@ fn emit_orphan_check_error<'tcx>(
 
                 if is_target_ty {
                     // Point at `D<A>` in `impl<A, B> for C<B> in D<A>`
-                    err.span_label(self_ty_span, &msg);
+                    err.span_label(self_ty_span, msg);
                 } else {
                     // Point at `C<B>` in `impl<A, B> for C<B> in D<A>`
-                    err.span_label(trait_span, &msg);
+                    err.span_label(trait_span, msg);
                 }
             }
             err.note("define and implement a trait or new type instead");
@@ -298,7 +467,7 @@ fn emit_newtype_suggestion_for_raw_ptr(
     ptr_ty: &ty::TypeAndMut<'_>,
     diag: &mut Diagnostic,
 ) {
-    if !self_ty.needs_subst() {
+    if !self_ty.has_param() {
         let mut_key = ptr_ty.mutbl.prefix_str();
         let msg_sugg = "consider introducing a new wrapper type".to_owned();
         let sugg = vec![
@@ -319,10 +488,6 @@ fn lint_auto_trait_impl<'tcx>(
     trait_ref: ty::TraitRef<'tcx>,
     impl_def_id: LocalDefId,
 ) {
-    if tcx.impl_polarity(impl_def_id) != ImplPolarity::Positive {
-        return;
-    }
-
     assert_eq!(trait_ref.substs.len(), 1);
     let self_ty = trait_ref.self_ty();
     let (self_type_did, substs) = match self_ty.kind() {
@@ -339,7 +504,7 @@ fn lint_auto_trait_impl<'tcx>(
     // Impls which completely cover a given root type are fine as they
     // disable auto impls entirely. So only lint if the substs
     // are not a permutation of the identity substs.
-    let Err(arg) = tcx.uses_unique_generic_params(substs, IgnoreRegions::Yes) else {
+    let Err(arg) = tcx.uses_unique_generic_params(substs, CheckRegions::No) else {
         // ok
         return;
     };
@@ -373,18 +538,18 @@ fn lint_auto_trait_impl<'tcx>(
         }),
         |lint| {
             let item_span = tcx.def_span(self_type_did);
-            let self_descr = tcx.def_kind(self_type_did).descr(self_type_did);
+            let self_descr = tcx.def_descr(self_type_did);
             match arg {
                 ty::util::NotUniqueParam::DuplicateParam(arg) => {
-                    lint.note(&format!("`{}` is mentioned multiple times", arg));
+                    lint.note(format!("`{}` is mentioned multiple times", arg));
                 }
                 ty::util::NotUniqueParam::NotParam(arg) => {
-                    lint.note(&format!("`{}` is not a generic parameter", arg));
+                    lint.note(format!("`{}` is not a generic parameter", arg));
                 }
             }
             lint.span_note(
                 item_span,
-                &format!(
+                format!(
                     "try using the same sequence of generic parameters as the {} definition",
                     self_descr,
                 ),
@@ -401,20 +566,20 @@ fn fast_reject_auto_impl<'tcx>(tcx: TyCtxt<'tcx>, trait_def_id: DefId, self_ty: 
         seen: FxHashSet<DefId>,
     }
 
-    impl<'tcx> TypeVisitor<'tcx> for DisableAutoTraitVisitor<'tcx> {
+    impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for DisableAutoTraitVisitor<'tcx> {
         type BreakTy = ();
         fn visit_ty(&mut self, t: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
             let tcx = self.tcx;
             if t != self.self_ty_root {
                 for impl_def_id in tcx.non_blanket_impls_for_ty(self.trait_def_id, t) {
                     match tcx.impl_polarity(impl_def_id) {
-                        ImplPolarity::Negative => return ControlFlow::BREAK,
+                        ImplPolarity::Negative => return ControlFlow::Break(()),
                         ImplPolarity::Reservation => {}
                         // FIXME(@lcnr): That's probably not good enough, idk
                         //
                         // We might just want to take the rustdoc code and somehow avoid
                         // explicit impls for `Self`.
-                        ImplPolarity::Positive => return ControlFlow::CONTINUE,
+                        ImplPolarity::Positive => return ControlFlow::Continue(()),
                     }
                 }
             }
@@ -432,7 +597,7 @@ fn fast_reject_auto_impl<'tcx>(tcx: TyCtxt<'tcx>, trait_def_id: DefId, self_ty: 
                         }
                     }
 
-                    ControlFlow::CONTINUE
+                    ControlFlow::Continue(())
                 }
                 _ => t.super_visit_with(self),
             }

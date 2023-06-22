@@ -46,14 +46,10 @@ pub(crate) fn where_clauses(cx: &DocContext<'_>, clauses: Vec<WP>) -> ThinVec<WP
 
     // Look for equality predicates on associated types that can be merged into
     // general bound predicates.
-    equalities.retain(|&(ref lhs, ref rhs, ref bound_params)| {
+    equalities.retain(|(lhs, rhs, bound_params)| {
         let Some((ty, trait_did, name)) = lhs.projection() else { return true; };
         let Some((bounds, _)) = tybounds.get_mut(ty) else { return true };
-        let bound_params = bound_params
-            .into_iter()
-            .map(|param| clean::GenericParamDef::lifetime(param.0))
-            .collect();
-        merge_bounds(cx, bounds, bound_params, trait_did, name, rhs)
+        merge_bounds(cx, bounds, bound_params.clone(), trait_did, name, rhs)
     });
 
     // And finally, let's reassemble everything
@@ -132,7 +128,9 @@ fn trait_is_same_or_supertrait(cx: &DocContext<'_>, child: DefId, trait_: DefId)
         .predicates
         .iter()
         .filter_map(|(pred, _)| {
-            if let ty::PredicateKind::Clause(ty::Clause::Trait(pred)) = pred.kind().skip_binder() {
+            if let ty::PredicateKind::Clause(ty::ClauseKind::Trait(pred)) =
+                pred.kind().skip_binder()
+            {
                 if pred.trait_ref.self_ty() == self_ty { Some(pred.def_id()) } else { None }
             } else {
                 None

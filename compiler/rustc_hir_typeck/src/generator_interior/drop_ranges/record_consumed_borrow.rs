@@ -9,7 +9,7 @@ use rustc_hir as hir;
 use rustc_middle::ty::{ParamEnv, TyCtxt};
 use rustc_middle::{
     hir::place::{PlaceBase, Projection, ProjectionKind},
-    ty::TypeVisitable,
+    ty::TypeVisitableExt,
 };
 
 pub(super) fn find_consumed_and_borrowed<'a, 'tcx>(
@@ -116,7 +116,7 @@ impl<'tcx> ExprUseDelegate<'tcx> {
         // where the `identity(...)` (the rvalue) produces a return type
         // of `&'rv mut A`, where `'a: 'rv`. We then assign this result to
         // `'y`, resulting in (transitively) `'a: 'y` (i.e., while `y` is in use,
-        // `a` will be considered borrowed).  Other parts of the code will ensure
+        // `a` will be considered borrowed). Other parts of the code will ensure
         // that if `y` is live over a yield, `&'y mut A` appears in the generator
         // state. If `'y` is live, then any sound region analysis must conclude
         // that `'a` is also live. So if this causes a bug, blame some other
@@ -140,7 +140,7 @@ impl<'tcx> expr_use_visitor::Delegate<'tcx> for ExprUseDelegate<'tcx> {
         diag_expr_id: HirId,
     ) {
         let hir = self.tcx.hir();
-        let parent = match hir.find_parent_node(place_with_id.hir_id) {
+        let parent = match hir.opt_parent_id(place_with_id.hir_id) {
             Some(parent) => parent,
             None => place_with_id.hir_id,
         };
@@ -202,10 +202,10 @@ impl<'tcx> expr_use_visitor::Delegate<'tcx> for ExprUseDelegate<'tcx> {
         // If the type being assigned needs dropped, then the mutation counts as a borrow
         // since it is essentially doing `Drop::drop(&mut x); x = new_value;`.
         let ty = self.tcx.erase_regions(assignee_place.place.base_ty);
-        if ty.needs_infer() {
+        if ty.has_infer() {
             self.tcx.sess.delay_span_bug(
                 self.tcx.hir().span(assignee_place.hir_id),
-                &format!("inference variables in {ty}"),
+                format!("inference variables in {ty}"),
             );
         } else if ty.needs_drop(self.tcx, self.param_env) {
             self.places

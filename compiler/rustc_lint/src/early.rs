@@ -19,6 +19,7 @@ use crate::passes::{EarlyLintPass, EarlyLintPassObject};
 use rustc_ast::ptr::P;
 use rustc_ast::visit::{self as ast_visit, Visitor};
 use rustc_ast::{self as ast, walk_list, HasAttrs};
+use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_middle::ty::RegisteredTools;
 use rustc_session::lint::{BufferedEarlyLint, LintBuffer, LintPass};
 use rustc_session::Session;
@@ -29,7 +30,7 @@ macro_rules! lint_callback { ($cx:expr, $f:ident, $($args:expr),*) => ({
     $cx.pass.$f(&$cx.context, $($args),*);
 }) }
 
-/// Implements the AST traversal for early lint passes. `T` provides the the
+/// Implements the AST traversal for early lint passes. `T` provides the
 /// `check_*` methods.
 pub struct EarlyContextAndPass<'a, T: EarlyLintPass> {
     context: EarlyContext<'a>,
@@ -39,6 +40,7 @@ pub struct EarlyContextAndPass<'a, T: EarlyLintPass> {
 impl<'a, T: EarlyLintPass> EarlyContextAndPass<'a, T> {
     // This always-inlined function is for the hot call site.
     #[inline(always)]
+    #[allow(rustc::diagnostic_outside_of_impl)]
     fn inlined_check_id(&mut self, id: ast::NodeId) {
         for early_lint in self.context.buffered.take(id) {
             let BufferedEarlyLint { span, msg, node_id: _, lint_id, diagnostic } = early_lint;
@@ -71,7 +73,7 @@ impl<'a, T: EarlyLintPass> EarlyContextAndPass<'a, T> {
         self.inlined_check_id(id);
         debug!("early context: enter_attrs({:?})", attrs);
         lint_callback!(self, enter_lint_attrs, attrs);
-        f(self);
+        ensure_sufficient_stack(|| f(self));
         debug!("early context: exit_attrs({:?})", attrs);
         lint_callback!(self, exit_lint_attrs, attrs);
         self.context.builder.pop(push);
@@ -222,8 +224,7 @@ impl<'a, T: EarlyLintPass> ast_visit::Visitor<'a> for EarlyContextAndPass<'a, T>
             ast::ExprKind::Closure(box ast::Closure {
                 asyncness: ast::Async::Yes { closure_id, .. },
                 ..
-            })
-            | ast::ExprKind::Async(_, closure_id, ..) => self.check_id(closure_id),
+            }) => self.check_id(closure_id),
             _ => {}
         }
     }
@@ -246,7 +247,9 @@ impl<'a, T: EarlyLintPass> ast_visit::Visitor<'a> for EarlyContextAndPass<'a, T>
     }
 
     fn visit_where_predicate(&mut self, p: &'a ast::WherePredicate) {
+        lint_callback!(self, enter_where_predicate, p);
         ast_visit::walk_where_predicate(self, p);
+        lint_callback!(self, exit_where_predicate, p);
     }
 
     fn visit_poly_trait_ref(&mut self, t: &'a ast::PolyTraitRef) {
@@ -337,7 +340,7 @@ pub trait EarlyCheckNode<'a>: Copy {
         'a: 'b;
 }
 
-impl<'a> EarlyCheckNode<'a> for &'a ast::Crate {
+impl<'a> EarlyCheckNode<'a> for (&'a ast::Crate, &'a [ast::Attribute]) {
     fn id(self) -> ast::NodeId {
         ast::CRATE_NODE_ID
     }
@@ -345,15 +348,15 @@ impl<'a> EarlyCheckNode<'a> for &'a ast::Crate {
     where
         'a: 'b,
     {
-        &self.attrs
+        &self.1
     }
     fn check<'b, T: EarlyLintPass>(self, cx: &mut EarlyContextAndPass<'b, T>)
     where
         'a: 'b,
     {
-        lint_callback!(cx, check_crate, self);
-        ast_visit::walk_crate(cx, self);
-        lint_callback!(cx, check_crate_post, self);
+        lint_callback!(cx, check_crate, self.0);
+        ast_visit::walk_crate(cx, self.0);
+        lint_callback!(cx, check_crate_post, self.0);
     }
 }
 
@@ -425,7 +428,7 @@ pub fn check_ast_node_inner<'a, T: EarlyLintPass>(
         for early_lint in lints {
             sess.delay_span_bug(
                 early_lint.span,
-                &format!(
+                format!(
                     "failed to process buffered lint here (dummy = {})",
                     id == ast::DUMMY_NODE_ID
                 ),

@@ -9,301 +9,249 @@
 //! FIXME(@lcnr): Write that section. If you read this before then ask me
 //! about it on zulip.
 
-// FIXME: Instead of using `infcx.canonicalize_query` we have to add a new routine which
-// preserves universes and creates a unique var (in the highest universe) for each
-// appearance of a region.
-
-// FIXME: `CanonicalVarValues` should be interned and `Copy`.
-
-// FIXME: uses of `infcx.at` need to enable deferred projection equality once that's implemented.
-
-use std::mem;
-
-use rustc_infer::infer::canonical::OriginalQueryValues;
-use rustc_infer::infer::{InferCtxt, TyCtxtInferExt};
+use rustc_hir::def_id::DefId;
+use rustc_infer::infer::canonical::{Canonical, CanonicalVarValues};
 use rustc_infer::traits::query::NoSolution;
-use rustc_infer::traits::Obligation;
-use rustc_middle::infer::canonical::{Canonical, CanonicalVarValues};
+use rustc_middle::traits::solve::{
+    CanonicalResponse, Certainty, ExternalConstraintsData, Goal, QueryResult, Response,
+};
 use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_middle::ty::{RegionOutlivesPredicate, ToPredicate, TypeOutlivesPredicate};
-use rustc_span::DUMMY_SP;
+use rustc_middle::ty::{
+    CoercePredicate, RegionOutlivesPredicate, SubtypePredicate, TypeOutlivesPredicate,
+};
 
-use self::infcx_ext::InferCtxtExt;
-
+mod alias_relate;
 mod assembly;
-mod cache;
+mod canonicalize;
+mod eval_ctxt;
 mod fulfill;
-mod infcx_ext;
-mod overflow;
+pub mod inspect;
+mod opaques;
 mod project_goals;
+mod search_graph;
 mod trait_goals;
+mod weak_types;
 
+pub use eval_ctxt::{EvalCtxt, InferCtxtEvalExt};
 pub use fulfill::FulfillmentCtxt;
 
-/// A goal is a statement, i.e. `predicate`, we want to prove
-/// given some assumptions, i.e. `param_env`.
-///
-/// Most of the time the `param_env` contains the `where`-bounds of the function
-/// we're currently typechecking while the `predicate` is some trait bound.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, TypeFoldable, TypeVisitable)]
-pub struct Goal<'tcx, P> {
-    param_env: ty::ParamEnv<'tcx>,
-    predicate: P,
+#[derive(Debug, Clone, Copy)]
+enum SolverMode {
+    /// Ordinary trait solving, using everywhere except for coherence.
+    Normal,
+    /// Trait solving during coherence. There are a few notable differences
+    /// between coherence and ordinary trait solving.
+    ///
+    /// Most importantly, trait solving during coherence must not be incomplete,
+    /// i.e. return `Err(NoSolution)` for goals for which a solution exists.
+    /// This means that we must not make any guesses or arbitrary choices.
+    Coherence,
 }
 
-impl<'tcx, P> Goal<'tcx, P> {
-    pub fn new(
-        tcx: TyCtxt<'tcx>,
-        param_env: ty::ParamEnv<'tcx>,
-        predicate: impl ToPredicate<'tcx, P>,
-    ) -> Goal<'tcx, P> {
-        Goal { param_env, predicate: predicate.to_predicate(tcx) }
+trait CanonicalResponseExt {
+    fn has_no_inference_or_external_constraints(&self) -> bool;
+
+    fn has_only_region_constraints(&self) -> bool;
+}
+
+impl<'tcx> CanonicalResponseExt for Canonical<'tcx, Response<'tcx>> {
+    fn has_no_inference_or_external_constraints(&self) -> bool {
+        self.value.external_constraints.region_constraints.is_empty()
+            && self.value.var_values.is_identity()
+            && self.value.external_constraints.opaque_types.is_empty()
     }
 
-    /// Updates the goal to one with a different `predicate` but the same `param_env`.
-    fn with<Q>(self, tcx: TyCtxt<'tcx>, predicate: impl ToPredicate<'tcx, Q>) -> Goal<'tcx, Q> {
-        Goal { param_env: self.param_env, predicate: predicate.to_predicate(tcx) }
-    }
-}
-
-impl<'tcx, P> From<Obligation<'tcx, P>> for Goal<'tcx, P> {
-    fn from(obligation: Obligation<'tcx, P>) -> Goal<'tcx, P> {
-        Goal { param_env: obligation.param_env, predicate: obligation.predicate }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Hash, TypeFoldable, TypeVisitable)]
-pub struct Response<'tcx> {
-    pub var_values: CanonicalVarValues<'tcx>,
-    /// Additional constraints returned by this query.
-    pub external_constraints: ExternalConstraints<'tcx>,
-    pub certainty: Certainty,
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, TypeFoldable, TypeVisitable)]
-pub enum Certainty {
-    Yes,
-    Maybe(MaybeCause),
-}
-
-impl Certainty {
-    /// When proving multiple goals using **AND**, e.g. nested obligations for an impl,
-    /// use this function to unify the certainty of these goals
-    pub fn unify_and(self, other: Certainty) -> Certainty {
-        match (self, other) {
-            (Certainty::Yes, Certainty::Yes) => Certainty::Yes,
-            (Certainty::Yes, Certainty::Maybe(_)) => other,
-            (Certainty::Maybe(_), Certainty::Yes) => self,
-            (Certainty::Maybe(MaybeCause::Overflow), Certainty::Maybe(MaybeCause::Overflow)) => {
-                Certainty::Maybe(MaybeCause::Overflow)
-            }
-            // If at least one of the goals is ambiguous, hide the overflow as the ambiguous goal
-            // may still result in failure.
-            (Certainty::Maybe(MaybeCause::Ambiguity), Certainty::Maybe(_))
-            | (Certainty::Maybe(_), Certainty::Maybe(MaybeCause::Ambiguity)) => {
-                Certainty::Maybe(MaybeCause::Ambiguity)
-            }
-        }
+    fn has_only_region_constraints(&self) -> bool {
+        self.value.var_values.is_identity_modulo_regions()
+            && self.value.external_constraints.opaque_types.is_empty()
     }
 }
 
-/// Why we failed to evaluate a goal.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, TypeFoldable, TypeVisitable)]
-pub enum MaybeCause {
-    /// We failed due to ambiguity. This ambiguity can either
-    /// be a true ambiguity, i.e. there are multiple different answers,
-    /// or we hit a case where we just don't bother, e.g. `?x: Trait` goals.
-    Ambiguity,
-    /// We gave up due to an overflow, most often by hitting the recursion limit.
-    Overflow,
-}
-
-/// Additional constraints returned on success.
-#[derive(Debug, PartialEq, Eq, Clone, Hash, TypeFoldable, TypeVisitable)]
-pub struct ExternalConstraints<'tcx> {
-    // FIXME: implement this.
-    regions: (),
-    opaque_types: Vec<(Ty<'tcx>, Ty<'tcx>)>,
-}
-
-type CanonicalGoal<'tcx, T = ty::Predicate<'tcx>> = Canonical<'tcx, Goal<'tcx, T>>;
-type CanonicalResponse<'tcx> = Canonical<'tcx, Response<'tcx>>;
-/// The result of evaluating a canonical query.
-///
-/// FIXME: We use a different type than the existing canonical queries. This is because
-/// we need to add a `Certainty` for `overflow` and may want to restructure this code without
-/// having to worry about changes to currently used code. Once we've made progress on this
-/// solver, merge the two responses again.
-pub type QueryResult<'tcx> = Result<CanonicalResponse<'tcx>, NoSolution>;
-
-pub trait TyCtxtExt<'tcx> {
-    fn evaluate_goal(self, goal: CanonicalGoal<'tcx>) -> QueryResult<'tcx>;
-}
-
-impl<'tcx> TyCtxtExt<'tcx> for TyCtxt<'tcx> {
-    fn evaluate_goal(self, goal: CanonicalGoal<'tcx>) -> QueryResult<'tcx> {
-        let mut cx = EvalCtxt::new(self);
-        cx.evaluate_canonical_goal(goal)
-    }
-}
-
-struct EvalCtxt<'tcx> {
-    tcx: TyCtxt<'tcx>,
-
-    provisional_cache: cache::ProvisionalCache<'tcx>,
-    overflow_data: overflow::OverflowData,
-}
-
-impl<'tcx> EvalCtxt<'tcx> {
-    fn new(tcx: TyCtxt<'tcx>) -> EvalCtxt<'tcx> {
-        EvalCtxt {
-            tcx,
-            provisional_cache: cache::ProvisionalCache::empty(),
-            overflow_data: overflow::OverflowData::new(tcx),
-        }
-    }
-
-    /// Recursively evaluates `goal`, returning whether any inference vars have
-    /// been constrained and the certainty of the result.
-    fn evaluate_goal(
-        &mut self,
-        infcx: &InferCtxt<'tcx>,
-        goal: Goal<'tcx, ty::Predicate<'tcx>>,
-    ) -> Result<(bool, Certainty), NoSolution> {
-        let mut orig_values = OriginalQueryValues::default();
-        let canonical_goal = infcx.canonicalize_query(goal, &mut orig_values);
-        let canonical_response = self.evaluate_canonical_goal(canonical_goal)?;
-        Ok((
-            true, // FIXME: check whether `var_values` are an identity substitution.
-            fixme_instantiate_canonical_query_response(infcx, &orig_values, canonical_response),
-        ))
-    }
-
-    fn evaluate_canonical_goal(&mut self, goal: CanonicalGoal<'tcx>) -> QueryResult<'tcx> {
-        match self.try_push_stack(goal) {
-            Ok(()) => {}
-            // Our goal is already on the stack, eager return.
-            Err(response) => return response,
-        }
-
-        // We may have to repeatedly recompute the goal in case of coinductive cycles,
-        // check out the `cache` module for more information.
-        //
-        // FIXME: Similar to `evaluate_all`, this has to check for overflow.
-        loop {
-            let result = self.compute_goal(goal);
-
-            // FIXME: `Response` should be `Copy`
-            if self.try_finalize_goal(goal, result.clone()) {
-                return result;
-            }
-        }
-    }
-
-    fn compute_goal(&mut self, canonical_goal: CanonicalGoal<'tcx>) -> QueryResult<'tcx> {
-        // WARNING: We're looking at a canonical value without instantiating it here.
-        //
-        // We have to be incredibly careful to not change the order of bound variables or
-        // remove any. As we go from `Goal<'tcx, Predicate>` to `Goal` with the variants
-        // of `PredicateKind` this is the case and it is and faster than instantiating and
-        // recanonicalizing.
-        let Goal { param_env, predicate } = canonical_goal.value;
-        if let Some(kind) = predicate.kind().no_bound_vars() {
-            match kind {
-                ty::PredicateKind::Clause(ty::Clause::Trait(predicate)) => self.compute_trait_goal(
-                    canonical_goal.unchecked_rebind(Goal { param_env, predicate }),
-                ),
-                ty::PredicateKind::Clause(ty::Clause::Projection(predicate)) => self
-                    .compute_projection_goal(
-                        canonical_goal.unchecked_rebind(Goal { param_env, predicate }),
-                    ),
-                ty::PredicateKind::Clause(ty::Clause::TypeOutlives(predicate)) => self
-                    .compute_type_outlives_goal(
-                        canonical_goal.unchecked_rebind(Goal { param_env, predicate }),
-                    ),
-                ty::PredicateKind::Clause(ty::Clause::RegionOutlives(predicate)) => self
-                    .compute_region_outlives_goal(
-                        canonical_goal.unchecked_rebind(Goal { param_env, predicate }),
-                    ),
-                // FIXME: implement these predicates :)
-                ty::PredicateKind::WellFormed(_)
-                | ty::PredicateKind::ObjectSafe(_)
-                | ty::PredicateKind::ClosureKind(_, _, _)
-                | ty::PredicateKind::Subtype(_)
-                | ty::PredicateKind::Coerce(_)
-                | ty::PredicateKind::ConstEvaluatable(_)
-                | ty::PredicateKind::ConstEquate(_, _)
-                | ty::PredicateKind::TypeWellFormedFromEnv(_)
-                | ty::PredicateKind::Ambiguous => unimplemented!(),
-            }
-        } else {
-            let (infcx, goal, var_values) =
-                self.tcx.infer_ctxt().build_with_canonical(DUMMY_SP, &canonical_goal);
-            let kind = infcx.replace_bound_vars_with_placeholders(goal.predicate.kind());
-            let goal = goal.with(self.tcx, ty::Binder::dummy(kind));
-            let (_, certainty) = self.evaluate_goal(&infcx, goal)?;
-            infcx.make_canonical_response(var_values, certainty)
-        }
-    }
-
+impl<'a, 'tcx> EvalCtxt<'a, 'tcx> {
+    #[instrument(level = "debug", skip(self))]
     fn compute_type_outlives_goal(
         &mut self,
-        _goal: CanonicalGoal<'tcx, TypeOutlivesPredicate<'tcx>>,
+        goal: Goal<'tcx, TypeOutlivesPredicate<'tcx>>,
     ) -> QueryResult<'tcx> {
-        todo!()
+        let ty::OutlivesPredicate(ty, lt) = goal.predicate;
+        self.register_ty_outlives(ty, lt);
+        self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
     }
 
+    #[instrument(level = "debug", skip(self))]
     fn compute_region_outlives_goal(
         &mut self,
-        _goal: CanonicalGoal<'tcx, RegionOutlivesPredicate<'tcx>>,
+        goal: Goal<'tcx, RegionOutlivesPredicate<'tcx>>,
     ) -> QueryResult<'tcx> {
-        todo!()
+        let ty::OutlivesPredicate(a, b) = goal.predicate;
+        self.register_region_outlives(a, b);
+        self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
     }
-}
 
-impl<'tcx> EvalCtxt<'tcx> {
-    fn evaluate_all(
+    #[instrument(level = "debug", skip(self))]
+    fn compute_coerce_goal(
         &mut self,
-        infcx: &InferCtxt<'tcx>,
-        mut goals: Vec<Goal<'tcx, ty::Predicate<'tcx>>>,
-    ) -> Result<Certainty, NoSolution> {
-        let mut new_goals = Vec::new();
-        self.repeat_while_none(|this| {
-            let mut has_changed = Err(Certainty::Yes);
-            for goal in goals.drain(..) {
-                let (changed, certainty) = match this.evaluate_goal(infcx, goal) {
-                    Ok(result) => result,
-                    Err(NoSolution) => return Some(Err(NoSolution)),
-                };
-
-                if changed {
-                    has_changed = Ok(());
-                }
-
-                match certainty {
-                    Certainty::Yes => {}
-                    Certainty::Maybe(_) => {
-                        new_goals.push(goal);
-                        has_changed = has_changed.map_err(|c| c.unify_and(certainty));
-                    }
-                }
-            }
-
-            match has_changed {
-                Ok(()) => {
-                    mem::swap(&mut new_goals, &mut goals);
-                    None
-                }
-                Err(certainty) => Some(Ok(certainty)),
-            }
+        goal: Goal<'tcx, CoercePredicate<'tcx>>,
+    ) -> QueryResult<'tcx> {
+        self.compute_subtype_goal(Goal {
+            param_env: goal.param_env,
+            predicate: SubtypePredicate {
+                a_is_expected: false,
+                a: goal.predicate.a,
+                b: goal.predicate.b,
+            },
         })
     }
+
+    #[instrument(level = "debug", skip(self))]
+    fn compute_subtype_goal(
+        &mut self,
+        goal: Goal<'tcx, SubtypePredicate<'tcx>>,
+    ) -> QueryResult<'tcx> {
+        if goal.predicate.a.is_ty_var() && goal.predicate.b.is_ty_var() {
+            self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS)
+        } else {
+            self.sub(goal.param_env, goal.predicate.a, goal.predicate.b)?;
+            self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+        }
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    fn compute_closure_kind_goal(
+        &mut self,
+        goal: Goal<'tcx, (DefId, ty::SubstsRef<'tcx>, ty::ClosureKind)>,
+    ) -> QueryResult<'tcx> {
+        let (_, substs, expected_kind) = goal.predicate;
+        let found_kind = substs.as_closure().kind_ty().to_opt_closure_kind();
+
+        let Some(found_kind) = found_kind else {
+            return self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS);
+        };
+        if found_kind.extends(expected_kind) {
+            self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+        } else {
+            Err(NoSolution)
+        }
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    fn compute_object_safe_goal(&mut self, trait_def_id: DefId) -> QueryResult<'tcx> {
+        if self.tcx().check_is_object_safe(trait_def_id) {
+            self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+        } else {
+            Err(NoSolution)
+        }
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    fn compute_well_formed_goal(
+        &mut self,
+        goal: Goal<'tcx, ty::GenericArg<'tcx>>,
+    ) -> QueryResult<'tcx> {
+        match self.well_formed_goals(goal.param_env, goal.predicate) {
+            Some(goals) => {
+                self.add_goals(goals);
+                self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+            }
+            None => self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS),
+        }
+    }
+
+    #[instrument(level = "debug", skip(self), ret)]
+    fn compute_const_arg_has_type_goal(
+        &mut self,
+        goal: Goal<'tcx, (ty::Const<'tcx>, Ty<'tcx>)>,
+    ) -> QueryResult<'tcx> {
+        let (ct, ty) = goal.predicate;
+        self.eq(goal.param_env, ct.ty(), ty)?;
+        self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+    }
 }
 
-fn fixme_instantiate_canonical_query_response<'tcx>(
-    _: &InferCtxt<'tcx>,
-    _: &OriginalQueryValues<'tcx>,
-    _: CanonicalResponse<'tcx>,
-) -> Certainty {
-    unimplemented!()
+impl<'tcx> EvalCtxt<'_, 'tcx> {
+    #[instrument(level = "debug", skip(self))]
+    fn set_normalizes_to_hack_goal(&mut self, goal: Goal<'tcx, ty::ProjectionPredicate<'tcx>>) {
+        assert!(
+            self.nested_goals.normalizes_to_hack_goal.is_none(),
+            "attempted to set the projection eq hack goal when one already exists"
+        );
+        self.nested_goals.normalizes_to_hack_goal = Some(goal);
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    fn add_goal(&mut self, goal: Goal<'tcx, ty::Predicate<'tcx>>) {
+        self.nested_goals.goals.push(goal);
+    }
+
+    #[instrument(level = "debug", skip(self, goals))]
+    fn add_goals(&mut self, goals: impl IntoIterator<Item = Goal<'tcx, ty::Predicate<'tcx>>>) {
+        let current_len = self.nested_goals.goals.len();
+        self.nested_goals.goals.extend(goals);
+        debug!("added_goals={:?}", &self.nested_goals.goals[current_len..]);
+    }
+
+    /// Try to merge multiple possible ways to prove a goal, if that is not possible returns `None`.
+    ///
+    /// In this case we tend to flounder and return ambiguity by calling `[EvalCtxt::flounder]`.
+    #[instrument(level = "debug", skip(self), ret)]
+    fn try_merge_responses(
+        &mut self,
+        responses: &[CanonicalResponse<'tcx>],
+    ) -> Option<CanonicalResponse<'tcx>> {
+        if responses.is_empty() {
+            return None;
+        }
+
+        // FIXME(-Ztrait-solver=next): We should instead try to find a `Certainty::Yes` response with
+        // a subset of the constraints that all the other responses have.
+        let one = responses[0];
+        if responses[1..].iter().all(|&resp| resp == one) {
+            return Some(one);
+        }
+
+        responses
+            .iter()
+            .find(|response| {
+                response.value.certainty == Certainty::Yes
+                    && response.has_no_inference_or_external_constraints()
+            })
+            .copied()
+    }
+
+    /// If we fail to merge responses we flounder and return overflow or ambiguity.
+    #[instrument(level = "debug", skip(self), ret)]
+    fn flounder(&mut self, responses: &[CanonicalResponse<'tcx>]) -> QueryResult<'tcx> {
+        if responses.is_empty() {
+            return Err(NoSolution);
+        }
+
+        let Certainty::Maybe(maybe_cause) = responses.iter().fold(
+            Certainty::AMBIGUOUS,
+            |certainty, response| {
+                certainty.unify_with(response.value.certainty)
+            },
+        ) else {
+            bug!("expected flounder response to be ambiguous")
+        };
+
+        Ok(self.make_ambiguous_response_no_constraints(maybe_cause))
+    }
+}
+
+pub(super) fn response_no_constraints<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    goal: Canonical<'tcx, impl Sized>,
+    certainty: Certainty,
+) -> QueryResult<'tcx> {
+    Ok(Canonical {
+        max_universe: goal.max_universe,
+        variables: goal.variables,
+        value: Response {
+            var_values: CanonicalVarValues::make_identity(tcx, goal.variables),
+            // FIXME: maybe we should store the "no response" version in tcx, like
+            // we do for tcx.types and stuff.
+            external_constraints: tcx.mk_external_constraints(ExternalConstraintsData::default()),
+            certainty,
+        },
+    })
 }

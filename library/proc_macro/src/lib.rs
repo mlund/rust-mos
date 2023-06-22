@@ -44,10 +44,10 @@ mod diagnostic;
 pub use diagnostic::{Diagnostic, Level, MultiSpan};
 
 use std::cmp::Ordering;
-use std::ops::RangeBounds;
+use std::ops::{Range, RangeBounds};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::{error, fmt, iter};
+use std::{error, fmt};
 
 /// Determines whether proc_macro has been made accessible to the currently
 /// running program.
@@ -74,6 +74,7 @@ pub fn is_available() -> bool {
 ///
 /// This is both the input and output of `#[proc_macro]`, `#[proc_macro_attribute]`
 /// and `#[proc_macro_derive]` definitions.
+#[rustc_diagnostic_item = "TokenStream"]
 #[stable(feature = "proc_macro_lib", since = "1.15.0")]
 #[derive(Clone)]
 pub struct TokenStream(Option<bridge::client::TokenStream>);
@@ -309,7 +310,7 @@ impl ConcatStreamsHelper {
 
 /// Collects a number of token trees into a single stream.
 #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
-impl iter::FromIterator<TokenTree> for TokenStream {
+impl FromIterator<TokenTree> for TokenStream {
     fn from_iter<I: IntoIterator<Item = TokenTree>>(trees: I) -> Self {
         let iter = trees.into_iter();
         let mut builder = ConcatTreesHelper::new(iter.size_hint().0);
@@ -321,7 +322,7 @@ impl iter::FromIterator<TokenTree> for TokenStream {
 /// A "flattening" operation on token streams, collects token trees
 /// from multiple token streams into a single stream.
 #[stable(feature = "proc_macro_lib", since = "1.15.0")]
-impl iter::FromIterator<TokenStream> for TokenStream {
+impl FromIterator<TokenStream> for TokenStream {
     fn from_iter<I: IntoIterator<Item = TokenStream>>(streams: I) -> Self {
         let iter = streams.into_iter();
         let mut builder = ConcatStreamsHelper::new(iter.size_hint().0);
@@ -487,6 +488,12 @@ impl Span {
         Span(self.0.source())
     }
 
+    /// Returns the span's byte position range in the source file.
+    #[unstable(feature = "proc_macro_span", issue = "54725")]
+    pub fn byte_range(&self) -> Range<usize> {
+        self.0.byte_range()
+    }
+
     /// Gets the starting line/column in the source file for this span.
     #[unstable(feature = "proc_macro_span", issue = "54725")]
     pub fn start(&self) -> LineColumn {
@@ -581,7 +588,7 @@ impl fmt::Debug for Span {
 
 /// A line-column pair representing the start or end of a `Span`.
 #[unstable(feature = "proc_macro_span", issue = "54725")]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct LineColumn {
     /// The 1-indexed line in the source file on which the span starts or ends (inclusive).
     #[unstable(feature = "proc_macro_span", issue = "54725")]

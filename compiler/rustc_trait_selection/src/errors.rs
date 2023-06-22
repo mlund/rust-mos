@@ -1,7 +1,7 @@
-use rustc_errors::{fluent, ErrorGuaranteed, Handler, IntoDiagnostic};
+use crate::fluent_generated as fluent;
+use rustc_errors::{ErrorGuaranteed, Handler, IntoDiagnostic};
 use rustc_macros::Diagnostic;
 use rustc_middle::ty::{self, PolyTraitRef, Ty};
-use rustc_session::Limit;
 use rustc_span::{Span, Symbol};
 
 #[derive(Diagnostic)]
@@ -19,18 +19,6 @@ pub struct UnableToConstructConstantValue<'a> {
     #[primary_span]
     pub span: Span,
     pub unevaluated: ty::UnevaluatedConst<'a>,
-}
-
-#[derive(Diagnostic)]
-#[help]
-#[diag(trait_selection_auto_deref_reached_recursion_limit, code = "E0055")]
-pub struct AutoDerefReachedRecursionLimit<'a> {
-    #[primary_span]
-    #[label]
-    pub span: Span,
-    pub ty: Ty<'a>,
-    pub suggested_limit: Limit,
-    pub crate_name: Symbol,
 }
 
 #[derive(Diagnostic)]
@@ -82,22 +70,30 @@ impl IntoDiagnostic<'_> for NegativePositiveConflict<'_> {
         diag.code(rustc_errors::error_code!(E0751));
         match self.negative_impl_span {
             Ok(span) => {
-                diag.span_label(span, fluent::negative_implementation_here);
+                diag.span_label(span, fluent::trait_selection_negative_implementation_here);
             }
             Err(cname) => {
-                diag.note(fluent::negative_implementation_in_crate);
+                diag.note(fluent::trait_selection_negative_implementation_in_crate);
                 diag.set_arg("negative_impl_cname", cname.to_string());
             }
         }
         match self.positive_impl_span {
             Ok(span) => {
-                diag.span_label(span, fluent::positive_implementation_here);
+                diag.span_label(span, fluent::trait_selection_positive_implementation_here);
             }
             Err(cname) => {
-                diag.note(fluent::positive_implementation_in_crate);
+                diag.note(fluent::trait_selection_positive_implementation_in_crate);
                 diag.set_arg("positive_impl_cname", cname.to_string());
             }
         }
         diag
     }
+}
+
+#[derive(Diagnostic)]
+#[diag(trait_selection_inherent_projection_normalization_overflow)]
+pub struct InherentProjectionNormalizationOverflow {
+    #[primary_span]
+    pub span: Span,
+    pub ty: String,
 }

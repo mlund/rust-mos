@@ -4,11 +4,12 @@
 The Rust toolchain test runner for Fuchsia.
 
 For instructions on running the compiler test suite, see
-https://doc.rust-lang.org/stable/rustc/platform-support/fuchsia.html#aarch64-fuchsia-and-x86_64-fuchsia
+https://doc.rust-lang.org/stable/rustc/platform-support/fuchsia.html#aarch64-unknown-fuchsia-and-x86_64-unknown-fuchsia
 """
 
 import argparse
 from dataclasses import dataclass
+import fcntl
 import glob
 import hashlib
 import json
@@ -19,18 +20,14 @@ import shutil
 import signal
 import subprocess
 import sys
-from typing import ClassVar, List
+from typing import ClassVar, List, Optional
 
 
 @dataclass
 class TestEnvironment:
-    rust_dir: str
+    rust_build_dir: str
     sdk_dir: str
-    target_arch: str
-    package_server_pid: int = None
-    emu_addr: str = None
-    libstd_name: str = None
-    libtest_name: str = None
+    target: str
     verbose: bool = False
 
     @staticmethod
@@ -40,6 +37,15 @@ class TestEnvironment:
             return os.path.abspath(tmp_dir)
         return os.path.join(os.path.dirname(__file__), "tmp~")
 
+    @staticmethod
+    def triple_to_arch(triple):
+        if "x86_64" in triple:
+            return "x64"
+        elif "aarch64" in triple:
+            return "arm64"
+        else:
+            raise Exception(f"Unrecognized target triple {triple}")
+
     @classmethod
     def env_file_path(cls):
         return os.path.join(cls.tmp_dir(), "test_env.json")
@@ -47,9 +53,9 @@ class TestEnvironment:
     @classmethod
     def from_args(cls, args):
         return cls(
-            os.path.abspath(args.rust),
+            os.path.abspath(args.rust_build),
             os.path.abspath(args.sdk),
-            args.target_arch,
+            args.target,
             verbose=args.verbose,
         )
 
@@ -58,38 +64,15 @@ class TestEnvironment:
         with open(cls.env_file_path(), encoding="utf-8") as f:
             test_env = json.loads(f.read())
             return cls(
-                test_env["rust_dir"],
+                test_env["rust_build_dir"],
                 test_env["sdk_dir"],
-                test_env["target_arch"],
-                libstd_name=test_env["libstd_name"],
-                libtest_name=test_env["libtest_name"],
-                emu_addr=test_env["emu_addr"],
-                package_server_pid=test_env["package_server_pid"],
+                test_env["target"],
                 verbose=test_env["verbose"],
             )
-
-    def image_name(self):
-        if self.target_arch == "x64":
-            return "qemu-x64"
-        if self.target_arch == "arm64":
-            return "qemu-arm64"
-        raise Exception(f"Unrecognized target architecture {self.target_arch}")
 
     def write_to_file(self):
         with open(self.env_file_path(), "w", encoding="utf-8") as f:
             f.write(json.dumps(self.__dict__))
-
-    def ssh_dir(self):
-        return os.path.join(self.tmp_dir(), "ssh")
-
-    def ssh_keyfile_path(self):
-        return os.path.join(self.ssh_dir(), "fuchsia_ed25519")
-
-    def ssh_authfile_path(self):
-        return os.path.join(self.ssh_dir(), "fuchsia_authorized_keys")
-
-    def vdl_output_path(self):
-        return os.path.join(self.tmp_dir(), "vdl_output")
 
     def package_server_log_path(self):
         return os.path.join(self.tmp_dir(), "package_server_log")
@@ -108,16 +91,11 @@ class TestEnvironment:
     def repo_dir(self):
         return os.path.join(self.tmp_dir(), self.TEST_REPO_NAME)
 
-    def rustlib_dir(self):
-        if self.target_arch == "x64":
-            return "x86_64-fuchsia"
-        if self.target_arch == "arm64":
-            return "aarch64-fuchsia"
-        raise Exception(f"Unrecognized target architecture {self.target_arch}")
-
     def libs_dir(self):
         return os.path.join(
-            self.rust_dir,
+            self.rust_build_dir,
+            "host",
+            "stage2",
             "lib",
         )
 
@@ -125,7 +103,7 @@ class TestEnvironment:
         return os.path.join(
             self.libs_dir(),
             "rustlib",
-            self.rustlib_dir(),
+            self.target,
             "lib",
         )
 
@@ -151,6 +129,9 @@ class TestEnvironment:
     def zxdb_script_path(self):
         return os.path.join(self.tmp_dir(), "zxdb_script")
 
+    def pm_lockfile_path(self):
+        return os.path.join(self.tmp_dir(), "pm.lock")
+
     def log_info(self, msg):
         print(msg)
 
@@ -169,85 +150,16 @@ class TestEnvironment:
     def ffx_isolate_dir(self):
         return os.path.join(self.tmp_dir(), "ffx_isolate")
 
-    def ffx_home_dir(self):
-        return os.path.join(self.ffx_isolate_dir(), "user-home")
-
-    def ffx_tmp_dir(self):
-        return os.path.join(self.ffx_isolate_dir(), "tmp")
-
-    def ffx_log_dir(self):
-        return os.path.join(self.ffx_isolate_dir(), "log")
-
-    def ffx_user_config_dir(self):
-        return os.path.join(self.ffx_xdg_config_home(), "Fuchsia", "ffx", "config")
-
-    def ffx_user_config_path(self):
-        return os.path.join(self.ffx_user_config_dir(), "config.json")
-
-    def ffx_xdg_config_home(self):
-        if platform.system() == "Darwin":
-            return os.path.join(self.ffx_home_dir(), "Library", "Preferences")
-        return os.path.join(self.ffx_home_dir(), ".local", "share")
-
-    def ffx_ascendd_path(self):
-        return os.path.join(self.ffx_tmp_dir(), "ascendd")
+    def home_dir(self):
+        return os.path.join(self.tmp_dir(), "user-home")
 
     def start_ffx_isolation(self):
         # Most of this is translated directly from ffx's isolate library
         os.mkdir(self.ffx_isolate_dir())
-        os.mkdir(self.ffx_home_dir())
-        os.mkdir(self.ffx_tmp_dir())
-        os.mkdir(self.ffx_log_dir())
+        os.mkdir(self.home_dir())
 
-        fuchsia_dir = os.path.join(self.ffx_home_dir(), ".fuchsia")
-        os.mkdir(fuchsia_dir)
-
-        fuchsia_debug_dir = os.path.join(fuchsia_dir, "debug")
-        os.mkdir(fuchsia_debug_dir)
-
-        metrics_dir = os.path.join(fuchsia_dir, "metrics")
-        os.mkdir(metrics_dir)
-
-        analytics_path = os.path.join(metrics_dir, "analytics-status")
-        with open(analytics_path, "w", encoding="utf-8") as analytics_file:
-            print("0", file=analytics_file)
-
-        ffx_path = os.path.join(metrics_dir, "ffx")
-        with open(ffx_path, "w", encoding="utf-8") as ffx_file:
-            print("1", file=ffx_file)
-
-        os.makedirs(self.ffx_user_config_dir())
-
-        with open(
-            self.ffx_user_config_path(), "w", encoding="utf-8"
-        ) as config_json_file:
-            user_config_for_test = {
-                "log": {
-                    "enabled": True,
-                    "dir": self.ffx_log_dir(),
-                },
-                "overnet": {
-                    "socket": self.ffx_ascendd_path(),
-                },
-                "ssh": {
-                    "pub": self.ssh_authfile_path(),
-                    "priv": self.ssh_keyfile_path(),
-                },
-                "test": {
-                    "is_isolated": True,
-                    "experimental_structured_output": True,
-                },
-            }
-            print(json.dumps(user_config_for_test), file=config_json_file)
-
-        ffx_env_path = os.path.join(self.ffx_user_config_dir(), ".ffx_env")
-        with open(ffx_env_path, "w", encoding="utf-8") as ffx_env_file:
-            ffx_env_config_for_test = {
-                "user": self.ffx_user_config_path(),
-                "build": None,
-                "global": None,
-            }
-            print(json.dumps(ffx_env_config_for_test), file=ffx_env_file)
+        ffx_path = self.tool_path("ffx")
+        ffx_env = self.ffx_cmd_env()
 
         # Start ffx daemon
         # We want this to be a long-running process that persists after the script finishes
@@ -257,23 +169,52 @@ class TestEnvironment:
         ) as ffx_daemon_log_file:
             subprocess.Popen(
                 [
-                    self.tool_path("ffx"),
-                    "--config",
-                    self.ffx_user_config_path(),
+                    ffx_path,
                     "daemon",
                     "start",
                 ],
-                env=self.ffx_cmd_env(),
+                env=ffx_env,
                 stdout=ffx_daemon_log_file,
                 stderr=ffx_daemon_log_file,
             )
 
+        # Disable analytics
+        subprocess.check_call(
+            [
+                ffx_path,
+                "config",
+                "analytics",
+                "disable",
+            ],
+            env=ffx_env,
+            stdout=self.subprocess_output(),
+            stderr=self.subprocess_output(),
+        )
+
+        # Set configs
+        configs = {
+            "log.enabled": "true",
+            "test.is_isolated": "true",
+            "test.experimental_structured_output": "true",
+        }
+        for key, value in configs.items():
+            subprocess.check_call(
+                [
+                    ffx_path,
+                    "config",
+                    "set",
+                    key,
+                    value,
+                ],
+                env=ffx_env,
+                stdout=self.subprocess_output(),
+                stderr=self.subprocess_output(),
+            )
+
     def ffx_cmd_env(self):
-        result = {
-            "HOME": self.ffx_home_dir(),
-            "XDG_CONFIG_HOME": self.ffx_xdg_config_home(),
-            "ASCENDD": self.ffx_ascendd_path(),
-            "FUCHSIA_SSH_KEY": self.ssh_keyfile_path(),
+        return {
+            "HOME": self.home_dir(),
+            "FFX_ISOLATE_DIR": self.ffx_isolate_dir(),
             # We want to use our own specified temp directory
             "TMP": self.tmp_dir(),
             "TEMP": self.tmp_dir(),
@@ -281,16 +222,13 @@ class TestEnvironment:
             "TEMPDIR": self.tmp_dir(),
         }
 
-        return result
-
     def stop_ffx_isolation(self):
         subprocess.check_call(
             [
                 self.tool_path("ffx"),
-                "--config",
-                self.ffx_user_config_path(),
                 "daemon",
                 "stop",
+                "-w",
             ],
             env=self.ffx_cmd_env(),
             stdout=self.subprocess_output(),
@@ -318,86 +256,61 @@ class TestEnvironment:
         elif len(os.listdir(self.tmp_dir())) != 0:
             raise Exception(f"Temp directory is not clean (in {self.tmp_dir()})")
 
-        os.mkdir(self.ssh_dir())
         os.mkdir(self.output_dir())
 
-        # Find libstd and libtest
-        libstd_paths = glob.glob(os.path.join(self.rustlibs_dir(), "libstd-*.so"))
-        libtest_paths = glob.glob(os.path.join(self.rustlibs_dir(), "libtest-*.so"))
-
-        if not libstd_paths:
-            raise Exception(f"Failed to locate libstd (in {self.rustlibs_dir()})")
-
-        if not libtest_paths:
-            raise Exception(f"Failed to locate libtest (in {self.rustlibs_dir()})")
-
-        self.libstd_name = os.path.basename(libstd_paths[0])
-        self.libtest_name = os.path.basename(libtest_paths[0])
-
-        # Generate SSH keys for the emulator to use
-        self.log_info("Generating SSH keys...")
-        subprocess.check_call(
-            [
-                "ssh-keygen",
-                "-N",
-                "",
-                "-t",
-                "ed25519",
-                "-f",
-                self.ssh_keyfile_path(),
-                "-C",
-                "Generated by fuchsia-test-runner.py",
-            ],
-            stdout=self.subprocess_output(),
-            stderr=self.subprocess_output(),
-        )
-        authfile_contents = subprocess.check_output(
-            [
-                "ssh-keygen",
-                "-y",
-                "-f",
-                self.ssh_keyfile_path(),
-            ],
-            stderr=self.subprocess_output(),
-        )
-        with open(self.ssh_authfile_path(), "wb") as authfile:
-            authfile.write(authfile_contents)
+        ffx_path = self.tool_path("ffx")
+        ffx_env = self.ffx_cmd_env()
 
         # Start ffx isolation
         self.log_info("Starting ffx isolation...")
         self.start_ffx_isolation()
 
-        # Start emulator (this will generate the vdl output)
-        self.log_info("Starting emulator...")
+        # Stop any running emulators (there shouldn't be any)
         subprocess.check_call(
             [
-                self.tool_path("fvdl"),
-                "--sdk",
-                "start",
-                "--tuntap",
-                "--headless",
-                "--nointeractive",
-                "--ssh",
-                self.ssh_dir(),
-                "--vdl-output",
-                self.vdl_output_path(),
-                "--emulator-log",
-                self.emulator_log_path(),
-                "--image-name",
-                self.image_name(),
+                ffx_path,
+                "emu",
+                "stop",
+                "--all",
             ],
+            env=ffx_env,
             stdout=self.subprocess_output(),
             stderr=self.subprocess_output(),
         )
 
-        # Parse vdl output for relevant information
-        with open(self.vdl_output_path(), encoding="utf-8") as f:
-            vdl_content = f.read()
-            matches = re.search(
-                r'network_address:\s+"\[([0-9a-f]{1,4}:(:[0-9a-f]{1,4}){4}%qemu)\]"',
-                vdl_content,
-            )
-            self.emu_addr = matches.group(1)
+        # Start emulator
+        self.log_info("Starting emulator...")
+        product_bundle = "terminal.qemu-" + self.triple_to_arch(self.target)
+        subprocess.check_call(
+            [
+                ffx_path,
+                "product-bundle",
+                "get",
+                product_bundle,
+            ],
+            env=ffx_env,
+            stdout=self.subprocess_output(),
+            stderr=self.subprocess_output(),
+        )
+        # FIXME: condition --accel hyper on target arch matching host arch
+        subprocess.check_call(
+            [
+                ffx_path,
+                "emu",
+                "start",
+                product_bundle,
+                "--headless",
+                "--log",
+                self.emulator_log_path(),
+                "--net",
+                "tap",
+                "--accel",
+                "hyper",
+            ],
+            env=ffx_env,
+            stdout=self.subprocess_output(),
+            stderr=self.subprocess_output(),
+        )
 
         # Create new package repo
         self.log_info("Creating package repo...")
@@ -412,58 +325,46 @@ class TestEnvironment:
             stderr=self.subprocess_output(),
         )
 
-        # Start package server
-        self.log_info("Starting package server...")
-        with open(
-            self.package_server_log_path(), "w", encoding="utf-8"
-        ) as package_server_log:
-            # We want this to be a long-running process that persists after the script finishes
-            # pylint: disable=consider-using-with
-            self.package_server_pid = subprocess.Popen(
-                [
-                    self.tool_path("pm"),
-                    "serve",
-                    "-vt",
-                    "-repo",
-                    self.repo_dir(),
-                    "-l",
-                    ":8084",
-                ],
-                stdout=package_server_log,
-                stderr=package_server_log,
-            ).pid
-
-        # Register package server with emulator
-        self.log_info("Registering package server...")
-        ssh_client = subprocess.check_output(
-            [
-                "ssh",
-                "-i",
-                self.ssh_keyfile_path(),
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                self.emu_addr,
-                "-f",
-                "echo $SSH_CLIENT",
-            ],
-            text=True,
-        )
-        repo_addr = ssh_client.split()[0].replace("%", "%25")
-        repo_url = f"http://[{repo_addr}]:8084/config.json"
+        # Add repo
         subprocess.check_call(
             [
-                "ssh",
-                "-i",
-                self.ssh_keyfile_path(),
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                self.emu_addr,
-                "-f",
-                f"pkgctl repo add url -f 1 -n {self.TEST_REPO_NAME} {repo_url}",
+                ffx_path,
+                "repository",
+                "add-from-pm",
+                self.repo_dir(),
+                "--repository",
+                self.TEST_REPO_NAME,
             ],
+            env=ffx_env,
             stdout=self.subprocess_output(),
             stderr=self.subprocess_output(),
         )
+
+        # Start repository server
+        subprocess.check_call(
+            [ffx_path, "repository", "server", "start", "--address", "[::]:0"],
+            env=ffx_env,
+            stdout=self.subprocess_output(),
+            stderr=self.subprocess_output(),
+        )
+
+        # Register with newly-started emulator
+        subprocess.check_call(
+            [
+                ffx_path,
+                "target",
+                "repository",
+                "register",
+                "--repository",
+                self.TEST_REPO_NAME,
+            ],
+            env=ffx_env,
+            stdout=self.subprocess_output(),
+            stderr=self.subprocess_output(),
+        )
+
+        # Create lockfiles
+        open(self.pm_lockfile_path(), "a").close()
 
         # Write to file
         self.write_to_file()
@@ -497,6 +398,7 @@ class TestEnvironment:
         ],
         use: [
             {{ storage: "data", path: "/data" }},
+            {{ storage: "tmp", path: "/tmp" }},
             {{ protocol: [ "fuchsia.process.Launcher" ] }},
             {{ protocol: [ "fuchsia.posix.socket.Provider" ] }}
         ],
@@ -510,11 +412,10 @@ class TestEnvironment:
     meta/package={package_dir}/meta/package
     meta/{package_name}.cm={package_dir}/meta/{package_name}.cm
     bin/{exe_name}={bin_path}
-    lib/{libstd_name}={rust_dir}/lib/rustlib/{rustlib_dir}/lib/{libstd_name}
-    lib/{libtest_name}={rust_dir}/lib/rustlib/{rustlib_dir}/lib/{libtest_name}
-    lib/ld.so.1={sdk_dir}/arch/{target_arch}/sysroot/lib/libc.so
-    lib/libzircon.so={sdk_dir}/arch/{target_arch}/sysroot/lib/libzircon.so
-    lib/libfdio.so={sdk_dir}/arch/{target_arch}/lib/libfdio.so
+    lib/{libstd_name}={libstd_path}
+    lib/{libtest_name}={libtest_path}
+    lib/ld.so.1={sdk_dir}/arch/{target_arch}/sysroot/dist/lib/ld.so.1
+    lib/libfdio.so={sdk_dir}/arch/{target_arch}/dist/libfdio.so
     """
 
     TEST_ENV_VARS: ClassVar[List[str]] = [
@@ -541,6 +442,16 @@ class TestEnvironment:
         """
 
         bin_path = os.path.abspath(args.bin_path)
+
+        # Find libstd and libtest
+        libstd_paths = glob.glob(os.path.join(self.rustlibs_dir(), "libstd-*.so"))
+        libtest_paths = glob.glob(os.path.join(self.rustlibs_dir(), "libtest-*.so"))
+
+        if not libstd_paths:
+            raise Exception(f"Failed to locate libstd (in {self.rustlibs_dir()})")
+
+        if not libtest_paths:
+            raise Exception(f"Failed to locate libtest (in {self.rustlibs_dir()})")
 
         # Build a unique, deterministic name for the test using the name of the
         # binary and the last 6 hex digits of the hash of the full path
@@ -608,8 +519,11 @@ class TestEnvironment:
                         env_vars += f'\n            "{var_name}={var_value}",'
 
                 # Default to no backtrace for test suite
-                if os.getenv("RUST_BACKTRACE") == None:
-                    env_vars += f'\n            "RUST_BACKTRACE=0",'
+                if os.getenv("RUST_BACKTRACE") is None:
+                    env_vars += '\n            "RUST_BACKTRACE=0",'
+
+                # Use /tmp as the test temporary directory
+                env_vars += f'\n            "RUST_TEST_TMPDIR=/tmp",'
 
                 cml.write(
                     self.CML_TEMPLATE.format(env_vars=env_vars, exe_name=exe_name)
@@ -641,12 +555,13 @@ class TestEnvironment:
                         exe_name=exe_name,
                         package_dir=package_dir,
                         package_name=package_name,
-                        rust_dir=self.rust_dir,
-                        rustlib_dir=self.rustlib_dir(),
+                        target=self.target,
                         sdk_dir=self.sdk_dir,
-                        libstd_name=self.libstd_name,
-                        libtest_name=self.libtest_name,
-                        target_arch=self.target_arch,
+                        libstd_name=os.path.basename(libstd_paths[0]),
+                        libtest_name=os.path.basename(libtest_paths[0]),
+                        libstd_path=libstd_paths[0],
+                        libtest_path=libtest_paths[0],
+                        target_arch=self.triple_to_arch(self.target),
                     )
                 )
                 for shared_lib in shared_libs:
@@ -682,19 +597,25 @@ class TestEnvironment:
             log("Publishing package to repo...")
 
             # Publish package to repo
-            subprocess.check_call(
-                [
-                    self.tool_path("pm"),
-                    "publish",
-                    "-a",
-                    "-repo",
-                    self.repo_dir(),
-                    "-f",
-                    far_path,
-                ],
-                stdout=log_file,
-                stderr=log_file,
-            )
+            with open(self.pm_lockfile_path(), "w") as pm_lockfile:
+                fcntl.lockf(pm_lockfile.fileno(), fcntl.LOCK_EX)
+                subprocess.check_call(
+                    [
+                        self.tool_path("pm"),
+                        "publish",
+                        "-a",
+                        "-repo",
+                        self.repo_dir(),
+                        "-f",
+                        far_path,
+                    ],
+                    stdout=log_file,
+                    stderr=log_file,
+                )
+                # This lock should be released automatically when the pm
+                # lockfile is closed, but we'll be polite and unlock it now
+                # since the spec leaves some wiggle room.
+                fcntl.lockf(pm_lockfile.fileno(), fcntl.LOCK_UN)
 
             log("Running ffx test...")
 
@@ -702,8 +623,6 @@ class TestEnvironment:
             subprocess.run(
                 [
                     self.tool_path("ffx"),
-                    "--config",
-                    self.ffx_user_config_path(),
                     "test",
                     "run",
                     f"fuchsia-pkg://{self.TEST_REPO_NAME}/{package_name}#meta/{package_name}.cm",
@@ -812,20 +731,15 @@ class TestEnvironment:
         else:
             self.log_debug("No ffx daemon log found")
 
-        # Stop package server
-        self.log_info("Stopping package server...")
-        os.kill(self.package_server_pid, signal.SIGTERM)
-
         # Shut down the emulator
         self.log_info("Stopping emulator...")
         subprocess.check_call(
             [
-                self.tool_path("fvdl"),
-                "--sdk",
-                "kill",
-                "--launched-proto",
-                self.vdl_output_path(),
+                self.tool_path("ffx"),
+                "emu",
+                "stop",
             ],
+            env=self.ffx_cmd_env(),
             stdout=self.subprocess_output(),
             stderr=self.subprocess_output(),
         )
@@ -842,30 +756,39 @@ class TestEnvironment:
     def debug(self, args):
         command = [
             self.tool_path("ffx"),
-            "--config",
-            self.ffx_user_config_path(),
             "debug",
             "connect",
             "--",
             "--build-id-dir",
             os.path.join(self.sdk_dir, ".build-id"),
-            "--build-id-dir",
-            os.path.join(self.libs_dir(), ".build-id"),
         ]
 
-        # Add rust source if it's available
-        if args.rust_src is not None:
+        libs_build_id_path = os.path.join(self.libs_dir(), ".build-id")
+        if os.path.exists(libs_build_id_path):
+            # Add .build-id symbols if installed libs have been stripped into a
+            # .build-id directory
             command += [
-                "--build-dir",
-                args.rust_src,
+                "--build-id-dir",
+                libs_build_id_path,
+            ]
+        else:
+            # If no .build-id directory is detected, then assume that the shared
+            # libs contain their debug symbols
+            command += [
+                f"--symbol-path={self.rust_dir}/lib/rustlib/{self.target}/lib",
             ]
 
+        # Add rust source if it's available
+        rust_src_map = None
+        if args.rust_src is not None:
+            # This matches the remapped prefix used by compiletest. There's no
+            # clear way that we can determine this, so it's hard coded.
+            rust_src_map = f"/rustc/FAKE_PREFIX={args.rust_src}"
+
         # Add fuchsia source if it's available
+        fuchsia_src_map = None
         if args.fuchsia_src is not None:
-            command += [
-                "--build-dir",
-                os.path.join(args.fuchsia_src, "out", "default"),
-            ]
+            fuchsia_src_map = f"./../..={args.fuchsia_src}"
 
         # Load debug symbols for the test binary and automatically attach
         if args.test is not None:
@@ -888,7 +811,28 @@ class TestEnvironment:
                 test_name,
             )
 
+            # The fake-test-src-base directory maps to the suite directory
+            # e.g. tests/ui/foo.rs has a path of rust/fake-test-src-base/foo.rs
+            fake_test_src_base = os.path.join(
+                args.rust_src,
+                "fake-test-src-base",
+            )
+            real_test_src_base = os.path.join(
+                args.rust_src,
+                "tests",
+                args.test.split(os.path.sep)[0],
+            )
+            test_src_map = f"{fake_test_src_base}={real_test_src_base}"
+
             with open(self.zxdb_script_path(), mode="w", encoding="utf-8") as f:
+                print(f"set source-map += {test_src_map}", file=f)
+
+                if rust_src_map is not None:
+                    print(f"set source-map += {rust_src_map}", file=f)
+
+                if fuchsia_src_map is not None:
+                    print(f"set source-map += {fuchsia_src_map}", file=f)
+
                 print(f"attach {test_name[:31]}", file=f)
 
             command += [
@@ -904,6 +848,18 @@ class TestEnvironment:
 
         # Connect to the running emulator with zxdb
         subprocess.run(command, env=self.ffx_cmd_env(), check=False)
+
+    def syslog(self, args):
+        subprocess.run(
+            [
+                self.tool_path("ffx"),
+                "log",
+                "--since",
+                "now",
+            ],
+            env=self.ffx_cmd_env(),
+            check=False,
+        )
 
 
 def start(args):
@@ -938,6 +894,12 @@ def debug(args):
     return 0
 
 
+def syslog(args):
+    test_env = TestEnvironment.read_from_file()
+    test_env.syslog(args)
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -954,8 +916,8 @@ def main():
         "start", help="initializes the testing environment"
     )
     start_parser.add_argument(
-        "--rust",
-        help="the directory of the installed Rust compiler for Fuchsia",
+        "--rust-build",
+        help="the current compiler build directory (`$RUST_SRC/build` by default)",
         required=True,
     )
     start_parser.add_argument(
@@ -969,8 +931,8 @@ def main():
         action="store_true",
     )
     start_parser.add_argument(
-        "--target-arch",
-        help="the architecture of the image to test",
+        "--target",
+        help="the target platform to test",
         required=True,
     )
     start_parser.set_defaults(func=start)
@@ -1032,6 +994,9 @@ def main():
         help="any additional arguments to pass to zxdb",
     )
     debug_parser.set_defaults(func=debug)
+
+    syslog_parser = subparsers.add_parser("syslog", help="prints the device syslog")
+    syslog_parser.set_defaults(func=syslog)
 
     args = parser.parse_args()
     return args.func(args)

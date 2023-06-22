@@ -6,11 +6,12 @@ use clippy_utils::{fn_has_unsatisfiable_preds, is_entrypoint_fn, is_from_proc_ma
 use rustc_hir as hir;
 use rustc_hir::def_id::CRATE_DEF_ID;
 use rustc_hir::intravisit::FnKind;
-use rustc_hir::{Body, Constness, FnDecl, GenericParamKind, HirId};
+use rustc_hir::{Body, Constness, FnDecl, GenericParamKind};
 use rustc_hir_analysis::hir_ty_to_ty;
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::lint::in_external_macro;
 use rustc_session::{declare_tool_lint, impl_lint_pass};
+use rustc_span::def_id::LocalDefId;
 use rustc_span::Span;
 
 declare_clippy_lint! {
@@ -40,6 +41,7 @@ declare_clippy_lint! {
     /// can't be const as it calls a non-const function. Making `a` const and running Clippy again,
     /// will suggest to make `b` const, too.
     ///
+    /// If you are marking a public function with `const`, removing it again will break API compatibility.
     /// ### Example
     /// ```rust
     /// # struct Foo {
@@ -91,13 +93,11 @@ impl<'tcx> LateLintPass<'tcx> for MissingConstForFn {
         _: &FnDecl<'_>,
         body: &Body<'tcx>,
         span: Span,
-        hir_id: HirId,
+        def_id: LocalDefId,
     ) {
         if !self.msrv.meets(msrvs::CONST_IF_MATCH) {
             return;
         }
-
-        let def_id = cx.tcx.hir().local_def_id(hir_id);
 
         if in_external_macro(cx.tcx.sess, span) || is_entrypoint_fn(cx, def_id.to_def_id()) {
             return;
@@ -132,6 +132,8 @@ impl<'tcx> LateLintPass<'tcx> for MissingConstForFn {
             FnKind::Closure => return,
         }
 
+        let hir_id = cx.tcx.hir().local_def_id_to_hir_id(def_id);
+
         // Const fns are not allowed as methods in a trait.
         {
             let parent = cx.tcx.hir().get_parent_item(hir_id).def_id;
@@ -152,7 +154,7 @@ impl<'tcx> LateLintPass<'tcx> for MissingConstForFn {
 
         if let Err((span, err)) = is_min_const_fn(cx.tcx, mir, &self.msrv) {
             if cx.tcx.is_const_fn_raw(def_id.to_def_id()) {
-                cx.tcx.sess.span_err(span, err.as_ref());
+                cx.tcx.sess.span_err(span, err);
             }
         } else {
             span_lint(cx, MISSING_CONST_FOR_FN, span, "this could be a `const fn`");

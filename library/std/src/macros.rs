@@ -3,6 +3,7 @@
 //! This module contains a set of macros which are exported from the standard
 //! library. Each macro is available for use when linking against the standard
 //! library.
+// ignore-tidy-dbg
 
 #[doc = include_str!("../../core/src/macros/panic.md")]
 #[macro_export]
@@ -153,7 +154,7 @@ macro_rules! println {
 ///
 /// Panics if writing to `io::stderr` fails.
 ///
-/// Writing to non-blocking stdout can cause an error, which will lead
+/// Writing to non-blocking stderr can cause an error, which will lead
 /// this macro to panic.
 ///
 /// # Examples
@@ -188,7 +189,7 @@ macro_rules! eprint {
 ///
 /// Panics if writing to `io::stderr` fails.
 ///
-/// Writing to non-blocking stdout can cause an error, which will lead
+/// Writing to non-blocking stderr can cause an error, which will lead
 /// this macro to panic.
 ///
 /// # Examples

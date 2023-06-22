@@ -2,9 +2,13 @@
 
 use crate::ast::{self, LitKind, MetaItemLit, StrStyle};
 use crate::token::{self, Token};
-use rustc_lexer::unescape::{byte_from_char, unescape_byte, unescape_char, unescape_literal, Mode};
+use rustc_lexer::unescape::{
+    byte_from_char, unescape_byte, unescape_c_string, unescape_char, unescape_literal, CStrUnit,
+    Mode,
+};
 use rustc_span::symbol::{kw, sym, Symbol};
 use rustc_span::Span;
+use std::ops::Range;
 use std::{ascii, fmt, str};
 
 // Escapes a string, represented as a symbol. Reuses the original symbol,
@@ -34,7 +38,8 @@ pub enum LitError {
     InvalidIntSuffix,
     InvalidFloatSuffix,
     NonDecimalFloat(u32),
-    IntTooLarge,
+    IntTooLarge(u32),
+    NulInCStr(Range<usize>),
 }
 
 impl LitKind {
@@ -158,6 +163,52 @@ impl LitKind {
 
                 LitKind::ByteStr(bytes.into(), StrStyle::Raw(n))
             }
+            token::CStr => {
+                let s = symbol.as_str();
+                let mut buf = Vec::with_capacity(s.len());
+                let mut error = Ok(());
+                unescape_c_string(s, Mode::CStr, &mut |span, c| match c {
+                    Ok(CStrUnit::Byte(0) | CStrUnit::Char('\0')) => {
+                        error = Err(LitError::NulInCStr(span));
+                    }
+                    Ok(CStrUnit::Byte(b)) => buf.push(b),
+                    Ok(CStrUnit::Char(c)) if c.len_utf8() == 1 => buf.push(c as u8),
+                    Ok(CStrUnit::Char(c)) => {
+                        buf.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes())
+                    }
+                    Err(err) => {
+                        if err.is_fatal() {
+                            error = Err(LitError::LexerError);
+                        }
+                    }
+                });
+                error?;
+                buf.push(0);
+                LitKind::CStr(buf.into(), StrStyle::Cooked)
+            }
+            token::CStrRaw(n) => {
+                let s = symbol.as_str();
+                let mut buf = Vec::with_capacity(s.len());
+                let mut error = Ok(());
+                unescape_c_string(s, Mode::RawCStr, &mut |span, c| match c {
+                    Ok(CStrUnit::Byte(0) | CStrUnit::Char('\0')) => {
+                        error = Err(LitError::NulInCStr(span));
+                    }
+                    Ok(CStrUnit::Byte(b)) => buf.push(b),
+                    Ok(CStrUnit::Char(c)) if c.len_utf8() == 1 => buf.push(c as u8),
+                    Ok(CStrUnit::Char(c)) => {
+                        buf.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes())
+                    }
+                    Err(err) => {
+                        if err.is_fatal() {
+                            error = Err(LitError::LexerError);
+                        }
+                    }
+                });
+                error?;
+                buf.push(0);
+                LitKind::CStr(buf.into(), StrStyle::Raw(n))
+            }
             token::Err => LitKind::Err,
         })
     }
@@ -168,7 +219,7 @@ impl fmt::Display for LitKind {
         match *self {
             LitKind::Byte(b) => {
                 let b: String = ascii::escape_default(b).map(Into::<char>::into).collect();
-                write!(f, "b'{}'", b)?;
+                write!(f, "b'{b}'")?;
             }
             LitKind::Char(ch) => write!(f, "'{}'", escape_char_symbol(ch))?,
             LitKind::Str(sym, StrStyle::Cooked) => write!(f, "\"{}\"", escape_string_symbol(sym))?,
@@ -191,8 +242,16 @@ impl fmt::Display for LitKind {
                     string = symbol
                 )?;
             }
+            LitKind::CStr(ref bytes, StrStyle::Cooked) => {
+                write!(f, "c\"{}\"", escape_byte_str_symbol(bytes))?
+            }
+            LitKind::CStr(ref bytes, StrStyle::Raw(n)) => {
+                // This can only be valid UTF-8.
+                let symbol = str::from_utf8(bytes).unwrap();
+                write!(f, "cr{delim}\"{symbol}\"{delim}", delim = "#".repeat(n as usize),)?;
+            }
             LitKind::Int(n, ty) => {
-                write!(f, "{}", n)?;
+                write!(f, "{n}")?;
                 match ty {
                     ast::LitIntType::Unsigned(ty) => write!(f, "{}", ty.name())?,
                     ast::LitIntType::Signed(ty) => write!(f, "{}", ty.name())?,
@@ -200,7 +259,7 @@ impl fmt::Display for LitKind {
                 }
             }
             LitKind::Float(symbol, ty) => {
-                write!(f, "{}", symbol)?;
+                write!(f, "{symbol}")?;
                 match ty {
                     ast::LitFloatType::Suffixed(ty) => write!(f, "{}", ty.name())?,
                     ast::LitFloatType::Unsuffixed => {}
@@ -237,6 +296,8 @@ impl MetaItemLit {
             LitKind::Str(_, ast::StrStyle::Raw(n)) => token::StrRaw(n),
             LitKind::ByteStr(_, ast::StrStyle::Cooked) => token::ByteStr,
             LitKind::ByteStr(_, ast::StrStyle::Raw(n)) => token::ByteStrRaw(n),
+            LitKind::CStr(_, ast::StrStyle::Cooked) => token::CStr,
+            LitKind::CStr(_, ast::StrStyle::Raw(n)) => token::CStrRaw(n),
             LitKind::Byte(_) => token::Byte,
             LitKind::Char(_) => token::Char,
             LitKind::Int(..) => token::Integer,
@@ -331,8 +392,7 @@ fn integer_lit(symbol: Symbol, suffix: Option<Symbol>) -> Result<LitKind, LitErr
         // Small bases are lexed as if they were base 10, e.g, the string
         // might be `0b10201`. This will cause the conversion above to fail,
         // but these kinds of errors are already reported by the lexer.
-        let from_lexer =
-            base < 10 && s.chars().any(|c| c.to_digit(10).map_or(false, |d| d >= base));
-        if from_lexer { LitError::LexerError } else { LitError::IntTooLarge }
+        let from_lexer = base < 10 && s.chars().any(|c| c.to_digit(10).is_some_and(|d| d >= base));
+        if from_lexer { LitError::LexerError } else { LitError::IntTooLarge(base) }
     })
 }

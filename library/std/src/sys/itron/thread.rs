@@ -247,7 +247,7 @@ impl Thread {
                 // [FINISHED → JOINED]
                 // To synchronize with the child task's memory accesses to
                 // `inner` up to the point of the assignment of `FINISHED`,
-                // `Ordering::Acquire` must be used for the above `swap` call`.
+                // `Ordering::Acquire` must be used for the above `swap` call.
             }
             _ => unsafe { hint::unreachable_unchecked() },
         }
@@ -294,7 +294,7 @@ impl Drop for Thread {
                 // Terminate and delete the task
                 // Safety: `self.task` still represents a task we own (because
                 //         this method or `join_inner` is called only once for
-                //         each `Thread`). The task  indicated that it's safe to
+                //         each `Thread`). The task indicated that it's safe to
                 //         delete by entering the `FINISHED` state.
                 unsafe { terminate_and_delete_task(self.task) };
 

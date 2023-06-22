@@ -43,7 +43,7 @@ pub fn parameters_for_impl<'tcx>(
 /// of parameters whose values are needed in order to constrain `ty` - these
 /// differ, with the latter being a superset, in the presence of projections.
 pub fn parameters_for<'tcx>(
-    t: &impl TypeVisitable<'tcx>,
+    t: &impl TypeVisitable<TyCtxt<'tcx>>,
     include_nonconstraining: bool,
 ) -> Vec<Parameter> {
     let mut collector = ParameterCollector { parameters: vec![], include_nonconstraining };
@@ -56,12 +56,12 @@ struct ParameterCollector {
     include_nonconstraining: bool,
 }
 
-impl<'tcx> TypeVisitor<'tcx> for ParameterCollector {
+impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for ParameterCollector {
     fn visit_ty(&mut self, t: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
         match *t.kind() {
-            ty::Alias(ty::Projection, ..) if !self.include_nonconstraining => {
+            ty::Alias(ty::Projection | ty::Inherent, ..) if !self.include_nonconstraining => {
                 // projections are not injective
-                return ControlFlow::CONTINUE;
+                return ControlFlow::Continue(());
             }
             ty::Param(data) => {
                 self.parameters.push(Parameter::from(data));
@@ -76,7 +76,7 @@ impl<'tcx> TypeVisitor<'tcx> for ParameterCollector {
         if let ty::ReEarlyBound(data) = *r {
             self.parameters.push(Parameter::from(data));
         }
-        ControlFlow::CONTINUE
+        ControlFlow::Continue(())
     }
 
     fn visit_const(&mut self, c: ty::Const<'tcx>) -> ControlFlow<Self::BreakTy> {
@@ -187,7 +187,7 @@ pub fn setup_constraining_predicates<'tcx>(
         for j in i..predicates.len() {
             // Note that we don't have to care about binders here,
             // as the impl trait ref never contains any late-bound regions.
-            if let ty::PredicateKind::Clause(ty::Clause::Projection(projection)) =
+            if let ty::PredicateKind::Clause(ty::ClauseKind::Projection(projection)) =
                 predicates[j].0.kind().skip_binder()
             {
                 // Special case: watch out for some kind of sneaky attempt

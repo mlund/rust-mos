@@ -340,9 +340,9 @@ pub macro debug_assert_matches($($arg:tt)*) {
 #[stable(feature = "matches_macro", since = "1.42.0")]
 #[cfg_attr(not(test), rustc_diagnostic_item = "matches_macro")]
 macro_rules! matches {
-    ($expression:expr, $(|)? $( $pattern:pat_param )|+ $( if $guard: expr )? $(,)?) => {
+    ($expression:expr, $pattern:pat $(if $guard:expr)? $(,)?) => {
         match $expression {
-            $( $pattern )|+ $( if $guard )? => true,
+            $pattern $(if $guard)? => true,
             _ => false
         }
     };
@@ -498,7 +498,6 @@ macro_rules! r#try {
 /// In a `no_std` setup you are responsible for the implementation details of the components.
 ///
 /// ```no_run
-/// # extern crate core;
 /// use core::fmt::Write;
 ///
 /// struct Example;
@@ -712,8 +711,8 @@ macro_rules! unimplemented {
 
 /// Indicates unfinished code.
 ///
-/// This can be useful if you are prototyping and are just looking to have your
-/// code typecheck.
+/// This can be useful if you are prototyping and just
+/// want a placeholder to let your code pass type analysis.
 ///
 /// The difference between [`unimplemented!`] and `todo!` is that while `todo!` conveys
 /// an intent of implementing the functionality later and the message is "not yet
@@ -961,6 +960,8 @@ pub(crate) mod builtin {
     ///
     /// A compile time error is never emitted when using this macro regardless
     /// of whether the environment variable is present or not.
+    /// To emit a compile error if the environment variable is not present,
+    /// use the [`env!`] macro instead.
     ///
     /// # Examples
     ///
@@ -1315,22 +1316,41 @@ pub(crate) mod builtin {
 
     /// Parses a file as an expression or an item according to the context.
     ///
-    /// The file is located relative to the current file (similarly to how
-    /// modules are found). The provided path is interpreted in a platform-specific
-    /// way at compile time. So, for instance, an invocation with a Windows path
-    /// containing backslashes `\` would not compile correctly on Unix.
+    /// **Warning**: For multi-file Rust projects, the `include!` macro is probably not what you
+    /// are looking for. Usually, multi-file Rust projects use
+    /// [modules](https://doc.rust-lang.org/reference/items/modules.html). Multi-file projects and
+    /// modules are explained in the Rust-by-Example book
+    /// [here](https://doc.rust-lang.org/rust-by-example/mod/split.html) and the module system is
+    /// explained in the Rust Book
+    /// [here](https://doc.rust-lang.org/book/ch07-02-defining-modules-to-control-scope-and-privacy.html).
     ///
-    /// Using this macro is often a bad idea, because if the file is
-    /// parsed as an expression, it is going to be placed in the
-    /// surrounding code unhygienically. This could result in variables
-    /// or functions being different from what the file expected if
-    /// there are variables or functions that have the same name in
-    /// the current file.
+    /// The included file is placed in the surrounding code
+    /// [unhygienically](https://doc.rust-lang.org/reference/macros-by-example.html#hygiene). If
+    /// the included file is parsed as an expression and variables or functions share names across
+    /// both files, it could result in variables or functions being different from what the
+    /// included file expected.
+    ///
+    /// The included file is located relative to the current file (similarly to how modules are
+    /// found). The provided path is interpreted in a platform-specific way at compile time. So,
+    /// for instance, an invocation with a Windows path containing backslashes `\` would not
+    /// compile correctly on Unix.
+    ///
+    /// # Uses
+    ///
+    /// The `include!` macro is primarily used for two purposes. It is used to include
+    /// documentation that is written in a separate file and it is used to include [build artifacts
+    /// usually as a result from the `build.rs`
+    /// script](https://doc.rust-lang.org/cargo/reference/build-scripts.html#outputs-of-the-build-script).
+    ///
+    /// When using the `include` macro to include stretches of documentation, remember that the
+    /// included file still needs to be a valid rust syntax. It is also possible to
+    /// use the [`include_str`] macro as `#![doc = include_str!("...")]` (at the module level) or
+    /// `#[doc = include_str!("...")]` (at the item level) to include documentation from a plain
+    /// text or markdown file.
     ///
     /// # Examples
     ///
-    /// Assume there are two files in the same directory with the following
-    /// contents:
+    /// Assume there are two files in the same directory with the following contents:
     ///
     /// File 'monkeys.in':
     ///
@@ -1409,7 +1429,7 @@ pub(crate) mod builtin {
     #[rustc_builtin_macro]
     #[macro_export]
     #[rustc_diagnostic_item = "assert_macro"]
-    #[allow_internal_unstable(core_panic, edition_panic)]
+    #[allow_internal_unstable(core_panic, edition_panic, generic_assert_internals)]
     macro_rules! assert {
         ($cond:expr $(,)?) => {{ /* compiler built-in */ }};
         ($cond:expr, $($arg:tt)+) => {{ /* compiler built-in */ }};

@@ -2,7 +2,10 @@ use crate::cell::UnsafeCell;
 use crate::ptr;
 use crate::sync::atomic::{AtomicPtr, Ordering::Relaxed};
 use crate::sys::locks::{pthread_mutex, Mutex};
+#[cfg(not(target_os = "nto"))]
 use crate::sys::time::TIMESPEC_MAX;
+#[cfg(target_os = "nto")]
+use crate::sys::time::TIMESPEC_MAX_CAPPED;
 use crate::sys_common::lazy_box::{LazyBox, LazyInit};
 use crate::time::Duration;
 
@@ -29,6 +32,7 @@ impl LazyInit for AllocatedCondvar {
             if #[cfg(any(
                 target_os = "macos",
                 target_os = "ios",
+                target_os = "tvos",
                 target_os = "watchos",
                 target_os = "l4re",
                 target_os = "android",
@@ -121,6 +125,7 @@ impl Condvar {
     #[cfg(not(any(
         target_os = "macos",
         target_os = "ios",
+        target_os = "tvos",
         target_os = "watchos",
         target_os = "android",
         target_os = "espidf",
@@ -132,10 +137,18 @@ impl Condvar {
         let mutex = pthread_mutex::raw(mutex);
         self.verify(mutex);
 
+        #[cfg(not(target_os = "nto"))]
         let timeout = Timespec::now(libc::CLOCK_MONOTONIC)
             .checked_add_duration(&dur)
             .and_then(|t| t.to_timespec())
             .unwrap_or(TIMESPEC_MAX);
+
+        #[cfg(target_os = "nto")]
+        let timeout = Timespec::now(libc::CLOCK_MONOTONIC)
+            .checked_add_duration(&dur)
+            .and_then(|t| t.to_timespec_capped())
+            .unwrap_or(TIMESPEC_MAX_CAPPED);
+
         let r = libc::pthread_cond_timedwait(raw(self), mutex, &timeout);
         assert!(r == libc::ETIMEDOUT || r == 0);
         r == 0
@@ -147,6 +160,7 @@ impl Condvar {
     #[cfg(any(
         target_os = "macos",
         target_os = "ios",
+        target_os = "tvos",
         target_os = "watchos",
         target_os = "android",
         target_os = "espidf",

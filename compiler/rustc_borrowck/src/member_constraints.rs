@@ -1,8 +1,8 @@
 #![deny(rustc::untranslatable_diagnostic)]
 #![deny(rustc::diagnostic_outside_of_impl)]
 use rustc_data_structures::captures::Captures;
-use rustc_data_structures::fx::FxHashMap;
-use rustc_index::vec::IndexVec;
+use rustc_data_structures::fx::FxIndexMap;
+use rustc_index::{IndexSlice, IndexVec};
 use rustc_middle::infer::MemberConstraint;
 use rustc_middle::ty::{self, Ty};
 use rustc_span::Span;
@@ -18,7 +18,7 @@ where
 {
     /// Stores the first "member" constraint for a given `R0`. This is an
     /// index into the `constraints` vector below.
-    first_constraints: FxHashMap<R, NllMemberConstraintIndex>,
+    first_constraints: FxIndexMap<R, NllMemberConstraintIndex>,
 
     /// Stores the data about each `R0 member of [R1..Rn]` constraint.
     /// These are organized into a linked list, so each constraint
@@ -109,7 +109,7 @@ where
     R1: Copy + Hash + Eq,
 {
     /// Remap the "member region" key using `map_fn`, producing a new
-    /// member constraint set.  This is used in the NLL code to map from
+    /// member constraint set. This is used in the NLL code to map from
     /// the original `RegionVid` to an scc index. In some cases, we
     /// may have multiple `R1` values mapping to the same `R2` key -- that
     /// is ok, the two sets will be merged.
@@ -132,7 +132,7 @@ where
 
         let MemberConstraintSet { first_constraints, mut constraints, choice_regions } = self;
 
-        let mut first_constraints2 = FxHashMap::default();
+        let mut first_constraints2 = FxIndexMap::default();
         first_constraints2.reserve(first_constraints.len());
 
         for (r1, start1) in first_constraints {
@@ -158,7 +158,7 @@ where
     }
 
     /// Iterate down the constraint indices associated with a given
-    /// peek-region.  You can then use `choice_regions` and other
+    /// peek-region. You can then use `choice_regions` and other
     /// methods to access data.
     pub(crate) fn indices(
         &self,
@@ -215,13 +215,13 @@ where
 /// target_list: A -> B -> C -> D -> E -> F -> (None)
 /// ```
 fn append_list(
-    constraints: &mut IndexVec<NllMemberConstraintIndex, NllMemberConstraint<'_>>,
+    constraints: &mut IndexSlice<NllMemberConstraintIndex, NllMemberConstraint<'_>>,
     target_list: NllMemberConstraintIndex,
     source_list: NllMemberConstraintIndex,
 ) {
     let mut p = target_list;
     loop {
-        let mut r = &mut constraints[p];
+        let r = &mut constraints[p];
         match r.next_constraint {
             Some(q) => p = q,
             None => {

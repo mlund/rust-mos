@@ -5,6 +5,7 @@ use rustc_middle::thir::visit::{self, Visitor};
 use rustc_hir as hir;
 use rustc_middle::mir::BorrowKind;
 use rustc_middle::thir::*;
+use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, ParamEnv, Ty, TyCtxt};
 use rustc_session::lint::builtin::{UNSAFE_OP_IN_UNSAFE_FN, UNUSED_UNSAFE};
 use rustc_session::lint::Level;
@@ -116,10 +117,10 @@ impl<'tcx> UnsafetyVisitor<'_, 'tcx> {
     }
 
     /// Handle closures/generators/inline-consts, which is unsafecked with their parent body.
-    fn visit_inner_body(&mut self, def: ty::WithOptConstParam<LocalDefId>) {
+    fn visit_inner_body(&mut self, def: LocalDefId) {
         if let Ok((inner_thir, expr)) = self.tcx.thir_body(def) {
             let inner_thir = &inner_thir.borrow();
-            let hir_context = self.tcx.hir().local_def_id_to_hir_id(def.did);
+            let hir_context = self.tcx.hir().local_def_id_to_hir_id(def);
             let mut inner_visitor = UnsafetyVisitor { thir: inner_thir, hir_context, ..*self };
             inner_visitor.visit_expr(&inner_thir[expr]);
             // Unsafe blocks can be used in the inner body, make sure to take it into account
@@ -253,7 +254,7 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tcx> {
                         );
                     };
                     match borrow_kind {
-                        BorrowKind::Shallow | BorrowKind::Shared | BorrowKind::Unique => {
+                        BorrowKind::Shallow | BorrowKind::Shared => {
                             if !ty.is_freeze(self.tcx, self.param_env) {
                                 self.requires_unsafe(pat.span, BorrowOfLayoutConstrainedField);
                             }
@@ -322,6 +323,7 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tcx> {
             | ExprKind::Box { .. }
             | ExprKind::If { .. }
             | ExprKind::InlineAsm { .. }
+            | ExprKind::OffsetOf { .. }
             | ExprKind::LogicalOp { .. }
             | ExprKind::Use { .. } => {
                 // We don't need to save the old value and restore it
@@ -395,18 +397,11 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tcx> {
                 movability: _,
                 fake_reads: _,
             }) => {
-                let closure_def = if let Some((did, const_param_id)) =
-                    ty::WithOptConstParam::try_lookup(closure_id, self.tcx)
-                {
-                    ty::WithOptConstParam { did, const_param_did: Some(const_param_id) }
-                } else {
-                    ty::WithOptConstParam::unknown(closure_id)
-                };
-                self.visit_inner_body(closure_def);
+                self.visit_inner_body(closure_id);
             }
             ExprKind::ConstBlock { did, substs: _ } => {
                 let def_id = did.expect_local();
-                self.visit_inner_body(ty::WithOptConstParam::unknown(def_id));
+                self.visit_inner_body(def_id);
             }
             ExprKind::Field { lhs, .. } => {
                 let lhs = &self.thir[lhs];
@@ -445,7 +440,7 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tcx> {
                 visit::walk_expr(&mut visitor, expr);
                 if visitor.found {
                     match borrow_kind {
-                        BorrowKind::Shallow | BorrowKind::Shared | BorrowKind::Unique
+                        BorrowKind::Shallow | BorrowKind::Shared
                             if !self.thir[arg].ty.is_freeze(self.tcx, self.param_env) =>
                         {
                             self.requires_unsafe(expr.span, BorrowOfLayoutConstrainedField)
@@ -453,7 +448,7 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tcx> {
                         BorrowKind::Mut { .. } => {
                             self.requires_unsafe(expr.span, MutationOfLayoutConstrainedField)
                         }
-                        BorrowKind::Shallow | BorrowKind::Shared | BorrowKind::Unique => {}
+                        BorrowKind::Shallow | BorrowKind::Shared => {}
                     }
                 }
             }
@@ -524,17 +519,19 @@ impl UnsafeOpKind {
         hir_id: hir::HirId,
         span: Span,
     ) {
+        // FIXME: ideally we would want to trim the def paths, but this is not
+        // feasible with the current lint emission API (see issue #106126).
         match self {
-            CallToUnsafeFunction(did) if did.is_some() => tcx.emit_spanned_lint(
+            CallToUnsafeFunction(Some(did)) => tcx.emit_spanned_lint(
                 UNSAFE_OP_IN_UNSAFE_FN,
                 hir_id,
                 span,
                 UnsafeOpInUnsafeFnCallToUnsafeFunctionRequiresUnsafe {
                     span,
-                    function: &tcx.def_path_str(did.unwrap()),
+                    function: &with_no_trimmed_paths!(tcx.def_path_str(*did)),
                 },
             ),
-            CallToUnsafeFunction(..) => tcx.emit_spanned_lint(
+            CallToUnsafeFunction(None) => tcx.emit_spanned_lint(
                 UNSAFE_OP_IN_UNSAFE_FN,
                 hir_id,
                 span,
@@ -594,7 +591,7 @@ impl UnsafeOpKind {
                 span,
                 UnsafeOpInUnsafeFnCallToFunctionWithRequiresUnsafe {
                     span,
-                    function: &tcx.def_path_str(*did),
+                    function: &with_no_trimmed_paths!(tcx.def_path_str(*did)),
                 },
             ),
         }
@@ -607,24 +604,24 @@ impl UnsafeOpKind {
         unsafe_op_in_unsafe_fn_allowed: bool,
     ) {
         match self {
-            CallToUnsafeFunction(did) if did.is_some() && unsafe_op_in_unsafe_fn_allowed => {
+            CallToUnsafeFunction(Some(did)) if unsafe_op_in_unsafe_fn_allowed => {
                 tcx.sess.emit_err(CallToUnsafeFunctionRequiresUnsafeUnsafeOpInUnsafeFnAllowed {
                     span,
-                    function: &tcx.def_path_str(did.unwrap()),
+                    function: &tcx.def_path_str(*did),
                 });
             }
-            CallToUnsafeFunction(did) if did.is_some() => {
+            CallToUnsafeFunction(Some(did)) => {
                 tcx.sess.emit_err(CallToUnsafeFunctionRequiresUnsafe {
                     span,
-                    function: &tcx.def_path_str(did.unwrap()),
+                    function: &tcx.def_path_str(*did),
                 });
             }
-            CallToUnsafeFunction(..) if unsafe_op_in_unsafe_fn_allowed => {
+            CallToUnsafeFunction(None) if unsafe_op_in_unsafe_fn_allowed => {
                 tcx.sess.emit_err(
                     CallToUnsafeFunctionRequiresUnsafeNamelessUnsafeOpInUnsafeFnAllowed { span },
                 );
             }
-            CallToUnsafeFunction(..) => {
+            CallToUnsafeFunction(None) => {
                 tcx.sess.emit_err(CallToUnsafeFunctionRequiresUnsafeNameless { span });
             }
             UseOfInlineAssembly if unsafe_op_in_unsafe_fn_allowed => {
@@ -703,14 +700,14 @@ impl UnsafeOpKind {
     }
 }
 
-pub fn check_unsafety(tcx: TyCtxt<'_>, def: ty::WithOptConstParam<LocalDefId>) {
+pub fn thir_check_unsafety(tcx: TyCtxt<'_>, def: LocalDefId) {
     // THIR unsafeck is gated under `-Z thir-unsafeck`
     if !tcx.sess.opts.unstable_opts.thir_unsafeck {
         return;
     }
 
     // Closures and inline consts are handled by their owner, if it has a body
-    if tcx.is_typeck_child(def.did.to_def_id()) {
+    if tcx.is_typeck_child(def.to_def_id()) {
         return;
     }
 
@@ -723,7 +720,7 @@ pub fn check_unsafety(tcx: TyCtxt<'_>, def: ty::WithOptConstParam<LocalDefId>) {
         return;
     }
 
-    let hir_id = tcx.hir().local_def_id_to_hir_id(def.did);
+    let hir_id = tcx.hir().local_def_id_to_hir_id(def);
     let body_unsafety = tcx.hir().fn_sig_by_hir_id(hir_id).map_or(BodyUnsafety::Safe, |fn_sig| {
         if fn_sig.header.unsafety == hir::Unsafety::Unsafe {
             BodyUnsafety::Unsafe(fn_sig.span)
@@ -731,7 +728,7 @@ pub fn check_unsafety(tcx: TyCtxt<'_>, def: ty::WithOptConstParam<LocalDefId>) {
             BodyUnsafety::Safe
         }
     });
-    let body_target_features = &tcx.body_codegen_attrs(def.did.to_def_id()).target_features;
+    let body_target_features = &tcx.body_codegen_attrs(def.to_def_id()).target_features;
     let safety_context =
         if body_unsafety.is_unsafe() { SafetyContext::UnsafeFn } else { SafetyContext::Safe };
     let mut visitor = UnsafetyVisitor {
@@ -743,23 +740,8 @@ pub fn check_unsafety(tcx: TyCtxt<'_>, def: ty::WithOptConstParam<LocalDefId>) {
         body_target_features,
         assignment_info: None,
         in_union_destructure: false,
-        param_env: tcx.param_env(def.did),
+        param_env: tcx.param_env(def),
         inside_adt: false,
     };
     visitor.visit_expr(&thir[expr]);
-}
-
-pub(crate) fn thir_check_unsafety(tcx: TyCtxt<'_>, def_id: LocalDefId) {
-    if let Some(def) = ty::WithOptConstParam::try_lookup(def_id, tcx) {
-        tcx.thir_check_unsafety_for_const_arg(def)
-    } else {
-        check_unsafety(tcx, ty::WithOptConstParam::unknown(def_id))
-    }
-}
-
-pub(crate) fn thir_check_unsafety_for_const_arg(
-    tcx: TyCtxt<'_>,
-    (did, param_did): (LocalDefId, DefId),
-) {
-    check_unsafety(tcx, ty::WithOptConstParam { did, const_param_did: Some(param_did) })
 }

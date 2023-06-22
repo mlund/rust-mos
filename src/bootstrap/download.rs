@@ -2,21 +2,24 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs::{self, File},
-    io::{BufRead, BufReader, ErrorKind},
+    io::{BufRead, BufReader, BufWriter, ErrorKind, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
+use build_helper::util::try_run;
 use once_cell::sync::OnceCell;
 use xz2::bufread::XzDecoder;
 
 use crate::{
     config::RustfmtMetadata,
-    native::detect_llvm_sha,
+    llvm::detect_llvm_sha,
     t,
-    util::{check_run, exe, program_out_of_date, try_run},
+    util::{check_run, exe, program_out_of_date},
     Config,
 };
+
+static SHOULD_FIX_BINS_AND_DYLIBS: OnceCell<bool> = OnceCell::new();
 
 /// Generic helpers that are useful anywhere in bootstrap.
 impl Config {
@@ -70,53 +73,61 @@ impl Config {
         check_run(cmd, self.is_verbose())
     }
 
+    /// Whether or not `fix_bin_or_dylib` needs to be run; can only be true
+    /// on NixOS
+    fn should_fix_bins_and_dylibs(&self) -> bool {
+        let val = *SHOULD_FIX_BINS_AND_DYLIBS.get_or_init(|| {
+            match Command::new("uname").arg("-s").stderr(Stdio::inherit()).output() {
+                Err(_) => return false,
+                Ok(output) if !output.status.success() => return false,
+                Ok(output) => {
+                    let mut os_name = output.stdout;
+                    if os_name.last() == Some(&b'\n') {
+                        os_name.pop();
+                    }
+                    if os_name != b"Linux" {
+                        return false;
+                    }
+                }
+            }
+
+            // If the user has asked binaries to be patched for Nix, then
+            // don't check for NixOS or `/lib`.
+            // NOTE: this intentionally comes after the Linux check:
+            // - patchelf only works with ELF files, so no need to run it on Mac or Windows
+            // - On other Unix systems, there is no stable syscall interface, so Nix doesn't manage the global libc.
+            if self.patch_binaries_for_nix {
+                return true;
+            }
+
+            // Use `/etc/os-release` instead of `/etc/NIXOS`.
+            // The latter one does not exist on NixOS when using tmpfs as root.
+            let is_nixos = match File::open("/etc/os-release") {
+                Err(e) if e.kind() == ErrorKind::NotFound => false,
+                Err(e) => panic!("failed to access /etc/os-release: {}", e),
+                Ok(os_release) => BufReader::new(os_release).lines().any(|l| {
+                    let l = l.expect("reading /etc/os-release");
+                    matches!(l.trim(), "ID=nixos" | "ID='nixos'" | "ID=\"nixos\"")
+                }),
+            };
+            is_nixos && !Path::new("/lib").exists()
+        });
+        if val {
+            eprintln!("info: You seem to be using Nix.");
+        }
+        val
+    }
+
     /// Modifies the interpreter section of 'fname' to fix the dynamic linker,
     /// or the RPATH section, to fix the dynamic library search path
     ///
     /// This is only required on NixOS and uses the PatchELF utility to
     /// change the interpreter/RPATH of ELF executables.
     ///
-    /// Please see https://nixos.org/patchelf.html for more information
+    /// Please see <https://nixos.org/patchelf.html> for more information
     fn fix_bin_or_dylib(&self, fname: &Path) {
-        // FIXME: cache NixOS detection?
-        match Command::new("uname").arg("-s").stderr(Stdio::inherit()).output() {
-            Err(_) => return,
-            Ok(output) if !output.status.success() => return,
-            Ok(output) => {
-                let mut s = output.stdout;
-                if s.last() == Some(&b'\n') {
-                    s.pop();
-                }
-                if s != b"Linux" {
-                    return;
-                }
-            }
-        }
-
-        // If the user has asked binaries to be patched for Nix, then
-        // don't check for NixOS or `/lib`, just continue to the patching.
-        // NOTE: this intentionally comes after the Linux check:
-        // - patchelf only works with ELF files, so no need to run it on Mac or Windows
-        // - On other Unix systems, there is no stable syscall interface, so Nix doesn't manage the global libc.
-        if !self.patch_binaries_for_nix {
-            // Use `/etc/os-release` instead of `/etc/NIXOS`.
-            // The latter one does not exist on NixOS when using tmpfs as root.
-            const NIX_IDS: &[&str] = &["ID=nixos", "ID='nixos'", "ID=\"nixos\""];
-            let os_release = match File::open("/etc/os-release") {
-                Err(e) if e.kind() == ErrorKind::NotFound => return,
-                Err(e) => panic!("failed to access /etc/os-release: {}", e),
-                Ok(f) => f,
-            };
-            if !BufReader::new(os_release).lines().any(|l| NIX_IDS.contains(&t!(l).trim())) {
-                return;
-            }
-            if Path::new("/lib").exists() {
-                return;
-            }
-        }
-
-        // At this point we're pretty sure the user is running NixOS or using Nix
-        println!("info: you seem to be using Nix. Attempting to patch {}", fname.display());
+        assert_eq!(SHOULD_FIX_BINS_AND_DYLIBS.get(), Some(&true));
+        println!("attempting to patch {}", fname.display());
 
         // Only build `.nix-deps` once.
         static NIX_DEPS_DIR: OnceCell<PathBuf> = OnceCell::new();
@@ -163,8 +174,7 @@ impl Config {
             // appear to have this (even when `../lib` is redundant).
             // NOTE: there are only two paths here, delimited by a `:`
             let mut entries = OsString::from("$ORIGIN/../lib:");
-            entries.push(t!(fs::canonicalize(nix_deps_dir)));
-            entries.push("/lib");
+            entries.push(t!(fs::canonicalize(nix_deps_dir)).join("lib"));
             entries
         };
         patchelf.args(&[OsString::from("--set-rpath"), rpath_entries]);
@@ -210,14 +220,14 @@ impl Config {
             "30", // timeout if cannot connect within 30 seconds
             "--retry",
             "3",
-            "-Sf",
-            "-o",
+            "-SRf",
         ]);
-        curl.arg(tempfile);
         curl.arg(url);
+        let f = File::create(tempfile).unwrap();
+        curl.stdout(Stdio::from(f));
         if !self.check_run(&mut curl) {
             if self.build.contains("windows-msvc") {
-                println!("Fallback to PowerShell");
+                eprintln!("Fallback to PowerShell");
                 for _ in 0..3 {
                     if self.try_run(Command::new("PowerShell.exe").args(&[
                         "/nologo",
@@ -230,18 +240,18 @@ impl Config {
                     ])) {
                         return;
                     }
-                    println!("\nspurious failure, trying again");
+                    eprintln!("\nspurious failure, trying again");
                 }
             }
             if !help_on_error.is_empty() {
                 eprintln!("{}", help_on_error);
             }
-            crate::detail_exit(1);
+            crate::detail_exit_macro!(1);
         }
     }
 
     fn unpack(&self, tarball: &Path, dst: &Path, pattern: &str) {
-        println!("extracting {} to {}", tarball.display(), dst.display());
+        eprintln!("extracting {} to {}", tarball.display(), dst.display());
         if !dst.exists() {
             t!(fs::create_dir_all(dst));
         }
@@ -253,10 +263,17 @@ impl Config {
         let directory_prefix = Path::new(Path::new(uncompressed_filename).file_stem().unwrap());
 
         // decompress the file
-        let data = t!(File::open(tarball));
+        let data = t!(File::open(tarball), format!("file {} not found", tarball.display()));
         let decompressor = XzDecoder::new(BufReader::new(data));
 
         let mut tar = tar::Archive::new(decompressor);
+
+        // `compile::Sysroot` needs to know the contents of the `rustc-dev` tarball to avoid adding
+        // it to the sysroot unless it was explicitly requested. But parsing the 100 MB tarball is slow.
+        // Cache the entries when we extract it so we only have to read it once.
+        let mut recorded_entries =
+            if dst.ends_with("ci-rustc") { recorded_entries(dst, pattern) } else { None };
+
         for member in t!(tar.entries()) {
             let mut member = t!(member);
             let original_path = t!(member.path()).into_owned();
@@ -274,13 +291,19 @@ impl Config {
             if !t!(member.unpack_in(dst)) {
                 panic!("path traversal attack ??");
             }
+            if let Some(record) = &mut recorded_entries {
+                t!(writeln!(record, "{}", short_path.to_str().unwrap()));
+            }
             let src_path = dst.join(original_path);
             if src_path.is_dir() && dst_path.exists() {
                 continue;
             }
             t!(fs::rename(src_path, dst_path));
         }
-        t!(fs::remove_dir_all(dst.join(directory_prefix)));
+        let dst_dir = dst.join(directory_prefix);
+        if dst_dir.exists() {
+            t!(fs::remove_dir_all(&dst_dir), format!("failed to remove {}", dst_dir.display()));
+        }
     }
 
     /// Returns whether the SHA256 checksum of `path` matches `expected`.
@@ -306,6 +329,17 @@ impl Config {
     }
 }
 
+fn recorded_entries(dst: &Path, pattern: &str) -> Option<BufWriter<File>> {
+    let name = if pattern == "rustc-dev" {
+        ".rustc-dev-contents"
+    } else if pattern.starts_with("rust-std") {
+        ".rust-std-contents"
+    } else {
+        return None;
+    };
+    Some(BufWriter::new(t!(File::create(dst.join(name)))))
+}
+
 enum DownloadSource {
     CI,
     Dist,
@@ -318,49 +352,31 @@ impl Config {
         let channel = format!("{version}-{date}");
 
         let host = self.build;
-        let rustfmt_path = self.initial_rustc.with_file_name(exe("rustfmt", host));
-        let bin_root = self.out.join(host.triple).join("stage0");
+        let bin_root = self.out.join(host.triple).join("rustfmt");
+        let rustfmt_path = bin_root.join("bin").join(exe("rustfmt", host));
         let rustfmt_stamp = bin_root.join(".rustfmt-stamp");
         if rustfmt_path.exists() && !program_out_of_date(&rustfmt_stamp, &channel) {
             return Some(rustfmt_path);
         }
 
-        let filename = format!("rustfmt-{version}-{build}.tar.xz", build = host.triple);
-        self.download_component(DownloadSource::Dist, filename, "rustfmt-preview", &date, "stage0");
+        self.download_component(
+            DownloadSource::Dist,
+            format!("rustfmt-{version}-{build}.tar.xz", build = host.triple),
+            "rustfmt-preview",
+            &date,
+            "rustfmt",
+        );
+        self.download_component(
+            DownloadSource::Dist,
+            format!("rustc-{version}-{build}.tar.xz", build = host.triple),
+            "rustc",
+            &date,
+            "rustfmt",
+        );
 
-        self.fix_bin_or_dylib(&bin_root.join("bin").join("rustfmt"));
-        self.fix_bin_or_dylib(&bin_root.join("bin").join("cargo-fmt"));
-
-        self.create(&rustfmt_stamp, &channel);
-        Some(rustfmt_path)
-    }
-
-    pub(crate) fn download_ci_rustc(&self, commit: &str) {
-        self.verbose(&format!("using downloaded stage2 artifacts from CI (commit {commit})"));
-        let version = self.artifact_version_part(commit);
-        let host = self.build.triple;
-        let bin_root = self.out.join(host).join("ci-rustc");
-        let rustc_stamp = bin_root.join(".rustc-stamp");
-
-        if !bin_root.join("bin").join("rustc").exists() || program_out_of_date(&rustc_stamp, commit)
-        {
-            if bin_root.exists() {
-                t!(fs::remove_dir_all(&bin_root));
-            }
-            let filename = format!("rust-std-{version}-{host}.tar.xz");
-            let pattern = format!("rust-std-{host}");
-            self.download_ci_component(filename, &pattern, commit);
-            let filename = format!("rustc-{version}-{host}.tar.xz");
-            self.download_ci_component(filename, "rustc", commit);
-            // download-rustc doesn't need its own cargo, it can just use beta's.
-            let filename = format!("rustc-dev-{version}-{host}.tar.xz");
-            self.download_ci_component(filename, "rustc-dev", commit);
-            let filename = format!("rust-src-{version}.tar.xz");
-            self.download_ci_component(filename, "rust-src", commit);
-
-            self.fix_bin_or_dylib(&bin_root.join("bin").join("rustc"));
-            self.fix_bin_or_dylib(&bin_root.join("bin").join("rustdoc"));
-            self.fix_bin_or_dylib(&bin_root.join("libexec").join("rust-analyzer-proc-macro-srv"));
+        if self.should_fix_bins_and_dylibs() {
+            self.fix_bin_or_dylib(&bin_root.join("bin").join("rustfmt"));
+            self.fix_bin_or_dylib(&bin_root.join("bin").join("cargo-fmt"));
             let lib_dir = bin_root.join("lib");
             for lib in t!(fs::read_dir(&lib_dir), lib_dir.display().to_string()) {
                 let lib = t!(lib);
@@ -368,7 +384,110 @@ impl Config {
                     self.fix_bin_or_dylib(&lib.path());
                 }
             }
-            t!(fs::write(rustc_stamp, commit));
+        }
+
+        self.create(&rustfmt_stamp, &channel);
+        Some(rustfmt_path)
+    }
+
+    pub(crate) fn ci_rust_std_contents(&self) -> Vec<String> {
+        self.ci_component_contents(".rust-std-contents")
+    }
+
+    pub(crate) fn ci_rustc_dev_contents(&self) -> Vec<String> {
+        self.ci_component_contents(".rustc-dev-contents")
+    }
+
+    fn ci_component_contents(&self, stamp_file: &str) -> Vec<String> {
+        assert!(self.download_rustc());
+        let ci_rustc_dir = self.out.join(&*self.build.triple).join("ci-rustc");
+        let stamp_file = ci_rustc_dir.join(stamp_file);
+        let contents_file = t!(File::open(&stamp_file), stamp_file.display().to_string());
+        t!(BufReader::new(contents_file).lines().collect())
+    }
+
+    pub(crate) fn download_ci_rustc(&self, commit: &str) {
+        self.verbose(&format!("using downloaded stage2 artifacts from CI (commit {commit})"));
+
+        let version = self.artifact_version_part(commit);
+        // download-rustc doesn't need its own cargo, it can just use beta's. But it does need the
+        // `rustc_private` crates for tools.
+        let extra_components = ["rustc-dev"];
+
+        self.download_toolchain(
+            &version,
+            "ci-rustc",
+            commit,
+            &extra_components,
+            Self::download_ci_component,
+        );
+    }
+
+    pub(crate) fn download_beta_toolchain(&self) {
+        self.verbose(&format!("downloading stage0 beta artifacts"));
+
+        let date = &self.stage0_metadata.compiler.date;
+        let version = &self.stage0_metadata.compiler.version;
+        let extra_components = ["cargo"];
+
+        let download_beta_component = |config: &Config, filename, prefix: &_, date: &_| {
+            config.download_component(DownloadSource::Dist, filename, prefix, date, "stage0")
+        };
+
+        self.download_toolchain(
+            version,
+            "stage0",
+            date,
+            &extra_components,
+            download_beta_component,
+        );
+    }
+
+    fn download_toolchain(
+        &self,
+        version: &str,
+        sysroot: &str,
+        stamp_key: &str,
+        extra_components: &[&str],
+        download_component: fn(&Config, String, &str, &str),
+    ) {
+        let host = self.build.triple;
+        let bin_root = self.out.join(host).join(sysroot);
+        let rustc_stamp = bin_root.join(".rustc-stamp");
+
+        if !bin_root.join("bin").join(exe("rustc", self.build)).exists()
+            || program_out_of_date(&rustc_stamp, stamp_key)
+        {
+            if bin_root.exists() {
+                t!(fs::remove_dir_all(&bin_root));
+            }
+            let filename = format!("rust-std-{version}-{host}.tar.xz");
+            let pattern = format!("rust-std-{host}");
+            download_component(self, filename, &pattern, stamp_key);
+            let filename = format!("rustc-{version}-{host}.tar.xz");
+            download_component(self, filename, "rustc", stamp_key);
+
+            for component in extra_components {
+                let filename = format!("{component}-{version}-{host}.tar.xz");
+                download_component(self, filename, component, stamp_key);
+            }
+
+            if self.should_fix_bins_and_dylibs() {
+                self.fix_bin_or_dylib(&bin_root.join("bin").join("rustc"));
+                self.fix_bin_or_dylib(&bin_root.join("bin").join("rustdoc"));
+                self.fix_bin_or_dylib(
+                    &bin_root.join("libexec").join("rust-analyzer-proc-macro-srv"),
+                );
+                let lib_dir = bin_root.join("lib");
+                for lib in t!(fs::read_dir(&lib_dir), lib_dir.display().to_string()) {
+                    let lib = t!(lib);
+                    if lib.path().extension() == Some(OsStr::new("so")) {
+                        self.fix_bin_or_dylib(&lib.path());
+                    }
+                }
+            }
+
+            t!(fs::write(rustc_stamp, stamp_key));
         }
     }
 
@@ -439,7 +558,18 @@ impl Config {
             None
         };
 
-        self.download_file(&format!("{base_url}/{url}"), &tarball, "");
+        let mut help_on_error = "";
+        if destination == "ci-rustc" {
+            help_on_error = "error: failed to download pre-built rustc from CI
+
+note: old builds get deleted after a certain time
+help: if trying to compile an old commit of rustc, disable `download-rustc` in config.toml:
+
+[rust]
+download-rustc = false
+";
+        }
+        self.download_file(&format!("{base_url}/{url}"), &tarball, help_on_error);
         if let Some(sha256) = checksum {
             if !self.verify(&tarball, sha256) {
                 panic!("failed to verify {}", tarball.display());
@@ -459,8 +589,10 @@ impl Config {
         let key = format!("{}{}", llvm_sha, self.llvm_assertions);
         if program_out_of_date(&llvm_stamp, &key) && !self.dry_run() {
             self.download_ci_llvm(&llvm_sha);
-            for entry in t!(fs::read_dir(llvm_root.join("bin"))) {
-                self.fix_bin_or_dylib(&t!(entry).path());
+            if self.should_fix_bins_and_dylibs() {
+                for entry in t!(fs::read_dir(llvm_root.join("bin"))) {
+                    self.fix_bin_or_dylib(&t!(entry).path());
+                }
             }
 
             // Update the timestamp of llvm-config to force rustc_llvm to be
@@ -475,13 +607,16 @@ impl Config {
             let llvm_config = llvm_root.join("bin").join(exe("llvm-config", self.build));
             t!(filetime::set_file_times(&llvm_config, now, now));
 
-            let llvm_lib = llvm_root.join("lib");
-            for entry in t!(fs::read_dir(&llvm_lib)) {
-                let lib = t!(entry).path();
-                if lib.extension().map_or(false, |ext| ext == "so") {
-                    self.fix_bin_or_dylib(&lib);
+            if self.should_fix_bins_and_dylibs() {
+                let llvm_lib = llvm_root.join("lib");
+                for entry in t!(fs::read_dir(&llvm_lib)) {
+                    let lib = t!(entry).path();
+                    if lib.extension().map_or(false, |ext| ext == "so") {
+                        self.fix_bin_or_dylib(&lib);
+                    }
                 }
             }
+
             t!(fs::write(llvm_stamp, key));
         }
     }

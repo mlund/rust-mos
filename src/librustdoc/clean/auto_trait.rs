@@ -1,7 +1,7 @@
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir as hir;
 use rustc_hir::lang_items::LangItem;
-use rustc_middle::ty::{self, Region, RegionVid, TypeFoldable, TypeSuperFoldable};
+use rustc_middle::ty::{self, Region, RegionVid, TypeFoldable};
 use rustc_trait_selection::traits::auto_trait::{self, AutoTraitResult};
 use thin_vec::ThinVec;
 
@@ -44,7 +44,7 @@ where
         discard_positive_impl: bool,
     ) -> Option<Item> {
         let tcx = self.cx.tcx;
-        let trait_ref = ty::Binder::dummy(tcx.mk_trait_ref(trait_def_id, [ty]));
+        let trait_ref = ty::Binder::dummy(ty::TraitRef::new(tcx, trait_def_id, [ty]));
         if !self.cx.generated_synthetics.insert((ty, trait_def_id)) {
             debug!("get_auto_trait_impl_for({:?}): already generated, aborting", trait_ref);
             return None;
@@ -124,7 +124,7 @@ where
                 unsafety: hir::Unsafety::Normal,
                 generics: new_generics,
                 trait_: Some(clean_trait_ref_with_bindings(self.cx, trait_ref, ThinVec::new())),
-                for_: clean_middle_ty(ty::Binder::dummy(ty), self.cx, None),
+                for_: clean_middle_ty(ty::Binder::dummy(ty), self.cx, None, None),
                 items: Vec::new(),
                 polarity,
                 kind: ImplKind::Auto,
@@ -137,11 +137,11 @@ where
     pub(crate) fn get_auto_trait_impls(&mut self, item_def_id: DefId) -> Vec<Item> {
         let tcx = self.cx.tcx;
         let param_env = tcx.param_env(item_def_id);
-        let ty = tcx.type_of(item_def_id);
+        let ty = tcx.type_of(item_def_id).subst_identity();
         let f = auto_trait::AutoTraitFinder::new(tcx);
 
         debug!("get_auto_trait_impls({:?})", ty);
-        let auto_traits: Vec<_> = self.cx.auto_traits.iter().copied().collect();
+        let auto_traits: Vec<_> = self.cx.auto_traits.to_vec();
         let mut auto_traits: Vec<Item> = auto_traits
             .into_iter()
             .filter_map(|trait_def_id| {
@@ -321,10 +321,10 @@ where
         let bound_predicate = pred.kind();
         let tcx = self.cx.tcx;
         let regions = match bound_predicate.skip_binder() {
-            ty::PredicateKind::Clause(ty::Clause::Trait(poly_trait_pred)) => {
+            ty::PredicateKind::Clause(ty::ClauseKind::Trait(poly_trait_pred)) => {
                 tcx.collect_referenced_late_bound_regions(&bound_predicate.rebind(poly_trait_pred))
             }
-            ty::PredicateKind::Clause(ty::Clause::Projection(poly_proj_pred)) => {
+            ty::PredicateKind::Clause(ty::ClauseKind::Projection(poly_proj_pred)) => {
                 tcx.collect_referenced_late_bound_regions(&bound_predicate.rebind(poly_proj_pred))
             }
             _ => return FxHashSet::default(),
@@ -402,15 +402,13 @@ where
                     bound_params: Vec::new(),
                 })
             })
-            .chain(
-                lifetime_to_bounds.into_iter().filter(|&(_, ref bounds)| !bounds.is_empty()).map(
-                    |(lifetime, bounds)| {
-                        let mut bounds_vec = bounds.into_iter().collect();
-                        self.sort_where_bounds(&mut bounds_vec);
-                        WherePredicate::RegionPredicate { lifetime, bounds: bounds_vec }
-                    },
-                ),
-            )
+            .chain(lifetime_to_bounds.into_iter().filter(|(_, bounds)| !bounds.is_empty()).map(
+                |(lifetime, bounds)| {
+                    let mut bounds_vec = bounds.into_iter().collect();
+                    self.sort_where_bounds(&mut bounds_vec);
+                    WherePredicate::RegionPredicate { lifetime, bounds: bounds_vec }
+                },
+            ))
             .collect()
     }
 
@@ -451,7 +449,7 @@ where
             .filter(|p| {
                 !orig_bounds.contains(p)
                     || match p.kind().skip_binder() {
-                        ty::PredicateKind::Clause(ty::Clause::Trait(pred)) => {
+                        ty::PredicateKind::Clause(ty::ClauseKind::Trait(pred)) => {
                             pred.def_id() == sized_trait
                         }
                         _ => false,
@@ -558,7 +556,10 @@ where
                 WherePredicate::EqPredicate { lhs, rhs, bound_params } => {
                     match *lhs {
                         Type::QPath(box QPathData {
-                            ref assoc, ref self_type, ref trait_, ..
+                            ref assoc,
+                            ref self_type,
+                            trait_: Some(ref trait_),
+                            ..
                         }) => {
                             let ty = &*self_type;
                             let mut new_trait = trait_.clone();
@@ -736,16 +737,17 @@ struct RegionReplacer<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
 }
 
-impl<'a, 'tcx> TypeFolder<'tcx> for RegionReplacer<'a, 'tcx> {
-    fn tcx<'b>(&'b self) -> TyCtxt<'tcx> {
+impl<'a, 'tcx> TypeFolder<TyCtxt<'tcx>> for RegionReplacer<'a, 'tcx> {
+    fn interner(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
 
     fn fold_region(&mut self, r: ty::Region<'tcx>) -> ty::Region<'tcx> {
-        (match *r {
-            ty::ReVar(vid) => self.vid_to_region.get(&vid).cloned(),
-            _ => None,
-        })
-        .unwrap_or_else(|| r.super_fold_with(self))
+        match *r {
+            // These are the regions that can be seen in the AST.
+            ty::ReVar(vid) => self.vid_to_region.get(&vid).cloned().unwrap_or(r),
+            ty::ReEarlyBound(_) | ty::ReStatic | ty::ReLateBound(..) | ty::ReError(_) => r,
+            r => bug!("unexpected region: {r:?}"),
+        }
     }
 }

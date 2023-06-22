@@ -8,11 +8,11 @@ use hir::{
 };
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir as hir;
-use rustc_index::vec::IndexVec;
+use rustc_index::IndexVec;
 use rustc_infer::infer::InferCtxt;
 use rustc_middle::{
     hir::map::Map,
-    ty::{ParamEnv, TyCtxt, TypeVisitable, TypeckResults},
+    ty::{ParamEnv, TyCtxt, TypeVisitableExt, TypeckResults},
 };
 use std::mem::swap;
 
@@ -190,7 +190,6 @@ impl<'a, 'tcx> DropRangeVisitor<'a, 'tcx> {
             //
             // Some of these may be interesting in the future
             ExprKind::Path(..)
-            | ExprKind::Box(..)
             | ExprKind::ConstBlock(..)
             | ExprKind::Array(..)
             | ExprKind::Call(..)
@@ -216,10 +215,11 @@ impl<'a, 'tcx> DropRangeVisitor<'a, 'tcx> {
             | ExprKind::Continue(..)
             | ExprKind::Ret(..)
             | ExprKind::InlineAsm(..)
+            | ExprKind::OffsetOf(..)
             | ExprKind::Struct(..)
             | ExprKind::Repeat(..)
             | ExprKind::Yield(..)
-            | ExprKind::Err => (),
+            | ExprKind::Err(_) => (),
         }
     }
 
@@ -270,6 +270,7 @@ impl<'a, 'tcx> DropRangeVisitor<'a, 'tcx> {
                 | hir::Node::Variant(..)
                 | hir::Node::Field(..)
                 | hir::Node::AnonConst(..)
+                | hir::Node::ConstBlock(..)
                 | hir::Node::Stmt(..)
                 | hir::Node::PathSegment(..)
                 | hir::Node::Ty(..)
@@ -304,8 +305,8 @@ impl<'a, 'tcx> Visitor<'tcx> for DropRangeVisitor<'a, 'tcx> {
         let mut reinit = None;
         match expr.kind {
             ExprKind::Assign(lhs, rhs, _) => {
-                self.visit_expr(lhs);
                 self.visit_expr(rhs);
+                self.visit_expr(lhs);
 
                 reinit = Some(lhs);
             }
@@ -433,7 +434,7 @@ impl<'a, 'tcx> Visitor<'tcx> for DropRangeVisitor<'a, 'tcx> {
                     self.drop_ranges.add_control_edge(self.expr_index, *target)
                 }),
 
-            ExprKind::Break(destination, ..) => {
+            ExprKind::Break(destination, value) => {
                 // destination either points to an expression or to a block. We use
                 // find_target_expression_from_destination to use the last expression of the block
                 // if destination points to a block.
@@ -443,7 +444,11 @@ impl<'a, 'tcx> Visitor<'tcx> for DropRangeVisitor<'a, 'tcx> {
                 // will refer to the end of the block due to the post order traversal.
                 self.find_target_expression_from_destination(destination).map_or((), |target| {
                     self.drop_ranges.add_control_edge_hir_id(self.expr_index, target)
-                })
+                });
+
+                if let Some(value) = value {
+                    self.visit_expr(value);
+                }
             }
 
             ExprKind::Call(f, args) => {
@@ -465,18 +470,24 @@ impl<'a, 'tcx> Visitor<'tcx> for DropRangeVisitor<'a, 'tcx> {
 
             ExprKind::AddrOf(..)
             | ExprKind::Array(..)
+            // FIXME(eholk): We probably need special handling for AssignOps. The ScopeTree builder
+            // in region.rs runs both lhs then rhs and rhs then lhs and then sets all yields to be
+            // the latest they show up in either traversal. With the older scope-based
+            // approximation, this was fine, but it's probably not right now. What we probably want
+            // to do instead is still run both orders, but consider anything that showed up as a
+            // yield in either order.
             | ExprKind::AssignOp(..)
             | ExprKind::Binary(..)
             | ExprKind::Block(..)
-            | ExprKind::Box(..)
             | ExprKind::Cast(..)
             | ExprKind::Closure { .. }
             | ExprKind::ConstBlock(..)
             | ExprKind::DropTemps(..)
-            | ExprKind::Err
+            | ExprKind::Err(_)
             | ExprKind::Field(..)
             | ExprKind::Index(..)
             | ExprKind::InlineAsm(..)
+            | ExprKind::OffsetOf(..)
             | ExprKind::Let(..)
             | ExprKind::Lit(..)
             | ExprKind::Path(..)
@@ -502,6 +513,9 @@ impl<'a, 'tcx> Visitor<'tcx> for DropRangeVisitor<'a, 'tcx> {
 
         // Increment expr_count here to match what InteriorVisitor expects.
         self.expr_index = self.expr_index + 1;
+
+        // Save a node mapping to get better CFG visualization
+        self.drop_ranges.add_node_mapping(pat.hir_id, self.expr_index);
     }
 }
 
@@ -515,13 +529,14 @@ impl DropRangesBuilder {
         let mut next = <_>::from(0u32);
         for value in tracked_values {
             for_each_consumable(hir, value, |value| {
-                if !tracked_value_map.contains_key(&value) {
-                    tracked_value_map.insert(value, next);
+                if let std::collections::hash_map::Entry::Vacant(e) = tracked_value_map.entry(value)
+                {
+                    e.insert(next);
                     next = next + 1;
                 }
             });
         }
-        debug!("hir_id_map: {:?}", tracked_value_map);
+        debug!("hir_id_map: {:#?}", tracked_value_map);
         let num_values = tracked_value_map.len();
         Self {
             tracked_value_map,

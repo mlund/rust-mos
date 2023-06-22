@@ -14,7 +14,7 @@
 //! # How to read this documentation
 //!
 //! If you already know the name of what you are looking for, the fastest way to
-//! find it is to use the <a href="#" onclick="focusSearchBar();">search
+//! find it is to use the <a href="#" onclick="window.searchState.focus();">search
 //! bar</a> at the top of the page.
 //!
 //! Otherwise, you may want to jump to one of these useful sections:
@@ -188,6 +188,13 @@
 //! [array]: prim@array
 //! [slice]: prim@slice
 
+// To run std tests without x.py without ending up with two copies of std, Miri needs to be
+// able to "empty" this crate. See <https://github.com/rust-lang/miri-test-libstd/issues/4>.
+// rustc itself never sets the feature, so this line has no affect there.
+#![cfg(any(not(feature = "miri-test-libstd"), test, doctest))]
+// miri-test-libstd also prefers to make std use the sysroot versions of the dependencies.
+#![cfg_attr(feature = "miri-test-libstd", feature(rustc_private))]
+//
 #![cfg_attr(not(feature = "restricted-std"), stable(feature = "rust1", since = "1.0.0"))]
 #![cfg_attr(feature = "restricted-std", unstable(feature = "restricted_std", issue = "none"))]
 #![doc(
@@ -202,12 +209,6 @@
     no_global_oom_handling,
     not(no_global_oom_handling)
 ))]
-// To run std tests without x.py without ending up with two copies of std, Miri needs to be
-// able to "empty" this crate. See <https://github.com/rust-lang/miri-test-libstd/issues/4>.
-// rustc itself never sets the feature, so this line has no affect there.
-#![cfg(any(not(feature = "miri-test-libstd"), test, doctest))]
-// miri-test-libstd also prefers to make std use the sysroot versions of the dependencies.
-#![cfg_attr(feature = "miri-test-libstd", feature(rustc_private))]
 // Don't link to std. We are std.
 #![no_std]
 // Tell the compiler to link to either panic_abort or panic_unwind
@@ -232,13 +233,15 @@
     all(target_vendor = "fortanix", target_env = "sgx"),
     feature(slice_index_methods, coerce_unsized, sgx_platform)
 )]
+#![cfg_attr(windows, feature(round_char_boundary))]
 //
 // Language features:
+// tidy-alphabetical-start
 #![feature(alloc_error_handler)]
 #![feature(allocator_internals)]
 #![feature(allow_internal_unsafe)]
 #![feature(allow_internal_unstable)]
-#![feature(box_syntax)]
+#![feature(c_str_literals)]
 #![feature(c_unwind)]
 #![feature(cfg_target_thread_local)]
 #![feature(concat_idents)]
@@ -254,11 +257,10 @@
 #![feature(exhaustive_patterns)]
 #![feature(if_let_guard)]
 #![feature(intra_doc_pointers)]
-#![feature(is_terminal)]
 #![feature(lang_items)]
 #![feature(let_chains)]
-#![feature(linkage)]
 #![feature(link_cfg)]
+#![feature(linkage)]
 #![feature(min_specialization)]
 #![feature(must_not_suspend)]
 #![feature(needs_panic_runtime)]
@@ -272,15 +274,12 @@
 #![feature(thread_local)]
 #![feature(try_blocks)]
 #![feature(utf8_chunks)]
+// tidy-alphabetical-end
 //
 // Library features (core):
-#![feature(array_error_internals)]
-#![feature(atomic_mut_ptr)]
-#![feature(char_error_internals)]
+// tidy-alphabetical-start
 #![feature(char_internals)]
 #![feature(core_intrinsics)]
-#![feature(cstr_from_bytes_until_nul)]
-#![feature(cstr_internals)]
 #![feature(duration_constants)]
 #![feature(error_generic_member_access)]
 #![feature(error_in_core)]
@@ -292,11 +291,12 @@
 #![feature(float_next_up_down)]
 #![feature(hasher_prefixfree_extras)]
 #![feature(hashmap_internals)]
-#![feature(int_error_internals)]
-#![feature(is_some_and)]
+#![feature(int_roundings)]
+#![feature(ip)]
+#![feature(ip_in_core)]
 #![feature(maybe_uninit_slice)]
+#![feature(maybe_uninit_uninit_array)]
 #![feature(maybe_uninit_write_slice)]
-#![feature(nonnull_slice_from_raw_parts)]
 #![feature(panic_can_unwind)]
 #![feature(panic_info_message)]
 #![feature(panic_internals)]
@@ -307,30 +307,34 @@
 #![feature(provide_any)]
 #![feature(ptr_as_uninit)]
 #![feature(raw_os_nonzero)]
+#![feature(round_ties_even)]
 #![feature(slice_internals)]
 #![feature(slice_ptr_get)]
 #![feature(std_internals)]
 #![feature(str_internals)]
 #![feature(strict_provenance)]
-#![feature(maybe_uninit_uninit_array)]
-#![feature(const_maybe_uninit_uninit_array)]
-#![feature(const_waker)]
+// tidy-alphabetical-end
 //
 // Library features (alloc):
+// tidy-alphabetical-start
 #![feature(alloc_layout_extra)]
 #![feature(allocator_api)]
 #![feature(get_mut_unchecked)]
 #![feature(map_try_insert)]
 #![feature(new_uninit)]
+#![feature(slice_concat_trait)]
 #![feature(thin_box)]
 #![feature(try_reserve_kind)]
 #![feature(vec_into_raw_parts)]
-#![feature(slice_concat_trait)]
+// tidy-alphabetical-end
 //
 // Library features (unwind):
+// tidy-alphabetical-start
 #![feature(panic_unwind)]
+// tidy-alphabetical-end
 //
 // Only for re-exporting:
+// tidy-alphabetical-start
 #![feature(assert_matches)]
 #![feature(async_iterator)]
 #![feature(c_variadic)]
@@ -342,25 +346,29 @@
 #![feature(custom_test_frameworks)]
 #![feature(edition_panic)]
 #![feature(format_args_nl)]
+#![feature(get_many_mut)]
+#![feature(lazy_cell)]
 #![feature(log_syntax)]
-#![feature(once_cell)]
 #![feature(saturating_int_impl)]
 #![feature(stdsimd)]
 #![feature(test)]
 #![feature(trace_macros)]
-#![feature(get_many_mut)]
+// tidy-alphabetical-end
 //
 // Only used in tests/benchmarks:
 //
 // Only for const-ness:
+// tidy-alphabetical-start
 #![feature(const_collections_with_hasher)]
 #![feature(const_hash)]
 #![feature(const_io_structs)]
 #![feature(const_ip)]
 #![feature(const_ipv4)]
 #![feature(const_ipv6)]
-#![feature(const_socketaddr)]
+#![feature(const_maybe_uninit_uninit_array)]
+#![feature(const_waker)]
 #![feature(thread_local_internals)]
+// tidy-alphabetical-end
 //
 #![default_lib_allocator]
 
@@ -651,4 +659,31 @@ mod sealed {
     /// This allows adding more trait methods in the future.
     #[unstable(feature = "sealed", issue = "none")]
     pub trait Sealed {}
+}
+
+#[cfg(test)]
+#[allow(dead_code)] // Not used in all configurations.
+pub(crate) mod test_helpers {
+    /// Test-only replacement for `rand::thread_rng()`, which is unusable for
+    /// us, as we want to allow running stdlib tests on tier-3 targets which may
+    /// not have `getrandom` support.
+    ///
+    /// Does a bit of a song and dance to ensure that the seed is different on
+    /// each call (as some tests sadly rely on this), but doesn't try that hard.
+    ///
+    /// This is duplicated in the `core`, `alloc` test suites (as well as
+    /// `std`'s integration tests), but figuring out a mechanism to share these
+    /// seems far more painful than copy-pasting a 7 line function a couple
+    /// times, given that even under a perma-unstable feature, I don't think we
+    /// want to expose types from `rand` from `std`.
+    #[track_caller]
+    pub(crate) fn test_rng() -> rand_xorshift::XorShiftRng {
+        use core::hash::{BuildHasher, Hash, Hasher};
+        let mut hasher = crate::collections::hash_map::RandomState::new().build_hasher();
+        core::panic::Location::caller().hash(&mut hasher);
+        let hc64 = hasher.finish();
+        let seed_vec = hc64.to_le_bytes().into_iter().chain(0u8..8).collect::<Vec<u8>>();
+        let seed: [u8; 16] = seed_vec.as_slice().try_into().unwrap();
+        rand::SeedableRng::from_seed(seed)
+    }
 }

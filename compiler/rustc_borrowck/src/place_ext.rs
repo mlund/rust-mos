@@ -7,7 +7,7 @@ use rustc_middle::mir::{Body, Mutability, Place};
 use rustc_middle::ty::{self, TyCtxt};
 
 /// Extension methods for the `Place` type.
-pub(crate) trait PlaceExt<'tcx> {
+pub trait PlaceExt<'tcx> {
     /// Returns `true` if we can safely ignore borrows of this place.
     /// This is true whenever there is no action that the user can do
     /// to the place `self` that would invalidate the borrow. This is true
@@ -63,7 +63,7 @@ impl<'tcx> PlaceExt<'tcx> for Place<'tcx> {
                     ty::RawPtr(..) | ty::Ref(_, _, hir::Mutability::Not) => {
                         // For both derefs of raw pointers and `&T`
                         // references, the original path is `Copy` and
-                        // therefore not significant.  In particular,
+                        // therefore not significant. In particular,
                         // there is nothing the user can do to the
                         // original path that would invalidate the
                         // newly created reference -- and if there

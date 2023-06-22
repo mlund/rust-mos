@@ -13,12 +13,12 @@ Usage:
 
 Common options:
     --no-deps                Run Clippy only on the given crate, without linting the dependencies
-    --fix                    Automatically apply lint suggestions. This flag implies `--no-deps`
+    --fix                    Automatically apply lint suggestions. This flag implies `--no-deps` and `--all-targets`
     -h, --help               Print this message
     -V, --version            Print version info and exit
     --explain LINT           Print the documentation for a given lint
 
-Other options are the same as `cargo check`.
+For the other options see `cargo check --help`.
 
 To allow or deny a lint from the command line you can use `cargo clippy --`
 with:
@@ -28,7 +28,7 @@ with:
     -D --deny OPT       Set lint denied
     -F --forbid OPT     Set lint forbidden
 
-You can use tool lints to allow or deny lints from your code, eg.:
+You can use tool lints to allow or deny lints from your code, e.g.:
 
     #[allow(clippy::needless_lifetimes)]
 "#;

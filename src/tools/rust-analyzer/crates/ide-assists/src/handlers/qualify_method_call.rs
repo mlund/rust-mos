@@ -53,7 +53,7 @@ pub(crate) fn qualify_method_call(acc: &mut Assists, ctx: &AssistContext<'_>) ->
     let qualify_candidate = QualifyCandidate::ImplMethod(ctx.sema.db, call, resolved_call);
 
     acc.add(
-        AssistId("qualify_method_call", AssistKind::RefactorInline),
+        AssistId("qualify_method_call", AssistKind::RefactorRewrite),
         format!("Qualify `{ident}` method call"),
         range,
         |builder| {
@@ -507,7 +507,7 @@ fn main() {
     }
 
     #[test]
-    fn struct_method_over_stuct_instance() {
+    fn struct_method_over_struct_instance() {
         check_assist_not_applicable(
             qualify_method_call,
             r#"
@@ -525,7 +525,7 @@ fn main() {
     }
 
     #[test]
-    fn trait_method_over_stuct_instance() {
+    fn trait_method_over_struct_instance() {
         check_assist_not_applicable(
             qualify_method_call,
             r#"

@@ -2,7 +2,6 @@ use crate::abi::{self, Abi, Align, FieldsShape, Size};
 use crate::abi::{HasDataLayout, TyAbiInterface, TyAndLayout};
 use crate::spec::{self, HasTargetSpec};
 use rustc_span::Symbol;
-use std::fmt;
 use std::str::FromStr;
 
 mod aarch64;
@@ -29,7 +28,7 @@ mod x86_64;
 mod x86_win64;
 mod mos;
 
-#[derive(PartialEq, Eq, Hash, Debug, HashStable_Generic)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, HashStable_Generic)]
 pub enum PassMode {
     /// Ignore the argument.
     ///
@@ -66,18 +65,13 @@ mod attr_impl {
     // The subset of llvm::Attribute needed for arguments, packed into a bitfield.
     bitflags::bitflags! {
         #[derive(Default, HashStable_Generic)]
-        pub struct ArgAttribute: u16 {
+        pub struct ArgAttribute: u8 {
             const NoAlias   = 1 << 1;
             const NoCapture = 1 << 2;
             const NonNull   = 1 << 3;
             const ReadOnly  = 1 << 4;
             const InReg     = 1 << 5;
-            // Due to past miscompiles in LLVM, we use a separate attribute for
-            // &mut arguments, so that the codegen backend can decide whether
-            // or not to actually emit the attribute. It can also be controlled
-            // with the `-Zmutable-noalias` debugging option.
-            const NoAliasMutRef = 1 << 6;
-            const NoUndef = 1 << 7;
+            const NoUndef = 1 << 6;
         }
     }
 }
@@ -178,12 +172,12 @@ impl Reg {
                 17..=32 => dl.i32_align.abi,
                 33..=64 => dl.i64_align.abi,
                 65..=128 => dl.i128_align.abi,
-                _ => panic!("unsupported integer: {:?}", self),
+                _ => panic!("unsupported integer: {self:?}"),
             },
             RegKind::Float => match self.size.bits() {
                 32 => dl.f32_align.abi,
                 64 => dl.f64_align.abi,
-                _ => panic!("unsupported float: {:?}", self),
+                _ => panic!("unsupported float: {self:?}"),
             },
             RegKind::Vector => dl.vector_align(self.size).abi,
         }
@@ -217,7 +211,7 @@ impl Uniform {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, HashStable_Generic)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, HashStable_Generic)]
 pub struct CastTarget {
     pub prefix: [Option<Reg>; 8],
     pub rest: Uniform,
@@ -352,7 +346,7 @@ impl<'a, Ty> TyAndLayout<'a, Ty> {
             // The primitive for this algorithm.
             Abi::Scalar(scalar) => {
                 let kind = match scalar.primitive() {
-                    abi::Int(..) | abi::Pointer => RegKind::Integer,
+                    abi::Int(..) | abi::Pointer(_) => RegKind::Integer,
                     abi::F32 | abi::F64 => RegKind::Float,
                 };
                 Ok(HomogeneousAggregate::Homogeneous(Reg { kind, size: self.size }))
@@ -464,7 +458,7 @@ impl<'a, Ty> TyAndLayout<'a, Ty> {
 
 /// Information about how to pass an argument to,
 /// or return a value from, a function, under some ABI.
-#[derive(PartialEq, Eq, Hash, Debug, HashStable_Generic)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, HashStable_Generic)]
 pub struct ArgAbi<'a, Ty> {
     pub layout: TyAndLayout<'a, Ty>,
     pub mode: PassMode,
@@ -611,7 +605,7 @@ pub enum Conv {
 ///
 /// I will do my best to describe this structure, but these
 /// comments are reverse-engineered and may be inaccurate. -NDM
-#[derive(PartialEq, Eq, Hash, Debug, HashStable_Generic)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, HashStable_Generic)]
 pub struct FnAbi<'a, Ty> {
     /// The LLVM types of each argument.
     pub args: Box<[ArgAbi<'a, Ty>]>,
@@ -637,16 +631,6 @@ pub struct FnAbi<'a, Ty> {
 pub enum AdjustForForeignAbiError {
     /// Target architecture doesn't support "foreign" (i.e. non-Rust) ABIs.
     Unsupported { arch: Symbol, abi: spec::abi::Abi },
-}
-
-impl fmt::Display for AdjustForForeignAbiError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unsupported { arch, abi } => {
-                write!(f, "target architecture {:?} does not support `extern {}` ABI", arch, abi)
-            }
-        }
-    }
 }
 
 impl<'a, Ty> FnAbi<'a, Ty> {
@@ -762,7 +746,7 @@ impl FromStr for Conv {
             "AmdGpuKernel" => Ok(Conv::AmdGpuKernel),
             "AvrInterrupt" => Ok(Conv::AvrInterrupt),
             "AvrNonBlockingInterrupt" => Ok(Conv::AvrNonBlockingInterrupt),
-            _ => Err(format!("'{}' is not a valid value for entry function call convetion.", s)),
+            _ => Err(format!("'{s}' is not a valid value for entry function call convention.")),
         }
     }
 }

@@ -1,6 +1,6 @@
 use super::*;
 use crate::cmp::Ordering::{self, Equal, Greater, Less};
-use crate::intrinsics;
+use crate::intrinsics::{self, const_eval_select};
 use crate::mem;
 use crate::slice::{self, SliceIndex};
 
@@ -23,8 +23,6 @@ impl<T: ?Sized> *const T {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let s: &str = "Follow the rabbit";
     /// let ptr: *const u8 = s.as_ptr();
@@ -34,12 +32,23 @@ impl<T: ?Sized> *const T {
     #[rustc_const_unstable(feature = "const_ptr_is_null", issue = "74939")]
     #[inline]
     pub const fn is_null(self) -> bool {
-        // Compare via a cast to a thin pointer, so fat pointers are only
-        // considering their "data" part for null-ness.
-        match (self as *const u8).guaranteed_eq(null()) {
-            None => false,
-            Some(res) => res,
+        #[inline]
+        fn runtime_impl(ptr: *const u8) -> bool {
+            ptr.addr() == 0
         }
+
+        #[inline]
+        const fn const_impl(ptr: *const u8) -> bool {
+            // Compare via a cast to a thin pointer, so fat pointers are only
+            // considering their "data" part for null-ness.
+            match (ptr).guaranteed_eq(null_mut()) {
+                None => false,
+                Some(res) => res,
+            }
+        }
+
+        // SAFETY: The two versions are equivalent at runtime.
+        unsafe { const_eval_select((self as *const u8,), const_impl, runtime_impl) }
     }
 
     /// Casts to a pointer of another type.
@@ -52,14 +61,14 @@ impl<T: ?Sized> *const T {
 
     /// Use the pointer value in a new pointer of another type.
     ///
-    /// In case `val` is a (fat) pointer to an unsized type, this operation
+    /// In case `meta` is a (fat) pointer to an unsized type, this operation
     /// will ignore the pointer part, whereas for (thin) pointers to sized
     /// types, this has the same effect as a simple cast.
     ///
     /// The resulting pointer will have provenance of `self`, i.e., for a fat
     /// pointer, this operation is semantically the same as creating a new
     /// fat pointer with the data pointer value of `self` but the metadata of
-    /// `val`.
+    /// `meta`.
     ///
     /// # Examples
     ///
@@ -95,6 +104,7 @@ impl<T: ?Sized> *const T {
     /// refactored.
     #[stable(feature = "ptr_const_cast", since = "1.65.0")]
     #[rustc_const_stable(feature = "ptr_const_cast", since = "1.65.0")]
+    #[rustc_diagnostic_item = "ptr_cast_mut"]
     #[inline(always)]
     pub const fn cast_mut(self) -> *mut T {
         self as _
@@ -123,8 +133,8 @@ impl<T: ?Sized> *const T {
     /// ```
     #[unstable(feature = "ptr_to_from_bits", issue = "91126")]
     #[deprecated(
-        since = "1.67",
-        note = "replaced by the `exposed_addr` method, or update your code \
+        since = "1.67.0",
+        note = "replaced by the `expose_addr` method, or update your code \
             to follow the strict provenance rules using its APIs"
     )]
     #[inline(always)]
@@ -152,7 +162,7 @@ impl<T: ?Sized> *const T {
     /// ```
     #[unstable(feature = "ptr_to_from_bits", issue = "91126")]
     #[deprecated(
-        since = "1.67",
+        since = "1.67.0",
         note = "replaced by the `ptr::from_exposed_addr` function, or update \
             your code to follow the strict provenance rules using its APIs"
     )]
@@ -191,14 +201,11 @@ impl<T: ?Sized> *const T {
     #[must_use]
     #[inline(always)]
     #[unstable(feature = "strict_provenance", issue = "95228")]
-    pub fn addr(self) -> usize
-    where
-        T: Sized,
-    {
+    pub fn addr(self) -> usize {
         // FIXME(strict_provenance_magic): I am magic and should be a compiler intrinsic.
         // SAFETY: Pointer-to-integer transmutes are valid (if you are okay with losing the
         // provenance).
-        unsafe { mem::transmute(self) }
+        unsafe { mem::transmute(self.cast::<()>()) }
     }
 
     /// Gets the "address" portion of the pointer, and 'exposes' the "provenance" part for future
@@ -228,12 +235,9 @@ impl<T: ?Sized> *const T {
     #[must_use]
     #[inline(always)]
     #[unstable(feature = "strict_provenance", issue = "95228")]
-    pub fn expose_addr(self) -> usize
-    where
-        T: Sized,
-    {
+    pub fn expose_addr(self) -> usize {
         // FIXME(strict_provenance_magic): I am magic and should be a compiler intrinsic.
-        self as usize
+        self.cast::<()>() as usize
     }
 
     /// Creates a new pointer with the given address.
@@ -251,10 +255,7 @@ impl<T: ?Sized> *const T {
     #[must_use]
     #[inline]
     #[unstable(feature = "strict_provenance", issue = "95228")]
-    pub fn with_addr(self, addr: usize) -> Self
-    where
-        T: Sized,
-    {
+    pub fn with_addr(self, addr: usize) -> Self {
         // FIXME(strict_provenance_magic): I am magic and should be a compiler intrinsic.
         //
         // In the mean-time, this operation is defined to be "as if" it was
@@ -264,7 +265,7 @@ impl<T: ?Sized> *const T {
         let dest_addr = addr as isize;
         let offset = dest_addr.wrapping_sub(self_addr);
 
-        // This is the canonical desugarring of this operation
+        // This is the canonical desugaring of this operation
         self.wrapping_byte_offset(offset)
     }
 
@@ -277,10 +278,7 @@ impl<T: ?Sized> *const T {
     #[must_use]
     #[inline]
     #[unstable(feature = "strict_provenance", issue = "95228")]
-    pub fn map_addr(self, f: impl FnOnce(usize) -> usize) -> Self
-    where
-        T: Sized,
-    {
+    pub fn map_addr(self, f: impl FnOnce(usize) -> usize) -> Self {
         self.with_addr(f(self.addr()))
     }
 
@@ -323,8 +321,6 @@ impl<T: ?Sized> *const T {
     /// [the module documentation]: crate::ptr#safety
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// let ptr: *const u8 = &10u8 as *const u8;
@@ -384,8 +380,6 @@ impl<T: ?Sized> *const T {
     /// [the module documentation]: crate::ptr#safety
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// #![feature(ptr_as_uninit)]
@@ -449,8 +443,6 @@ impl<T: ?Sized> *const T {
     /// [allocated object]: crate::ptr#allocated-object
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// let s: &str = "123";
@@ -526,8 +518,6 @@ impl<T: ?Sized> *const T {
     /// [allocated object]: crate::ptr#allocated-object
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// // Iterate using a raw pointer in increments of two elements
@@ -732,7 +722,7 @@ impl<T: ?Sized> *const T {
     /// This computes the same value that [`offset_from`](#method.offset_from)
     /// would compute, but with the added precondition that the offset is
     /// guaranteed to be non-negative.  This method is equivalent to
-    /// `usize::from(self.offset_from(origin)).unwrap_unchecked()`,
+    /// `usize::try_from(self.offset_from(origin)).unwrap_unchecked()`,
     /// but it provides slightly more information to the optimizer, which can
     /// sometimes allow it to optimize slightly better with some backends.
     ///
@@ -909,8 +899,6 @@ impl<T: ?Sized> *const T {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let s: &str = "123";
     /// let ptr: *const u8 = s.as_ptr();
@@ -930,7 +918,7 @@ impl<T: ?Sized> *const T {
         T: Sized,
     {
         // SAFETY: the caller must uphold the safety contract for `offset`.
-        unsafe { self.offset(count as isize) }
+        unsafe { intrinsics::offset(self, count) }
     }
 
     /// Calculates the offset from a pointer in bytes (convenience for `.byte_offset(count as isize)`).
@@ -993,8 +981,6 @@ impl<T: ?Sized> *const T {
     /// [allocated object]: crate::ptr#allocated-object
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// let s: &str = "123";
@@ -1072,8 +1058,6 @@ impl<T: ?Sized> *const T {
     /// [allocated object]: crate::ptr#allocated-object
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// // Iterate using a raw pointer in increments of two elements
@@ -1153,8 +1137,6 @@ impl<T: ?Sized> *const T {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// // Iterate using a raw pointer in increments of two elements (backwards)
     /// let data = [1u8, 2, 3, 4, 5];
@@ -1206,7 +1188,7 @@ impl<T: ?Sized> *const T {
     ///
     /// [`ptr::read`]: crate::ptr::read()
     #[stable(feature = "pointer_methods", since = "1.26.0")]
-    #[rustc_const_unstable(feature = "const_ptr_read", issue = "80377")]
+    #[rustc_const_stable(feature = "const_ptr_read", since = "1.71.0")]
     #[inline]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
     pub const unsafe fn read(self) -> T
@@ -1247,7 +1229,7 @@ impl<T: ?Sized> *const T {
     ///
     /// [`ptr::read_unaligned`]: crate::ptr::read_unaligned()
     #[stable(feature = "pointer_methods", since = "1.26.0")]
-    #[rustc_const_unstable(feature = "const_ptr_read", issue = "80377")]
+    #[rustc_const_stable(feature = "const_ptr_read", since = "1.71.0")]
     #[inline]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
     pub const unsafe fn read_unaligned(self) -> T
@@ -1360,7 +1342,6 @@ impl<T: ?Sized> *const T {
     ///
     /// # Examples
     ///
-    /// Basic usage:
     /// ```
     /// #![feature(pointer_is_aligned)]
     /// #![feature(pointer_byte_offsets)]
@@ -1483,7 +1464,6 @@ impl<T: ?Sized> *const T {
     ///
     /// # Examples
     ///
-    /// Basic usage:
     /// ```
     /// #![feature(pointer_is_aligned)]
     /// #![feature(pointer_byte_offsets)]
@@ -1587,11 +1567,22 @@ impl<T: ?Sized> *const T {
             panic!("is_aligned_to: align is not a power-of-two");
         }
 
-        // We can't use the address of `self` in a `const fn`, so we use `align_offset` instead.
-        // The cast to `()` is used to
-        //   1. deal with fat pointers; and
-        //   2. ensure that `align_offset` doesn't actually try to compute an offset.
-        self.cast::<()>().align_offset(align) == 0
+        #[inline]
+        fn runtime_impl(ptr: *const (), align: usize) -> bool {
+            ptr.addr() & (align - 1) == 0
+        }
+
+        #[inline]
+        const fn const_impl(ptr: *const (), align: usize) -> bool {
+            // We can't use the address of `self` in a `const fn`, so we use `align_offset` instead.
+            // The cast to `()` is used to
+            //   1. deal with fat pointers; and
+            //   2. ensure that `align_offset` doesn't actually try to compute an offset.
+            ptr.align_offset(align) == 0
+        }
+
+        // SAFETY: The two versions are equivalent at runtime.
+        unsafe { const_eval_select((self.cast::<()>(), align), const_impl, runtime_impl) }
     }
 }
 
@@ -1660,11 +1651,10 @@ impl<T> *const [T] {
     /// }
     /// ```
     #[unstable(feature = "slice_ptr_get", issue = "74265")]
-    #[rustc_const_unstable(feature = "const_slice_index", issue = "none")]
     #[inline]
-    pub const unsafe fn get_unchecked<I>(self, index: I) -> *const I::Output
+    pub unsafe fn get_unchecked<I>(self, index: I) -> *const I::Output
     where
-        I: ~const SliceIndex<[T]>,
+        I: SliceIndex<[T]>,
     {
         // SAFETY: the caller ensures that `self` is dereferenceable and `index` in-bounds.
         unsafe { index.get_unchecked(self) }

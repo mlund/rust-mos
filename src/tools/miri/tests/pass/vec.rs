@@ -1,3 +1,5 @@
+//@revisions: stack tree
+//@[tree]compile-flags: -Zmiri-tree-borrows
 //@compile-flags: -Zmiri-strict-provenance
 #![feature(iter_advance_by, iter_next_chunk)]
 
@@ -162,6 +164,11 @@ fn reverse() {
     assert!(v[0].0 == 49);
 }
 
+fn miri_issue_2759() {
+    let mut input = "1".to_string();
+    input.replace_range(0..0, "0");
+}
+
 fn main() {
     assert_eq!(vec_reallocate().len(), 5);
 
@@ -191,4 +198,5 @@ fn main() {
     swap();
     swap_remove();
     reverse();
+    miri_issue_2759();
 }

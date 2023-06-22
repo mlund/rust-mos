@@ -3,7 +3,7 @@
 use std::hash::{Hash, Hasher};
 
 use crate::stable_hasher::{HashStable, StableHasher};
-use rustc_index::vec::{Idx, IndexVec};
+use rustc_index::{Idx, IndexVec};
 
 /// An indexed multi-map that preserves insertion order while permitting both *O*(log *n*) lookup of
 /// an item by key and *O*(1) lookup by index.
@@ -63,13 +63,13 @@ impl<I: Idx, K: Ord, V> SortedIndexMultiMap<I, K, V> {
     /// Returns an iterator over the items in the map in insertion order.
     #[inline]
     pub fn iter(&self) -> impl '_ + DoubleEndedIterator<Item = (&K, &V)> {
-        self.items.iter().map(|(ref k, ref v)| (k, v))
+        self.items.iter().map(|(k, v)| (k, v))
     }
 
     /// Returns an iterator over the items in the map in insertion order along with their indices.
     #[inline]
     pub fn iter_enumerated(&self) -> impl '_ + DoubleEndedIterator<Item = (I, (&K, &V))> {
-        self.items.iter_enumerated().map(|(i, (ref k, ref v))| (i, (k, v)))
+        self.items.iter_enumerated().map(|(i, (k, v))| (i, (k, v)))
     }
 
     /// Returns the item in the map with the given index.
@@ -99,6 +99,11 @@ impl<I: Idx, K: Ord, V> SortedIndexMultiMap<I, K, V> {
             let (k, v) = &self.items[i];
             (k == &key).then_some((i, v))
         })
+    }
+
+    #[inline]
+    pub fn contains_key(&self, key: K) -> bool {
+        self.get_by_key(key).next().is_some()
     }
 }
 

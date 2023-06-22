@@ -88,11 +88,7 @@ impl fmt::Display for InvalidationCause {
         match self {
             InvalidationCause::Access(kind) => write!(f, "{kind}"),
             InvalidationCause::Retag(perm, kind) =>
-                if *kind == RetagCause::FnEntry {
-                    write!(f, "{perm:?} FnEntry retag")
-                } else {
-                    write!(f, "{perm:?} retag")
-                },
+                write!(f, "{perm:?} {retag}", retag = kind.summary()),
         }
     }
 }
@@ -193,7 +189,7 @@ struct RetagOp {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RetagCause {
     Normal,
-    FnReturn,
+    FnReturnPlace,
     FnEntry,
     TwoPhase,
 }
@@ -296,7 +292,7 @@ impl<'history, 'ecx, 'mir, 'tcx> DiagnosticCx<'history, 'ecx, 'mir, 'tcx> {
             .rev()
             .find_map(|event| {
                 // First, look for a Creation event where the tag and the offset matches. This
-                // ensrues that we pick the right Creation event when a retag isn't uniform due to
+                // ensures that we pick the right Creation event when a retag isn't uniform due to
                 // Freeze.
                 let range = event.retag.range;
                 if event.retag.new_tag == tag
@@ -495,8 +491,8 @@ impl RetagCause {
     fn summary(&self) -> String {
         match self {
             RetagCause::Normal => "retag",
-            RetagCause::FnEntry => "FnEntry retag",
-            RetagCause::FnReturn => "FnReturn retag",
+            RetagCause::FnEntry => "function-entry retag",
+            RetagCause::FnReturnPlace => "return-place retag",
             RetagCause::TwoPhase => "two-phase retag",
         }
         .to_string()

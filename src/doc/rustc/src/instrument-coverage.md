@@ -31,7 +31,7 @@ Rust's source-based code coverage requires the Rust "profiler runtime". Without 
 
 The Rust `nightly` distribution channel includes the profiler runtime, by default.
 
-> **Important**: If you are building the Rust compiler from the source distribution, the profiler runtime is _not_ enabled in the default `config.toml.example`. Edit your `config.toml` file and ensure the `profiler` feature is set it to `true` (either under the `[build]` section, or under the settings for an individual `[target.<triple>]`):
+> **Important**: If you are building the Rust compiler from the source distribution, the profiler runtime is _not_ enabled in the default `config.example.toml`. Edit your `config.toml` file and ensure the `profiler` feature is set it to `true` (either under the `[build]` section, or under the settings for an individual `[target.<triple>]`):
 >
 > ```toml
 > # Build the profiler runtime (required when compiling with options that depend
@@ -117,7 +117,7 @@ $ ls formatjson5.profraw
 formatjson5.profraw
 ```
 
-If `LLVM_PROFILE_FILE` contains a path to a non-existent directory, the missing directory structure will be created. Additionally, the following special pattern strings are rewritten:
+If `LLVM_PROFILE_FILE` contains a path to a nonexistent directory, the missing directory structure will be created. Additionally, the following special pattern strings are rewritten:
 
 -   `%p` - The process ID.
 -   `%h` - The hostname of the machine running the program.
@@ -200,6 +200,8 @@ Since `cargo test` both builds and runs the tests, we set the additional `RUSTFL
 $ RUSTFLAGS="-C instrument-coverage" \
     cargo test --tests
 ```
+
+> **Note**: The default for `LLVM_PROFILE_FILE` is `default_%m_%p.profraw`. Versions prior to 1.65 had a default of `default.profraw`, so if using those earlier versions, it is recommended to explicitly set `LLVM_PROFILE_FILE="default_%m_%p.profraw"` to avoid having multiple tests overwrite the `.profraw` files.
 
 Make note of the test binary file paths, displayed after the word "`Running`" in the test output:
 

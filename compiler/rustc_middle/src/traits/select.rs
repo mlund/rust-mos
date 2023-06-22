@@ -103,7 +103,7 @@ pub type EvaluationCache<'tcx> = Cache<
 /// required for associated types to work in default impls, as the bounds
 /// are visible both as projection bounds and as where-clauses from the
 /// parameter environment.
-#[derive(PartialEq, Eq, Debug, Clone, TypeFoldable, TypeVisitable)]
+#[derive(PartialEq, Eq, Debug, Clone, TypeVisitable)]
 pub enum SelectionCandidate<'tcx> {
     /// A builtin implementation for some specific traits, used in cases
     /// where we cannot rely an ordinary library implementations.
@@ -131,7 +131,9 @@ pub enum SelectionCandidate<'tcx> {
 
     /// Implementation of a `Fn`-family trait by one of the anonymous types
     /// generated for an `||` expression.
-    ClosureCandidate,
+    ClosureCandidate {
+        is_const: bool,
+    },
 
     /// Implementation of a `Generator` trait by one of the anonymous types
     /// generated for a generator.

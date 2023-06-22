@@ -1,11 +1,11 @@
 // This file contains various trait resolution methods used by codegen.
-// They all assume regions can be erased and monomorphic types.  It
+// They all assume regions can be erased and monomorphic types. It
 // seems likely that they should eventually be merged into more
 // general routines.
 
-use rustc_infer::infer::{DefiningAnchor, TyCtxtInferExt};
-use rustc_infer::traits::FulfillmentErrorCode;
-use rustc_middle::traits::CodegenObligationError;
+use rustc_infer::infer::TyCtxtInferExt;
+use rustc_infer::traits::{FulfillmentErrorCode, TraitEngineExt as _};
+use rustc_middle::traits::{CodegenObligationError, DefiningAnchor};
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_trait_selection::traits::error_reporting::TypeErrCtxtExt;
 use rustc_trait_selection::traits::{
@@ -55,7 +55,7 @@ pub fn codegen_select_candidate<'tcx>(
     // Currently, we use a fulfillment context to completely resolve
     // all nested obligations. This is because they can inform the
     // inference of the impl's type parameters.
-    let mut fulfill_cx = <dyn TraitEngine<'tcx>>::new(tcx);
+    let mut fulfill_cx = <dyn TraitEngine<'tcx>>::new(&infcx);
     let impl_source = selection.map(|predicate| {
         fulfill_cx.register_predicate_obligation(&infcx, predicate);
     });
@@ -82,7 +82,7 @@ pub fn codegen_select_candidate<'tcx>(
     // Opaque types may have gotten their hidden types constrained, but we can ignore them safely
     // as they will get constrained elsewhere, too.
     // (ouz-a) This is required for `type-alias-impl-trait/assoc-projection-ice.rs` to pass
-    let _ = infcx.inner.borrow_mut().opaque_type_storage.take_opaque_types();
+    let _ = infcx.take_opaque_types();
 
     Ok(&*tcx.arena.alloc(impl_source))
 }

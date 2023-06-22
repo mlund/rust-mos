@@ -13,7 +13,7 @@ use crate::value::Value;
 use rustc_codegen_ssa::traits::*;
 
 use rustc_middle::ty::layout::{FnAbiOf, HasTyCtxt};
-use rustc_middle::ty::{self, Instance, TypeVisitable};
+use rustc_middle::ty::{self, Instance, TypeVisitableExt};
 
 /// Codegens a reference to a fn/method item, monomorphizing and
 /// inlining as it goes.
@@ -27,7 +27,7 @@ pub fn get_fn<'ll, 'tcx>(cx: &CodegenCx<'ll, 'tcx>, instance: Instance<'tcx>) ->
 
     debug!("get_fn(instance={:?})", instance);
 
-    assert!(!instance.substs.needs_infer());
+    assert!(!instance.substs.has_infer());
     assert!(!instance.substs.has_escaping_bound_vars());
 
     if let Some(&llfn) = cx.instances.borrow().get(&instance) {
@@ -49,8 +49,8 @@ pub fn get_fn<'ll, 'tcx>(cx: &CodegenCx<'ll, 'tcx>, instance: Instance<'tcx>) ->
         let llptrty = fn_abi.ptr_to_llvm_type(cx);
 
         // This is subtle and surprising, but sometimes we have to bitcast
-        // the resulting fn pointer.  The reason has to do with external
-        // functions.  If you have two crates that both bind the same C
+        // the resulting fn pointer. The reason has to do with external
+        // functions. If you have two crates that both bind the same C
         // library, they may not use precisely the same types: for
         // example, they will probably each declare their own structs,
         // which are distinct types from LLVM's point of view (nominal
@@ -94,11 +94,11 @@ pub fn get_fn<'ll, 'tcx>(cx: &CodegenCx<'ll, 'tcx>, instance: Instance<'tcx>) ->
             // LLVM will prefix the name with `__imp_`. Ideally, we'd like the
             // existing logic below to set the Storage Class, but it has an
             // exemption for MinGW for backwards compatability.
-            let llfn = cx.declare_fn(&common::i686_decorated_name(&dllimport, common::is_mingw_gnu_toolchain(&tcx.sess.target), true), fn_abi);
+            let llfn = cx.declare_fn(&common::i686_decorated_name(&dllimport, common::is_mingw_gnu_toolchain(&tcx.sess.target), true), fn_abi, Some(instance));
             unsafe { llvm::LLVMSetDLLStorageClass(llfn, llvm::DLLStorageClass::DllImport); }
             llfn
         } else {
-            cx.declare_fn(sym, fn_abi)
+            cx.declare_fn(sym, fn_abi, Some(instance))
         };
         debug!("get_fn: not casting pointer!");
 

@@ -9,27 +9,7 @@ use rustc_middle::mir::interpret::{InterpResult, Scalar};
 use rustc_middle::ty::layout::LayoutOf;
 
 use super::{ImmTy, InterpCx, Machine};
-
-/// Classify whether an operator is "left-homogeneous", i.e., the LHS has the
-/// same type as the result.
-#[inline]
-fn binop_left_homogeneous(op: mir::BinOp) -> bool {
-    use rustc_middle::mir::BinOp::*;
-    match op {
-        Add | Sub | Mul | Div | Rem | BitXor | BitAnd | BitOr | Offset | Shl | Shr => true,
-        Eq | Ne | Lt | Le | Gt | Ge => false,
-    }
-}
-/// Classify whether an operator is "right-homogeneous", i.e., the RHS has the
-/// same type as the LHS.
-#[inline]
-fn binop_right_homogeneous(op: mir::BinOp) -> bool {
-    use rustc_middle::mir::BinOp::*;
-    match op {
-        Add | Sub | Mul | Div | Rem | BitXor | BitAnd | BitOr | Eq | Ne | Lt | Le | Gt | Ge => true,
-        Offset | Shl | Shr => false,
-    }
-}
+use crate::util;
 
 impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     /// Returns `true` as long as there are more things to do.
@@ -111,9 +91,15 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 M::retag_place_contents(self, *kind, &dest)?;
             }
 
-            Intrinsic(box ref intrinsic) => self.emulate_nondiverging_intrinsic(intrinsic)?,
+            Intrinsic(box intrinsic) => self.emulate_nondiverging_intrinsic(intrinsic)?,
 
-            // Statements we do not track.
+            // Evaluate the place expression, without reading from it.
+            PlaceMention(box place) => {
+                let _ = self.eval_place(*place)?;
+            }
+
+            // This exists purely to guide borrowck lifetime inference, and does not have
+            // an operational effect.
             AscribeUserType(..) => {}
 
             // Currently, Miri discards Coverage statements. Coverage statements are only injected
@@ -128,6 +114,10 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             //
             // FIXME(#73156): Handle source code coverage in const eval
             Coverage(..) => {}
+
+            ConstEvalCounter => {
+                M::increment_const_eval_counter(self)?;
+            }
 
             // Defined to do nothing. These are added by optimization passes, to avoid changing the
             // size of MIR constantly.
@@ -163,15 +153,15 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 self.copy_op(&op, &dest, /*allow_transmute*/ false)?;
             }
 
-            CopyForDeref(ref place) => {
-                let op = self.eval_place_to_op(*place, Some(dest.layout))?;
+            CopyForDeref(place) => {
+                let op = self.eval_place_to_op(place, Some(dest.layout))?;
                 self.copy_op(&op, &dest, /* allow_transmute*/ false)?;
             }
 
             BinaryOp(bin_op, box (ref left, ref right)) => {
-                let layout = binop_left_homogeneous(bin_op).then_some(dest.layout);
+                let layout = util::binop_left_homogeneous(bin_op).then_some(dest.layout);
                 let left = self.read_immediate(&self.eval_operand(left, layout)?)?;
-                let layout = binop_right_homogeneous(bin_op).then_some(left.layout);
+                let layout = util::binop_right_homogeneous(bin_op).then_some(left.layout);
                 let right = self.read_immediate(&self.eval_operand(right, layout)?)?;
                 self.binop_ignore_overflow(bin_op, &left, &right, &dest)?;
             }
@@ -179,11 +169,9 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             CheckedBinaryOp(bin_op, box (ref left, ref right)) => {
                 // Due to the extra boolean in the result, we can never reuse the `dest.layout`.
                 let left = self.read_immediate(&self.eval_operand(left, None)?)?;
-                let layout = binop_right_homogeneous(bin_op).then_some(left.layout);
+                let layout = util::binop_right_homogeneous(bin_op).then_some(left.layout);
                 let right = self.read_immediate(&self.eval_operand(right, layout)?)?;
-                self.binop_with_overflow(
-                    bin_op, /*force_overflow_checks*/ false, &left, &right, &dest,
-                )?;
+                self.binop_with_overflow(bin_op, &left, &right, &dest)?;
             }
 
             UnaryOp(un_op, ref operand) => {
@@ -195,13 +183,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             }
 
             Aggregate(box ref kind, ref operands) => {
-                assert!(matches!(kind, mir::AggregateKind::Array(..)));
-
-                for (field_index, operand) in operands.iter().enumerate() {
-                    let op = self.eval_operand(operand, None)?;
-                    let field_dest = self.place_field(&dest, field_index)?;
-                    self.copy_op(&op, &field_dest, /*allow_transmute*/ false)?;
-                }
+                self.write_aggregate(kind, operands, &dest)?;
             }
 
             Repeat(ref operand, _) => {
@@ -244,7 +226,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 let src = self.eval_place(place)?;
                 let op = self.place_to_op(&src)?;
                 let len = op.len(self)?;
-                self.write_scalar(Scalar::from_machine_usize(len, self), &dest)?;
+                self.write_scalar(Scalar::from_target_usize(len, self), &dest)?;
             }
 
             Ref(_, borrow_kind, place) => {
@@ -284,22 +266,25 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 self.write_immediate(*val, &dest)?;
             }
 
-            NullaryOp(null_op, ty) => {
+            NullaryOp(ref null_op, ty) => {
                 let ty = self.subst_from_current_frame_and_normalize_erasing_regions(ty)?;
                 let layout = self.layout_of(ty)?;
-                if layout.is_unsized() {
+                if let mir::NullOp::SizeOf | mir::NullOp::AlignOf = null_op && layout.is_unsized() {
                     // FIXME: This should be a span_bug (#80742)
                     self.tcx.sess.delay_span_bug(
                         self.frame().current_span(),
-                        &format!("Nullary MIR operator called for unsized type {}", ty),
+                        format!("{null_op:?} MIR operator called for unsized type {ty}"),
                     );
                     throw_inval!(SizeOfUnsizedType(ty));
                 }
                 let val = match null_op {
                     mir::NullOp::SizeOf => layout.size.bytes(),
                     mir::NullOp::AlignOf => layout.align.abi.bytes(),
+                    mir::NullOp::OffsetOf(fields) => {
+                        layout.offset_of_subfield(self, fields.iter().map(|f| f.index())).bytes()
+                    }
                 };
-                self.write_scalar(Scalar::from_machine_usize(val, self), &dest)?;
+                self.write_scalar(Scalar::from_target_usize(val, self), &dest)?;
             }
 
             ShallowInitBox(ref operand, _) => {

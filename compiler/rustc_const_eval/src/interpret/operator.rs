@@ -3,35 +3,30 @@ use rustc_middle::mir;
 use rustc_middle::mir::interpret::{InterpResult, Scalar};
 use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
 use rustc_middle::ty::{self, FloatTy, Ty};
+use rustc_span::symbol::sym;
 use rustc_target::abi::Abi;
 
 use super::{ImmTy, Immediate, InterpCx, Machine, PlaceTy};
 
+use crate::fluent_generated as fluent;
+
 impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     /// Applies the binary operation `op` to the two operands and writes a tuple of the result
     /// and a boolean signifying the potential overflow to the destination.
-    ///
-    /// `force_overflow_checks` indicates whether overflow checks should be done even when
-    /// `tcx.sess.overflow_checks()` is `false`.
     pub fn binop_with_overflow(
         &mut self,
         op: mir::BinOp,
-        force_overflow_checks: bool,
         left: &ImmTy<'tcx, M::Provenance>,
         right: &ImmTy<'tcx, M::Provenance>,
         dest: &PlaceTy<'tcx, M::Provenance>,
     ) -> InterpResult<'tcx> {
         let (val, overflowed, ty) = self.overflowing_binary_op(op, &left, &right)?;
         debug_assert_eq!(
-            self.tcx.intern_tup(&[ty, self.tcx.types.bool]),
+            self.tcx.mk_tup(&[ty, self.tcx.types.bool]),
             dest.layout.ty,
             "type mismatch for result of {:?}",
             op,
         );
-        // As per https://github.com/rust-lang/rust/pull/98738, we always return `false` in the 2nd
-        // component when overflow checking is disabled.
-        let overflowed =
-            overflowed && (force_overflow_checks || M::checked_binop_checks_overflow(self));
         // Write the result to `dest`.
         if let Abi::ScalarPair(..) = dest.layout.abi {
             // We can use the optimized path and avoid `place_field` (which might do
@@ -147,8 +142,17 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     ) -> InterpResult<'tcx, (Scalar<M::Provenance>, bool, Ty<'tcx>)> {
         use rustc_middle::mir::BinOp::*;
 
+        let throw_ub_on_overflow = match bin_op {
+            AddUnchecked => Some(sym::unchecked_add),
+            SubUnchecked => Some(sym::unchecked_sub),
+            MulUnchecked => Some(sym::unchecked_mul),
+            ShlUnchecked => Some(sym::unchecked_shl),
+            ShrUnchecked => Some(sym::unchecked_shr),
+            _ => None,
+        };
+
         // Shift ops can have an RHS with a different numeric type.
-        if bin_op == Shl || bin_op == Shr {
+        if matches!(bin_op, Shl | ShlUnchecked | Shr | ShrUnchecked) {
             let size = u128::from(left_layout.size.bits());
             // Even if `r` is signed, we treat it as if it was unsigned (i.e., we use its
             // zero-extended form). This matches the codegen backend:
@@ -163,6 +167,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             // integers are maximally 128bits wide, so negative shifts *always* overflow and we have
             // consistent results for the same value represented at different bit widths.
             assert!(size <= 128);
+            let original_r = r;
             let overflow = r >= size;
             // The shift offset is implicitly masked to the type size, to make sure this operation
             // is always defined. This is the one MIR operator that does *not* directly map to a
@@ -174,19 +179,28 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             let result = if left_layout.abi.is_signed() {
                 let l = self.sign_extend(l, left_layout) as i128;
                 let result = match bin_op {
-                    Shl => l.checked_shl(r).unwrap(),
-                    Shr => l.checked_shr(r).unwrap(),
+                    Shl | ShlUnchecked => l.checked_shl(r).unwrap(),
+                    Shr | ShrUnchecked => l.checked_shr(r).unwrap(),
                     _ => bug!(),
                 };
                 result as u128
             } else {
                 match bin_op {
-                    Shl => l.checked_shl(r).unwrap(),
-                    Shr => l.checked_shr(r).unwrap(),
+                    Shl | ShlUnchecked => l.checked_shl(r).unwrap(),
+                    Shr | ShrUnchecked => l.checked_shr(r).unwrap(),
                     _ => bug!(),
                 }
             };
             let truncated = self.truncate(result, left_layout);
+
+            if overflow && let Some(intrinsic_name) = throw_ub_on_overflow {
+                throw_ub_custom!(
+                    fluent::const_eval_overflow_shift,
+                    val = original_r,
+                    name = intrinsic_name
+                );
+            }
+
             return Ok((Scalar::from_uint(truncated, left_layout.size), overflow, left_layout.ty));
         }
 
@@ -224,9 +238,9 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 Rem if r == 0 => throw_ub!(RemainderByZero),
                 Div => Some(i128::overflowing_div),
                 Rem => Some(i128::overflowing_rem),
-                Add => Some(i128::overflowing_add),
-                Sub => Some(i128::overflowing_sub),
-                Mul => Some(i128::overflowing_mul),
+                Add | AddUnchecked => Some(i128::overflowing_add),
+                Sub | SubUnchecked => Some(i128::overflowing_sub),
+                Mul | MulUnchecked => Some(i128::overflowing_mul),
                 _ => None,
             };
             if let Some(op) = op {
@@ -250,11 +264,11 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 // If that truncation loses any information, we have an overflow.
                 let result = result as u128;
                 let truncated = self.truncate(result, left_layout);
-                return Ok((
-                    Scalar::from_uint(truncated, size),
-                    oflo || self.sign_extend(truncated, left_layout) != result,
-                    left_layout.ty,
-                ));
+                let overflow = oflo || self.sign_extend(truncated, left_layout) != result;
+                if overflow && let Some(intrinsic_name) = throw_ub_on_overflow {
+                    throw_ub_custom!(fluent::const_eval_overflow, name = intrinsic_name);
+                }
+                return Ok((Scalar::from_uint(truncated, size), overflow, left_layout.ty));
             }
         }
 
@@ -271,12 +285,12 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             BitAnd => (Scalar::from_uint(l & r, size), left_layout.ty),
             BitXor => (Scalar::from_uint(l ^ r, size), left_layout.ty),
 
-            Add | Sub | Mul | Rem | Div => {
+            Add | AddUnchecked | Sub | SubUnchecked | Mul | MulUnchecked | Rem | Div => {
                 assert!(!left_layout.abi.is_signed());
                 let op: fn(u128, u128) -> (u128, bool) = match bin_op {
-                    Add => u128::overflowing_add,
-                    Sub => u128::overflowing_sub,
-                    Mul => u128::overflowing_mul,
+                    Add | AddUnchecked => u128::overflowing_add,
+                    Sub | SubUnchecked => u128::overflowing_sub,
+                    Mul | MulUnchecked => u128::overflowing_mul,
                     Div if r == 0 => throw_ub!(DivisionByZero),
                     Rem if r == 0 => throw_ub!(RemainderByZero),
                     Div => u128::overflowing_div,
@@ -287,11 +301,11 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 // Truncate to target type.
                 // If that truncation loses any information, we have an overflow.
                 let truncated = self.truncate(result, left_layout);
-                return Ok((
-                    Scalar::from_uint(truncated, size),
-                    oflo || truncated != result,
-                    left_layout.ty,
-                ));
+                let overflow = oflo || truncated != result;
+                if overflow && let Some(intrinsic_name) = throw_ub_on_overflow {
+                    throw_ub_custom!(fluent::const_eval_overflow, name = intrinsic_name);
+                }
+                return Ok((Scalar::from_uint(truncated, size), overflow, left_layout.ty));
             }
 
             _ => span_bug!(
@@ -305,6 +319,30 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         };
 
         Ok((val, false, ty))
+    }
+
+    fn binary_ptr_op(
+        &self,
+        bin_op: mir::BinOp,
+        left: &ImmTy<'tcx, M::Provenance>,
+        right: &ImmTy<'tcx, M::Provenance>,
+    ) -> InterpResult<'tcx, (Scalar<M::Provenance>, bool, Ty<'tcx>)> {
+        use rustc_middle::mir::BinOp::*;
+
+        match bin_op {
+            // Pointer ops that are always supported.
+            Offset => {
+                let ptr = left.to_scalar().to_pointer(self)?;
+                let offset_count = right.to_scalar().to_target_isize(self)?;
+                let pointee_ty = left.layout.ty.builtin_deref(true).unwrap().ty;
+
+                let offset_ptr = self.ptr_offset_inbounds(ptr, pointee_ty, offset_count)?;
+                Ok((Scalar::from_maybe_pointer(offset_ptr, self), false, left.layout.ty))
+            }
+
+            // Fall back to machine hook so Miri can support more pointer ops.
+            _ => M::binary_ptr_op(self, bin_op, left, right),
+        }
     }
 
     /// Returns the result of the specified operation, whether it overflowed, and
@@ -376,7 +414,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                     right.layout.ty
                 );
 
-                M::binary_ptr_op(self, bin_op, left, right)
+                self.binary_ptr_op(bin_op, left, right)
             }
             _ => span_bug!(
                 self.cur_span(),

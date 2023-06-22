@@ -2,6 +2,7 @@ use crate::pp::Breaks::Inconsistent;
 use crate::pprust::state::delimited::IterDelimited;
 use crate::pprust::state::{AnnNode, PrintState, State, INDENT_UNIT};
 
+use ast::StaticItem;
 use rustc_ast as ast;
 use rustc_ast::GenericBound;
 use rustc_ast::ModKind;
@@ -156,7 +157,7 @@ impl<'a> State<'a> {
                 self.print_use_tree(tree);
                 self.word(";");
             }
-            ast::ItemKind::Static(ty, mutbl, body) => {
+            ast::ItemKind::Static(box StaticItem { ty, mutability: mutbl, expr: body }) => {
                 let def = ast::Defaultness::Final;
                 self.print_item_const(
                     item.ident,
@@ -167,8 +168,15 @@ impl<'a> State<'a> {
                     def,
                 );
             }
-            ast::ItemKind::Const(def, ty, body) => {
-                self.print_item_const(item.ident, None, ty, body.as_deref(), &item.vis, *def);
+            ast::ItemKind::Const(box ast::ConstItem { defaultness, ty, expr }) => {
+                self.print_item_const(
+                    item.ident,
+                    None,
+                    ty,
+                    expr.as_deref(),
+                    &item.vis,
+                    *defaultness,
+                );
             }
             ast::ItemKind::Fn(box ast::Fn { defaultness, sig, generics, body }) => {
                 self.print_fn_full(
@@ -411,9 +419,9 @@ impl<'a> State<'a> {
             ast::VisibilityKind::Restricted { path, shorthand, .. } => {
                 let path = Self::to_string(|s| s.print_path(path, false, 0));
                 if *shorthand && (path == "crate" || path == "self" || path == "super") {
-                    self.word_nbsp(format!("pub({})", path))
+                    self.word_nbsp(format!("pub({path})"))
                 } else {
-                    self.word_nbsp(format!("pub(in {})", path))
+                    self.word_nbsp(format!("pub(in {path})"))
                 }
             }
             ast::VisibilityKind::Inherited => {}
@@ -507,8 +515,8 @@ impl<'a> State<'a> {
             ast::AssocItemKind::Fn(box ast::Fn { defaultness, sig, generics, body }) => {
                 self.print_fn_full(sig, ident, generics, vis, *defaultness, body.as_deref(), attrs);
             }
-            ast::AssocItemKind::Const(def, ty, body) => {
-                self.print_item_const(ident, None, ty, body.as_deref(), vis, *def);
+            ast::AssocItemKind::Const(box ast::ConstItem { defaultness, ty, expr }) => {
+                self.print_item_const(ident, None, ty, expr.as_deref(), vis, *defaultness);
             }
             ast::AssocItemKind::Type(box ast::TyAlias {
                 defaultness,
@@ -615,19 +623,8 @@ impl<'a> State<'a> {
 
     pub fn print_where_predicate(&mut self, predicate: &ast::WherePredicate) {
         match predicate {
-            ast::WherePredicate::BoundPredicate(ast::WhereBoundPredicate {
-                bound_generic_params,
-                bounded_ty,
-                bounds,
-                ..
-            }) => {
-                self.print_formal_generic_params(bound_generic_params);
-                self.print_type(bounded_ty);
-                self.word(":");
-                if !bounds.is_empty() {
-                    self.nbsp();
-                    self.print_type_bounds(bounds);
-                }
+            ast::WherePredicate::BoundPredicate(where_bound_predicate) => {
+                self.print_where_bound_predicate(where_bound_predicate);
             }
             ast::WherePredicate::RegionPredicate(ast::WhereRegionPredicate {
                 lifetime,
@@ -647,6 +644,19 @@ impl<'a> State<'a> {
                 self.word_space("=");
                 self.print_type(rhs_ty);
             }
+        }
+    }
+
+    pub fn print_where_bound_predicate(
+        &mut self,
+        where_bound_predicate: &ast::WhereBoundPredicate,
+    ) {
+        self.print_formal_generic_params(&where_bound_predicate.bound_generic_params);
+        self.print_type(&where_bound_predicate.bounded_ty);
+        self.word(":");
+        if !where_bound_predicate.bounds.is_empty() {
+            self.nbsp();
+            self.print_type_bounds(&where_bound_predicate.bounds);
         }
     }
 

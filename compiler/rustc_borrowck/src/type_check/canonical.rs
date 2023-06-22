@@ -1,13 +1,13 @@
 use std::fmt;
 
+use rustc_errors::ErrorGuaranteed;
 use rustc_infer::infer::canonical::Canonical;
-use rustc_infer::traits::query::NoSolution;
 use rustc_middle::mir::ConstraintCategory;
-use rustc_middle::ty::{self, ToPredicate, TypeFoldable};
+use rustc_middle::ty::{self, ToPredicate, Ty, TyCtxt, TypeFoldable};
 use rustc_span::def_id::DefId;
 use rustc_span::Span;
 use rustc_trait_selection::traits::query::type_op::{self, TypeOpOutput};
-use rustc_trait_selection::traits::query::Fallible;
+use rustc_trait_selection::traits::ObligationCause;
 
 use crate::diagnostics::{ToUniverseInfo, UniverseInfo};
 
@@ -30,14 +30,15 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         locations: Locations,
         category: ConstraintCategory<'tcx>,
         op: Op,
-    ) -> Fallible<R>
+    ) -> Result<R, ErrorGuaranteed>
     where
         Op: type_op::TypeOp<'tcx, Output = R>,
         Op::ErrorInfo: ToUniverseInfo<'tcx>,
     {
         let old_universe = self.infcx.universe();
 
-        let TypeOpOutput { output, constraints, error_info } = op.fully_perform(self.infcx)?;
+        let TypeOpOutput { output, constraints, error_info } =
+            op.fully_perform(self.infcx, locations.span(self.body))?;
 
         debug!(?output, ?constraints);
 
@@ -66,7 +67,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         canonical: &Canonical<'tcx, T>,
     ) -> T
     where
-        T: TypeFoldable<'tcx>,
+        T: TypeFoldable<TyCtxt<'tcx>>,
     {
         let old_universe = self.infcx.universe();
 
@@ -88,11 +89,13 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         category: ConstraintCategory<'tcx>,
     ) {
         self.prove_predicate(
-            ty::Binder::dummy(ty::PredicateKind::Clause(ty::Clause::Trait(ty::TraitPredicate {
-                trait_ref,
-                constness: ty::BoundConstness::NotConst,
-                polarity: ty::ImplPolarity::Positive,
-            }))),
+            ty::Binder::dummy(ty::PredicateKind::Clause(ty::ClauseKind::Trait(
+                ty::TraitPredicate {
+                    trait_ref,
+                    constness: ty::BoundConstness::NotConst,
+                    polarity: ty::ImplPolarity::Positive,
+                },
+            ))),
             locations,
             category,
         );
@@ -107,11 +110,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         instantiated_predicates: ty::InstantiatedPredicates<'tcx>,
         locations: Locations,
     ) {
-        for (predicate, span) in instantiated_predicates
-            .predicates
-            .into_iter()
-            .zip(instantiated_predicates.spans.into_iter())
-        {
+        for (predicate, span) in instantiated_predicates {
             debug!(?predicate);
             let category = ConstraintCategory::Predicate(span);
             let predicate = self.normalize_with_category(predicate, locations, category);
@@ -121,7 +120,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
 
     pub(super) fn prove_predicates(
         &mut self,
-        predicates: impl IntoIterator<Item = impl ToPredicate<'tcx> + std::fmt::Debug>,
+        predicates: impl IntoIterator<Item: ToPredicate<'tcx> + std::fmt::Debug>,
         locations: Locations,
         category: ConstraintCategory<'tcx>,
     ) {
@@ -139,14 +138,11 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
     ) {
         let param_env = self.param_env;
         let predicate = predicate.to_predicate(self.tcx());
-        self.fully_perform_op(
+        let _: Result<_, ErrorGuaranteed> = self.fully_perform_op(
             locations,
             category,
             param_env.and(type_op::prove_predicate::ProvePredicate::new(predicate)),
-        )
-        .unwrap_or_else(|NoSolution| {
-            span_mirbug!(self, NoSolution, "could not prove {:?}", predicate);
-        })
+        );
     }
 
     pub(super) fn normalize<T>(&mut self, value: T, location: impl NormalizeLocation) -> T
@@ -167,14 +163,63 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         T: type_op::normalize::Normalizable<'tcx> + fmt::Display + Copy + 'tcx,
     {
         let param_env = self.param_env;
-        self.fully_perform_op(
+        let result: Result<_, ErrorGuaranteed> = self.fully_perform_op(
             location.to_locations(),
             category,
             param_env.and(type_op::normalize::Normalize::new(value)),
-        )
-        .unwrap_or_else(|NoSolution| {
-            span_mirbug!(self, NoSolution, "failed to normalize `{:?}`", value);
-            value
-        })
+        );
+        result.unwrap_or(value)
+    }
+
+    #[instrument(skip(self), level = "debug")]
+    pub(super) fn ascribe_user_type(
+        &mut self,
+        mir_ty: Ty<'tcx>,
+        user_ty: ty::UserType<'tcx>,
+        span: Span,
+    ) {
+        let _: Result<_, ErrorGuaranteed> = self.fully_perform_op(
+            Locations::All(span),
+            ConstraintCategory::Boring,
+            self.param_env.and(type_op::ascribe_user_type::AscribeUserType::new(mir_ty, user_ty)),
+        );
+    }
+
+    /// *Incorrectly* skips the WF checks we normally do in `ascribe_user_type`.
+    ///
+    /// FIXME(#104478, #104477): This is a hack for backward-compatibility.
+    #[instrument(skip(self), level = "debug")]
+    pub(super) fn ascribe_user_type_skip_wf(
+        &mut self,
+        mir_ty: Ty<'tcx>,
+        user_ty: ty::UserType<'tcx>,
+        span: Span,
+    ) {
+        let ty::UserType::Ty(user_ty) = user_ty else { bug!() };
+
+        // A fast path for a common case with closure input/output types.
+        if let ty::Infer(_) = user_ty.kind() {
+            self.eq_types(user_ty, mir_ty, Locations::All(span), ConstraintCategory::Boring)
+                .unwrap();
+            return;
+        }
+
+        // FIXME: Ideally MIR types are normalized, but this is not always true.
+        let mir_ty = self.normalize(mir_ty, Locations::All(span));
+
+        let cause = ObligationCause::dummy_with_span(span);
+        let param_env = self.param_env;
+        let _: Result<_, ErrorGuaranteed> = self.fully_perform_op(
+            Locations::All(span),
+            ConstraintCategory::Boring,
+            type_op::custom::CustomTypeOp::new(
+                |ocx| {
+                    let user_ty = ocx.normalize(&cause, param_env, user_ty);
+                    ocx.eq(&cause, param_env, user_ty, mir_ty)?;
+                    Ok(())
+                },
+                "ascribe_user_type_skip_wf",
+            ),
+        );
     }
 }

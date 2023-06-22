@@ -1,11 +1,16 @@
-use crate::thir::pattern::MatchCheckCtxt;
-use rustc_errors::Handler;
+use crate::{
+    fluent_generated as fluent,
+    thir::pattern::{deconstruct_pat::DeconstructedPat, MatchCheckCtxt},
+};
 use rustc_errors::{
-    error_code, Applicability, DiagnosticBuilder, ErrorGuaranteed, IntoDiagnostic, MultiSpan,
+    error_code, AddToDiagnostic, Applicability, Diagnostic, DiagnosticBuilder, ErrorGuaranteed,
+    Handler, IntoDiagnostic, MultiSpan, SubdiagnosticMessage,
 };
 use rustc_macros::{Diagnostic, LintDiagnostic, Subdiagnostic};
+use rustc_middle::thir::Pat;
 use rustc_middle::ty::{self, Ty};
-use rustc_span::{symbol::Ident, Span};
+use rustc_span::symbol::Symbol;
+use rustc_span::Span;
 
 #[derive(LintDiagnostic)]
 #[diag(mir_build_unconditional_recursion)]
@@ -354,7 +359,7 @@ impl<'a> IntoDiagnostic<'a> for NonExhaustivePatternsTypeNotEmpty<'_, '_, '_> {
     fn into_diagnostic(self, handler: &'a Handler) -> DiagnosticBuilder<'_, ErrorGuaranteed> {
         let mut diag = handler.struct_span_err_with_code(
             self.span,
-            rustc_errors::fluent::mir_build_non_exhaustive_patterns_type_not_empty,
+            fluent::mir_build_non_exhaustive_patterns_type_not_empty,
             error_code!(E0004),
         );
 
@@ -376,25 +381,20 @@ impl<'a> IntoDiagnostic<'a> for NonExhaustivePatternsTypeNotEmpty<'_, '_, '_> {
             let mut span: MultiSpan = def_span.into();
             span.push_span_label(def_span, "");
 
-            diag.span_note(span, rustc_errors::fluent::def_note);
+            diag.span_note(span, fluent::mir_build_def_note);
         }
 
-        let is_variant_list_non_exhaustive = match self.ty.kind() {
-            ty::Adt(def, _) if def.is_variant_list_non_exhaustive() && !def.did().is_local() => {
-                true
-            }
-            _ => false,
-        };
-
+        let is_variant_list_non_exhaustive = matches!(self.ty.kind(),
+            ty::Adt(def, _) if def.is_variant_list_non_exhaustive() && !def.did().is_local());
         if is_variant_list_non_exhaustive {
-            diag.note(rustc_errors::fluent::non_exhaustive_type_note);
+            diag.note(fluent::mir_build_non_exhaustive_type_note);
         } else {
-            diag.note(rustc_errors::fluent::type_note);
+            diag.note(fluent::mir_build_type_note);
         }
 
         if let ty::Ref(_, sub_ty, _) = self.ty.kind() {
             if !sub_ty.is_inhabited_from(self.cx.tcx, self.cx.module, self.cx.param_env) {
-                diag.note(rustc_errors::fluent::reference_note);
+                diag.note(fluent::mir_build_reference_note);
             }
         }
 
@@ -420,12 +420,12 @@ impl<'a> IntoDiagnostic<'a> for NonExhaustivePatternsTypeNotEmpty<'_, '_, '_> {
         if let Some((span, sugg)) = suggestion {
             diag.span_suggestion_verbose(
                 span,
-                rustc_errors::fluent::suggestion,
+                fluent::mir_build_suggestion,
                 sugg,
                 Applicability::HasPlaceholders,
             );
         } else {
-            diag.help(rustc_errors::fluent::help);
+            diag.help(fluent::mir_build_help);
         }
 
         diag
@@ -465,7 +465,7 @@ pub struct NonConstPath {
 pub struct UnreachablePattern {
     #[label]
     pub span: Option<Span>,
-    #[label(catchall_label)]
+    #[label(mir_build_catchall_label)]
     pub catchall: Option<Span>,
 }
 
@@ -489,8 +489,18 @@ pub struct LowerRangeBoundMustBeLessThanOrEqualToUpper {
     #[primary_span]
     #[label]
     pub span: Span,
-    #[note(teach_note)]
+    #[note(mir_build_teach_note)]
     pub teach: Option<()>,
+}
+
+#[derive(Diagnostic)]
+#[diag(mir_build_literal_in_range_out_of_bounds)]
+pub struct LiteralOutOfRange<'tcx> {
+    #[primary_span]
+    #[label]
+    pub span: Span,
+    pub ty: Ty<'tcx>,
+    pub max: u128,
 }
 
 #[derive(Diagnostic)]
@@ -519,18 +529,10 @@ pub struct TrailingIrrefutableLetPatterns {
 #[derive(LintDiagnostic)]
 #[diag(mir_build_bindings_with_variant_name, code = "E0170")]
 pub struct BindingsWithVariantName {
-    #[suggestion(code = "{ty_path}::{ident}", applicability = "machine-applicable")]
+    #[suggestion(code = "{ty_path}::{name}", applicability = "machine-applicable")]
     pub suggestion: Option<Span>,
     pub ty_path: String,
-    pub ident: Ident,
-}
-
-#[derive(LintDiagnostic)]
-#[diag(mir_build_irrefutable_let_patterns_generic_let)]
-#[note]
-#[help]
-pub struct IrrefutableLetPatternsGenericLet {
-    pub count: usize,
+    pub name: Symbol,
 }
 
 #[derive(LintDiagnostic)]
@@ -569,13 +571,12 @@ pub struct IrrefutableLetPatternsWhileLet {
 #[diag(mir_build_borrow_of_moved_value)]
 pub struct BorrowOfMovedValue<'tcx> {
     #[primary_span]
-    pub span: Span,
     #[label]
-    #[label(occurs_because_label)]
+    #[label(mir_build_occurs_because_label)]
     pub binding_span: Span,
-    #[label(value_borrowed_label)]
+    #[label(mir_build_value_borrowed_label)]
     pub conflicts_ref: Vec<Span>,
-    pub name: Ident,
+    pub name: Symbol,
     pub ty: Ty<'tcx>,
     #[suggestion(code = "ref ", applicability = "machine-applicable")]
     pub suggest_borrowing: Option<Span>,
@@ -586,31 +587,305 @@ pub struct BorrowOfMovedValue<'tcx> {
 pub struct MultipleMutBorrows {
     #[primary_span]
     pub span: Span,
-    #[label]
-    pub binding_span: Span,
     #[subdiagnostic]
-    pub occurences: Vec<MultipleMutBorrowOccurence>,
-    pub name: Ident,
+    pub occurrences: Vec<Conflict>,
+}
+
+#[derive(Diagnostic)]
+#[diag(mir_build_already_borrowed)]
+pub struct AlreadyBorrowed {
+    #[primary_span]
+    pub span: Span,
+    #[subdiagnostic]
+    pub occurrences: Vec<Conflict>,
+}
+
+#[derive(Diagnostic)]
+#[diag(mir_build_already_mut_borrowed)]
+pub struct AlreadyMutBorrowed {
+    #[primary_span]
+    pub span: Span,
+    #[subdiagnostic]
+    pub occurrences: Vec<Conflict>,
+}
+
+#[derive(Diagnostic)]
+#[diag(mir_build_moved_while_borrowed)]
+pub struct MovedWhileBorrowed {
+    #[primary_span]
+    pub span: Span,
+    #[subdiagnostic]
+    pub occurrences: Vec<Conflict>,
 }
 
 #[derive(Subdiagnostic)]
-pub enum MultipleMutBorrowOccurence {
-    #[label(mutable_borrow)]
-    Mutable {
+pub enum Conflict {
+    #[label(mir_build_mutable_borrow)]
+    Mut {
         #[primary_span]
         span: Span,
-        name_mut: Ident,
+        name: Symbol,
     },
-    #[label(immutable_borrow)]
-    Immutable {
+    #[label(mir_build_borrow)]
+    Ref {
         #[primary_span]
         span: Span,
-        name_immut: Ident,
+        name: Symbol,
     },
-    #[label(moved)]
+    #[label(mir_build_moved)]
     Moved {
         #[primary_span]
         span: Span,
-        name_moved: Ident,
+        name: Symbol,
     },
+}
+
+#[derive(Diagnostic)]
+#[diag(mir_build_union_pattern)]
+pub struct UnionPattern {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(mir_build_type_not_structural)]
+#[note(mir_build_type_not_structural_tip)]
+#[note(mir_build_type_not_structural_more_info)]
+pub struct TypeNotStructural<'tcx> {
+    #[primary_span]
+    pub span: Span,
+    pub non_sm_ty: Ty<'tcx>,
+}
+
+#[derive(Diagnostic)]
+#[diag(mir_build_invalid_pattern)]
+pub struct InvalidPattern<'tcx> {
+    #[primary_span]
+    pub span: Span,
+    pub non_sm_ty: Ty<'tcx>,
+}
+
+#[derive(Diagnostic)]
+#[diag(mir_build_unsized_pattern)]
+pub struct UnsizedPattern<'tcx> {
+    #[primary_span]
+    pub span: Span,
+    pub non_sm_ty: Ty<'tcx>,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(mir_build_float_pattern)]
+pub struct FloatPattern;
+
+#[derive(LintDiagnostic)]
+#[diag(mir_build_pointer_pattern)]
+pub struct PointerPattern;
+
+#[derive(LintDiagnostic)]
+#[diag(mir_build_indirect_structural_match)]
+#[note(mir_build_type_not_structural_tip)]
+#[note(mir_build_type_not_structural_more_info)]
+pub struct IndirectStructuralMatch<'tcx> {
+    pub non_sm_ty: Ty<'tcx>,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(mir_build_nontrivial_structural_match)]
+#[note(mir_build_type_not_structural_tip)]
+#[note(mir_build_type_not_structural_more_info)]
+pub struct NontrivialStructuralMatch<'tcx> {
+    pub non_sm_ty: Ty<'tcx>,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(mir_build_overlapping_range_endpoints)]
+#[note]
+pub struct OverlappingRangeEndpoints<'tcx> {
+    #[label(mir_build_range)]
+    pub range: Span,
+    #[subdiagnostic]
+    pub overlap: Vec<Overlap<'tcx>>,
+}
+
+pub struct Overlap<'tcx> {
+    pub span: Span,
+    pub range: Pat<'tcx>,
+}
+
+impl<'tcx> AddToDiagnostic for Overlap<'tcx> {
+    fn add_to_diagnostic_with<F>(self, diag: &mut Diagnostic, _: F)
+    where
+        F: Fn(&mut Diagnostic, SubdiagnosticMessage) -> SubdiagnosticMessage,
+    {
+        let Overlap { span, range } = self;
+
+        // FIXME(mejrs) unfortunately `#[derive(LintDiagnostic)]`
+        // does not support `#[subdiagnostic(eager)]`...
+        let message = format!("this range overlaps on `{range}`...");
+        diag.span_label(span, message);
+    }
+}
+
+#[derive(LintDiagnostic)]
+#[diag(mir_build_non_exhaustive_omitted_pattern)]
+#[help]
+#[note]
+pub(crate) struct NonExhaustiveOmittedPattern<'tcx> {
+    pub scrut_ty: Ty<'tcx>,
+    #[subdiagnostic]
+    pub uncovered: Uncovered<'tcx>,
+}
+
+#[derive(Subdiagnostic)]
+#[label(mir_build_uncovered)]
+pub(crate) struct Uncovered<'tcx> {
+    #[primary_span]
+    span: Span,
+    count: usize,
+    witness_1: Pat<'tcx>,
+    witness_2: Pat<'tcx>,
+    witness_3: Pat<'tcx>,
+    remainder: usize,
+}
+
+impl<'tcx> Uncovered<'tcx> {
+    pub fn new<'p>(
+        span: Span,
+        cx: &MatchCheckCtxt<'p, 'tcx>,
+        witnesses: Vec<DeconstructedPat<'p, 'tcx>>,
+    ) -> Self {
+        let witness_1 = witnesses.get(0).unwrap().to_pat(cx);
+        Self {
+            span,
+            count: witnesses.len(),
+            // Substitute dummy values if witnesses is smaller than 3. These will never be read.
+            witness_2: witnesses.get(1).map(|w| w.to_pat(cx)).unwrap_or_else(|| witness_1.clone()),
+            witness_3: witnesses.get(2).map(|w| w.to_pat(cx)).unwrap_or_else(|| witness_1.clone()),
+            witness_1,
+            remainder: witnesses.len().saturating_sub(3),
+        }
+    }
+}
+
+#[derive(Diagnostic)]
+#[diag(mir_build_pattern_not_covered, code = "E0005")]
+pub(crate) struct PatternNotCovered<'s, 'tcx> {
+    #[primary_span]
+    pub span: Span,
+    pub origin: &'s str,
+    #[subdiagnostic]
+    pub uncovered: Uncovered<'tcx>,
+    #[subdiagnostic]
+    pub inform: Option<Inform>,
+    #[subdiagnostic]
+    pub interpreted_as_const: Option<InterpretedAsConst>,
+    #[subdiagnostic]
+    pub adt_defined_here: Option<AdtDefinedHere<'tcx>>,
+    #[note(mir_build_privately_uninhabited)]
+    pub witness_1_is_privately_uninhabited: Option<()>,
+    #[note(mir_build_pattern_ty)]
+    pub _p: (),
+    pub pattern_ty: Ty<'tcx>,
+    #[subdiagnostic]
+    pub let_suggestion: Option<SuggestLet>,
+    #[subdiagnostic]
+    pub misc_suggestion: Option<MiscPatternSuggestion>,
+}
+
+#[derive(Subdiagnostic)]
+#[note(mir_build_inform_irrefutable)]
+#[note(mir_build_more_information)]
+pub struct Inform;
+
+pub struct AdtDefinedHere<'tcx> {
+    pub adt_def_span: Span,
+    pub ty: Ty<'tcx>,
+    pub variants: Vec<Variant>,
+}
+
+pub struct Variant {
+    pub span: Span,
+}
+
+impl<'tcx> AddToDiagnostic for AdtDefinedHere<'tcx> {
+    fn add_to_diagnostic_with<F>(self, diag: &mut Diagnostic, _: F)
+    where
+        F: Fn(&mut Diagnostic, SubdiagnosticMessage) -> SubdiagnosticMessage,
+    {
+        diag.set_arg("ty", self.ty);
+        let mut spans = MultiSpan::from(self.adt_def_span);
+
+        for Variant { span } in self.variants {
+            spans.push_span_label(span, fluent::mir_build_variant_defined_here);
+        }
+
+        diag.span_note(spans, fluent::mir_build_adt_defined_here);
+    }
+}
+
+#[derive(Subdiagnostic)]
+#[suggestion(
+    mir_build_interpreted_as_const,
+    code = "{variable}_var",
+    applicability = "maybe-incorrect"
+)]
+#[label(mir_build_confused)]
+pub struct InterpretedAsConst {
+    #[primary_span]
+    pub span: Span,
+    pub variable: String,
+}
+
+#[derive(Subdiagnostic)]
+pub enum SuggestLet {
+    #[multipart_suggestion(mir_build_suggest_if_let, applicability = "has-placeholders")]
+    If {
+        #[suggestion_part(code = "if ")]
+        start_span: Span,
+        #[suggestion_part(code = " {{ todo!() }}")]
+        semi_span: Span,
+        count: usize,
+    },
+    #[suggestion(
+        mir_build_suggest_let_else,
+        code = " else {{ todo!() }}",
+        applicability = "has-placeholders"
+    )]
+    Else {
+        #[primary_span]
+        end_span: Span,
+        count: usize,
+    },
+}
+
+#[derive(Subdiagnostic)]
+pub enum MiscPatternSuggestion {
+    #[suggestion(
+        mir_build_suggest_attempted_int_lit,
+        code = "_",
+        applicability = "maybe-incorrect"
+    )]
+    AttemptedIntegerLiteral {
+        #[primary_span]
+        start_span: Span,
+    },
+}
+
+#[derive(Diagnostic)]
+#[diag(mir_build_rustc_box_attribute_error)]
+pub struct RustcBoxAttributeError {
+    #[primary_span]
+    pub span: Span,
+    #[subdiagnostic]
+    pub reason: RustcBoxAttrReason,
+}
+
+#[derive(Subdiagnostic)]
+pub enum RustcBoxAttrReason {
+    #[note(mir_build_attributes)]
+    Attributes,
+    #[note(mir_build_not_box)]
+    NotBoxNew,
+    #[note(mir_build_missing_box)]
+    MissingBox,
 }

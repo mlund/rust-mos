@@ -5,7 +5,7 @@ use rustc_hir::def_id::LocalDefId;
 use rustc_hir::definitions;
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::*;
-use rustc_index::vec::{Idx, IndexVec};
+use rustc_index::{Idx, IndexVec};
 use rustc_middle::span_bug;
 use rustc_session::Session;
 use rustc_span::source_map::SourceMap;
@@ -38,7 +38,7 @@ pub(super) fn index_hir<'hir>(
 ) -> (IndexVec<ItemLocalId, Option<ParentedNode<'hir>>>, FxHashMap<LocalDefId, ItemLocalId>) {
     let mut nodes = IndexVec::new();
     // This node's parent should never be accessed: the owner's parent is computed by the
-    // hir_owner_parent query.  Make it invalid (= ItemLocalId::MAX) to force an ICE whenever it is
+    // hir_owner_parent query. Make it invalid (= ItemLocalId::MAX) to force an ICE whenever it is
     // used.
     nodes.push(Some(ParentedNode { parent: ItemLocalId::INVALID, node: item.into() }));
     let mut collector = NodeCollector {
@@ -223,6 +223,14 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
         });
     }
 
+    fn visit_inline_const(&mut self, constant: &'hir ConstBlock) {
+        self.insert(DUMMY_SP, constant.hir_id, Node::ConstBlock(constant));
+
+        self.with_parent(constant.hir_id, |this| {
+            intravisit::walk_inline_const(this, constant);
+        });
+    }
+
     fn visit_expr(&mut self, expr: &'hir Expr<'hir>) {
         self.insert(expr.span, expr.hir_id, Node::Expr(expr));
 
@@ -273,19 +281,6 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
         self.with_parent(tr.hir_ref_id, |this| {
             intravisit::walk_trait_ref(this, tr);
         });
-    }
-
-    fn visit_fn(
-        &mut self,
-        fk: intravisit::FnKind<'hir>,
-        fd: &'hir FnDecl<'hir>,
-        b: BodyId,
-        _: Span,
-        id: HirId,
-    ) {
-        assert_eq!(self.owner, id.owner);
-        assert_eq!(self.parent_node, id.local_id);
-        intravisit::walk_fn(self, fk, fd, b, id);
     }
 
     fn visit_block(&mut self, block: &'hir Block<'hir>) {

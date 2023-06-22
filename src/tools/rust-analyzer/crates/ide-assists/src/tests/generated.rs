@@ -3,6 +3,31 @@
 use super::check_doc_test;
 
 #[test]
+fn doctest_add_braces() {
+    check_doc_test(
+        "add_braces",
+        r#####"
+fn foo(n: i32) -> i32 {
+    match n {
+        1 =>$0 n + 1,
+        _ => 0
+    }
+}
+"#####,
+        r#####"
+fn foo(n: i32) -> i32 {
+    match n {
+        1 => {
+            n + 1
+        },
+        _ => 0
+    }
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_add_explicit_type() {
     check_doc_test(
         "add_explicit_type",
@@ -414,7 +439,7 @@ fn doctest_convert_match_to_let_else() {
         r#####"
 //- minicore: option
 fn foo(opt: Option<()>) {
-    let val = $0match opt {
+    let val$0 = match opt {
         Some(it) => it,
         None => return,
     };
@@ -464,6 +489,31 @@ impl Point {
     pub fn y(&self) -> f32 {
         self.1
     }
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_convert_nested_function_to_closure() {
+    check_doc_test(
+        "convert_nested_function_to_closure",
+        r#####"
+fn main() {
+    fn fo$0o(label: &str, number: u64) {
+        println!("{}: {}", label, number);
+    }
+
+    foo("Bar", 100);
+}
+"#####,
+        r#####"
+fn main() {
+    let foo = |label: &str, number: u64| {
+        println!("{}: {}", label, number);
+    };
+
+    foo("Bar", 100);
 }
 "#####,
     )
@@ -598,6 +648,21 @@ fn main() {
 }
 
 #[test]
+fn doctest_desugar_doc_comment() {
+    check_doc_test(
+        "desugar_doc_comment",
+        r#####"
+/// Multi-line$0
+/// comment
+"#####,
+        r#####"
+#[doc = r"Multi-line
+comment"]
+"#####,
+    )
+}
+
+#[test]
 fn doctest_expand_glob_import() {
     check_doc_test(
         "expand_glob_import",
@@ -620,6 +685,37 @@ mod foo {
 use foo::{Bar, Baz};
 
 fn qux(bar: Bar, baz: Baz) {}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_extract_expressions_from_format_string() {
+    check_doc_test(
+        "extract_expressions_from_format_string",
+        r#####"
+macro_rules! format_args {
+    ($lit:literal $(tt:tt)*) => { 0 },
+}
+macro_rules! print {
+    ($($arg:tt)*) => (std::io::_print(format_args!($($arg)*)));
+}
+
+fn main() {
+    print!("{var} {x + 1}$0");
+}
+"#####,
+        r#####"
+macro_rules! format_args {
+    ($lit:literal $(tt:tt)*) => { 0 },
+}
+macro_rules! print {
+    ($($arg:tt)*) => (std::io::_print(format_args!($($arg)*)));
+}
+
+fn main() {
+    print!("{var} {}"$0, x + 1);
+}
 "#####,
     )
 }
@@ -1249,8 +1345,8 @@ fn doctest_generate_impl() {
     check_doc_test(
         "generate_impl",
         r#####"
-struct Ctx<T: Clone> {
-    data: T,$0
+struct Ctx$0<T: Clone> {
+    data: T,
 }
 "#####,
         r#####"
@@ -1342,6 +1438,27 @@ impl Person {
 }
 
 #[test]
+fn doctest_generate_trait_impl() {
+    check_doc_test(
+        "generate_trait_impl",
+        r#####"
+struct $0Ctx<T: Clone> {
+    data: T,
+}
+"#####,
+        r#####"
+struct Ctx<T: Clone> {
+    data: T,
+}
+
+impl<T: Clone> $0 for Ctx<T> {
+
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_inline_call() {
     check_doc_test(
         "inline_call",
@@ -1357,6 +1474,27 @@ fn foo(name: Option<&str>) {
             Some(val) => val,
             None => panic!("called `Option::unwrap()` on a `None` value"),
         };
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_inline_const_as_literal() {
+    check_doc_test(
+        "inline_const_as_literal",
+        r#####"
+const STRING: &str = "Hello, World!";
+
+fn something() -> &'static str {
+    STRING$0
+}
+"#####,
+        r#####"
+const STRING: &str = "Hello, World!";
+
+fn something() -> &'static str {
+    "Hello, World!"
 }
 "#####,
     )
@@ -1418,6 +1556,39 @@ fn main() {
 }
 
 #[test]
+fn doctest_inline_macro() {
+    check_doc_test(
+        "inline_macro",
+        r#####"
+macro_rules! num {
+    (+$($t:tt)+) => (1 + num!($($t )+));
+    (-$($t:tt)+) => (-1 + num!($($t )+));
+    (+) => (1);
+    (-) => (-1);
+}
+
+fn main() {
+    let number = num$0!(+ + + - + +);
+    println!("{number}");
+}
+"#####,
+        r#####"
+macro_rules! num {
+    (+$($t:tt)+) => (1 + num!($($t )+));
+    (-$($t:tt)+) => (-1 + num!($($t )+));
+    (+) => (1);
+    (-) => (-1);
+}
+
+fn main() {
+    let number = 1+num!(+ + - + +);
+    println!("{number}");
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_inline_type_alias() {
     check_doc_test(
         "inline_type_alias",
@@ -1471,7 +1642,7 @@ fn doctest_introduce_named_generic() {
 fn foo(bar: $0impl Bar) {}
 "#####,
         r#####"
-fn foo<B: Bar>(bar: B) {}
+fn foo<$0B: Bar>(bar: B) {}
 "#####,
     )
 }
@@ -1654,31 +1825,29 @@ fn apply<T, U, F>(f: F, x: T) -> U where F: FnOnce(T) -> U {
 }
 
 #[test]
-fn doctest_move_format_string_arg() {
+fn doctest_move_const_to_impl() {
     check_doc_test(
-        "move_format_string_arg",
+        "move_const_to_impl",
         r#####"
-macro_rules! format_args {
-    ($lit:literal $(tt:tt)*) => { 0 },
-}
-macro_rules! print {
-    ($($arg:tt)*) => (std::io::_print(format_args!($($arg)*)));
-}
+struct S;
+impl S {
+    fn foo() -> usize {
+        /// The answer.
+        const C$0: usize = 42;
 
-fn main() {
-    print!("{x + 1}$0");
+        C * C
+    }
 }
 "#####,
         r#####"
-macro_rules! format_args {
-    ($lit:literal $(tt:tt)*) => { 0 },
-}
-macro_rules! print {
-    ($($arg:tt)*) => (std::io::_print(format_args!($($arg)*)));
-}
+struct S;
+impl S {
+    /// The answer.
+    const C: usize = 42;
 
-fn main() {
-    print!("{}"$0, x + 1);
+    fn foo() -> usize {
+        Self::C * Self::C
+    }
 }
 "#####,
     )
@@ -1883,12 +2052,12 @@ fn doctest_remove_dbg() {
         "remove_dbg",
         r#####"
 fn main() {
-    $0dbg!(92);
+    let x = $0dbg!(42 * dbg!(4 + 2));$0
 }
 "#####,
         r#####"
 fn main() {
-    92;
+    let x = 42 * (4 + 2);
 }
 "#####,
     )
@@ -1923,6 +2092,23 @@ impl Walrus {
         r#####"
 impl Walrus {
     fn feed(&self, amount: u32) {}
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_remove_parentheses() {
+    check_doc_test(
+        "remove_parentheses",
+        r#####"
+fn main() {
+    _ = $0(2) + 2;
+}
+"#####,
+        r#####"
+fn main() {
+    _ = 2 + 2;
 }
 "#####,
     )
@@ -1976,7 +2162,7 @@ trait Foo {
 }
 
 struct Bar;
-$0impl Foo for Bar {
+$0impl Foo for Bar$0 {
     const B: u8 = 17;
     fn c() {}
     type A = String;
@@ -1994,6 +2180,57 @@ impl Foo for Bar {
     type A = String;
     const B: u8 = 17;
     fn c() {}
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_replace_arith_with_checked() {
+    check_doc_test(
+        "replace_arith_with_checked",
+        r#####"
+fn main() {
+  let x = 1 $0+ 2;
+}
+"#####,
+        r#####"
+fn main() {
+  let x = 1.checked_add(2);
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_replace_arith_with_saturating() {
+    check_doc_test(
+        "replace_arith_with_saturating",
+        r#####"
+fn main() {
+  let x = 1 $0+ 2;
+}
+"#####,
+        r#####"
+fn main() {
+  let x = 1.saturating_add(2);
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_replace_arith_with_wrapping() {
+    check_doc_test(
+        "replace_arith_with_wrapping",
+        r#####"
+fn main() {
+  let x = 1 $0+ 2;
+}
+"#####,
+        r#####"
+fn main() {
+  let x = 1.wrapping_add(2);
 }
 "#####,
     )
@@ -2123,41 +2360,14 @@ fn handle(action: Action) {
 }
 
 #[test]
-fn doctest_replace_or_else_with_or() {
+fn doctest_replace_named_generic_with_impl() {
     check_doc_test(
-        "replace_or_else_with_or",
+        "replace_named_generic_with_impl",
         r#####"
-//- minicore:option
-fn foo() {
-    let a = Some(1);
-    a.unwra$0p_or_else(|| 2);
-}
+fn new<P$0: AsRef<Path>>(location: P) -> Self {}
 "#####,
         r#####"
-fn foo() {
-    let a = Some(1);
-    a.unwrap_or(2);
-}
-"#####,
-    )
-}
-
-#[test]
-fn doctest_replace_or_with_or_else() {
-    check_doc_test(
-        "replace_or_with_or_else",
-        r#####"
-//- minicore:option
-fn foo() {
-    let a = Some(1);
-    a.unwra$0p_or(2);
-}
-"#####,
-        r#####"
-fn foo() {
-    let a = Some(1);
-    a.unwrap_or_else(|| 2);
-}
+fn new(location: impl AsRef<Path>) -> Self {}
 "#####,
     )
 }
@@ -2201,7 +2411,7 @@ fn doctest_replace_try_expr_with_match() {
     check_doc_test(
         "replace_try_expr_with_match",
         r#####"
-//- minicore:option
+//- minicore: try, option
 fn handle() {
     let pat = Some(true)$0?;
 }
@@ -2231,6 +2441,46 @@ fn main() {
 fn make<T>() -> T { ) }
 fn main() {
     let a: i32 = make();
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_replace_with_eager_method() {
+    check_doc_test(
+        "replace_with_eager_method",
+        r#####"
+//- minicore:option, fn
+fn foo() {
+    let a = Some(1);
+    a.unwra$0p_or_else(|| 2);
+}
+"#####,
+        r#####"
+fn foo() {
+    let a = Some(1);
+    a.unwrap_or(2);
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_replace_with_lazy_method() {
+    check_doc_test(
+        "replace_with_lazy_method",
+        r#####"
+//- minicore:option, fn
+fn foo() {
+    let a = Some(1);
+    a.unwra$0p_or(2);
+}
+"#####,
+        r#####"
+fn foo() {
+    let a = Some(1);
+    a.unwrap_or_else(|| 2);
 }
 "#####,
     )
@@ -2411,6 +2661,25 @@ pub async fn bar() { foo().await }
         r#####"
 pub fn foo() {}
 pub async fn bar() { foo() }
+"#####,
+    )
+}
+
+#[test]
+fn doctest_unqualify_method_call() {
+    check_doc_test(
+        "unqualify_method_call",
+        r#####"
+fn main() {
+    std::ops::Add::add$0(1, 2);
+}
+mod std { pub mod ops { pub trait Add { fn add(self, _: Self) {} } impl Add for i32 {} } }
+"#####,
+        r#####"
+fn main() {
+    1.add(2);
+}
+mod std { pub mod ops { pub trait Add { fn add(self, _: Self) {} } impl Add for i32 {} } }
 "#####,
     )
 }

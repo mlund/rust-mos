@@ -1,4 +1,4 @@
-// run-rustfix
+//@run-rustfix
 
 #![feature(type_alias_impl_trait)]
 #![warn(clippy::from_over_into)]
@@ -32,7 +32,7 @@ struct SelfKeywords;
 
 impl Into<SelfKeywords> for X {
     fn into(self) -> SelfKeywords {
-        let _ = Self::default();
+        let _ = Self;
         let _ = Self::FOO;
         let _: Self = self;
 
@@ -80,12 +80,6 @@ fn msrv_1_41() {
             FromOverInto(self)
         }
     }
-}
-
-type Opaque = impl Sized;
-struct IntoOpaque;
-impl Into<Opaque> for IntoOpaque {
-    fn into(self) -> Opaque {}
 }
 
 fn main() {}

@@ -256,7 +256,7 @@ impl str {
     /// assert_eq!("than an old", s.replace("is", "an"));
     /// ```
     ///
-    /// When the pattern doesn't match:
+    /// When the pattern doesn't match, it returns this string slice as [`String`]:
     ///
     /// ```
     /// let s = "this is old";
@@ -297,7 +297,7 @@ impl str {
     /// assert_eq!("foo foo new23 foo", s.replacen(char::is_numeric, "new", 1));
     /// ```
     ///
-    /// When the pattern doesn't match:
+    /// When the pattern doesn't match, it returns this string slice as [`String`]:
     ///
     /// ```
     /// let s = "this is old";
@@ -404,12 +404,12 @@ impl str {
             // See https://www.unicode.org/versions/Unicode7.0.0/ch03.pdf#G33992
             // for the definition of `Final_Sigma`.
             debug_assert!('Σ'.len_utf8() == 2);
-            let is_word_final = case_ignoreable_then_cased(from[..i].chars().rev())
-                && !case_ignoreable_then_cased(from[i + 2..].chars());
+            let is_word_final = case_ignorable_then_cased(from[..i].chars().rev())
+                && !case_ignorable_then_cased(from[i + 2..].chars());
             to.push_str(if is_word_final { "ς" } else { "σ" });
         }
 
-        fn case_ignoreable_then_cased<I: Iterator<Item = char>>(iter: I) -> bool {
+        fn case_ignorable_then_cased<I: Iterator<Item = char>>(iter: I) -> bool {
             use core::unicode::{Case_Ignorable, Cased};
             match iter.skip_while(|&c| Case_Ignorable(c)).next() {
                 Some(c) => Cased(c),
@@ -559,10 +559,9 @@ impl str {
     #[stable(feature = "ascii_methods_on_intrinsics", since = "1.23.0")]
     #[inline]
     pub fn to_ascii_uppercase(&self) -> String {
-        let mut bytes = self.as_bytes().to_vec();
-        bytes.make_ascii_uppercase();
-        // make_ascii_uppercase() preserves the UTF-8 invariant.
-        unsafe { String::from_utf8_unchecked(bytes) }
+        let mut s = self.to_owned();
+        s.make_ascii_uppercase();
+        s
     }
 
     /// Returns a copy of this string where each character is mapped to its
@@ -592,10 +591,9 @@ impl str {
     #[stable(feature = "ascii_methods_on_intrinsics", since = "1.23.0")]
     #[inline]
     pub fn to_ascii_lowercase(&self) -> String {
-        let mut bytes = self.as_bytes().to_vec();
-        bytes.make_ascii_lowercase();
-        // make_ascii_lowercase() preserves the UTF-8 invariant.
-        unsafe { String::from_utf8_unchecked(bytes) }
+        let mut s = self.to_owned();
+        s.make_ascii_lowercase();
+        s
     }
 }
 

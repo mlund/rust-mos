@@ -11,6 +11,7 @@ use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_data_structures::sync::Lrc;
 use rustc_macros::HashStable_Generic;
 use rustc_span::symbol::{kw, sym};
+#[cfg_attr(not(bootstrap), allow(hidden_glob_reexports))]
 use rustc_span::symbol::{Ident, Symbol};
 use rustc_span::{self, edition::Edition, Span, DUMMY_SP};
 use std::borrow::Cow;
@@ -74,6 +75,8 @@ pub enum LitKind {
     StrRaw(u8), // raw string delimited by `n` hash symbols
     ByteStr,
     ByteStrRaw(u8), // raw byte string delimited by `n` hash symbols
+    CStr,
+    CStrRaw(u8),
     Err,
 }
 
@@ -125,27 +128,31 @@ impl fmt::Display for Lit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Lit { kind, symbol, suffix } = *self;
         match kind {
-            Byte => write!(f, "b'{}'", symbol)?,
-            Char => write!(f, "'{}'", symbol)?,
-            Str => write!(f, "\"{}\"", symbol)?,
+            Byte => write!(f, "b'{symbol}'")?,
+            Char => write!(f, "'{symbol}'")?,
+            Str => write!(f, "\"{symbol}\"")?,
             StrRaw(n) => write!(
                 f,
                 "r{delim}\"{string}\"{delim}",
                 delim = "#".repeat(n as usize),
                 string = symbol
             )?,
-            ByteStr => write!(f, "b\"{}\"", symbol)?,
+            ByteStr => write!(f, "b\"{symbol}\"")?,
             ByteStrRaw(n) => write!(
                 f,
                 "br{delim}\"{string}\"{delim}",
                 delim = "#".repeat(n as usize),
                 string = symbol
             )?,
-            Integer | Float | Bool | Err => write!(f, "{}", symbol)?,
+            CStr => write!(f, "c\"{symbol}\"")?,
+            CStrRaw(n) => {
+                write!(f, "cr{delim}\"{symbol}\"{delim}", delim = "#".repeat(n as usize))?
+            }
+            Integer | Float | Bool | Err => write!(f, "{symbol}")?,
         }
 
         if let Some(suffix) = suffix {
-            write!(f, "{}", suffix)?;
+            write!(f, "{suffix}")?;
         }
 
         Ok(())
@@ -170,6 +177,7 @@ impl LitKind {
             Float => "float",
             Str | StrRaw(..) => "string",
             ByteStr | ByteStrRaw(..) => "byte string",
+            CStr | CStrRaw(..) => "C string",
             Err => "error",
         }
     }
@@ -600,7 +608,7 @@ impl Token {
     /// Returns `true` if the token is an identifier whose name is the given
     /// string slice.
     pub fn is_ident_named(&self, name: Symbol) -> bool {
-        self.ident().map_or(false, |(ident, _)| ident.name == name)
+        self.ident().is_some_and(|(ident, _)| ident.name == name)
     }
 
     /// Returns `true` if the token is an interpolated path.
@@ -756,7 +764,7 @@ impl Token {
                 _ => return None,
             },
             SingleQuote => match joint.kind {
-                Ident(name, false) => Lifetime(Symbol::intern(&format!("'{}", name))),
+                Ident(name, false) => Lifetime(Symbol::intern(&format!("'{name}"))),
                 _ => return None,
             },
 

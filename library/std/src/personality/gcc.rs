@@ -37,7 +37,8 @@
 //! and the last personality routine transfers control to the catch block.
 
 use super::dwarf::eh::{self, EHAction, EHContext};
-use libc::{c_int, uintptr_t};
+use crate::ffi::c_int;
+use libc::uintptr_t;
 use unwind as uw;
 
 // Register ids were lifted from LLVM's TargetLowering::getExceptionPointerRegister()
@@ -76,12 +77,15 @@ const UNWIND_DATA_REG: (i32, i32) = (0, 1); // R0, R1
 #[cfg(any(target_arch = "riscv64", target_arch = "riscv32"))]
 const UNWIND_DATA_REG: (i32, i32) = (10, 11); // x10, x11
 
+#[cfg(target_arch = "loongarch64")]
+const UNWIND_DATA_REG: (i32, i32) = (4, 5); // a0, a1
+
 // The following code is based on GCC's C and C++ personality routines.  For reference, see:
 // https://github.com/gcc-mirror/gcc/blob/master/libstdc++-v3/libsupc++/eh_personality.cc
 // https://github.com/gcc-mirror/gcc/blob/trunk/libgcc/unwind-c.c
 
 cfg_if::cfg_if! {
-    if #[cfg(all(target_arch = "arm", not(target_os = "ios"), not(target_os = "watchos"), not(target_os = "netbsd")))] {
+    if #[cfg(all(target_arch = "arm", not(target_os = "ios"), not(target_os = "tvos"), not(target_os = "watchos"), not(target_os = "netbsd")))] {
         // ARM EHABI personality routine.
         // https://infocenter.arm.com/help/topic/com.arm.doc.ihi0038b/IHI0038B_ehabi.pdf
         //
@@ -131,7 +135,7 @@ cfg_if::cfg_if! {
                     EHAction::None | EHAction::Cleanup(_) => {
                         return continue_unwind(exception_object, context);
                     }
-                    EHAction::Catch(_) => {
+                    EHAction::Catch(_) | EHAction::Filter(_) => {
                         // EHABI requires the personality routine to update the
                         // SP value in the barrier cache of the exception object.
                         (*exception_object).private[5] =
@@ -143,7 +147,8 @@ cfg_if::cfg_if! {
             } else {
                 match eh_action {
                     EHAction::None => return continue_unwind(exception_object, context),
-                    EHAction::Cleanup(lpad) | EHAction::Catch(lpad) => {
+                    EHAction::Filter(_) if state & uw::_US_FORCE_UNWIND as c_int != 0 => return continue_unwind(exception_object, context),
+                    EHAction::Cleanup(lpad) | EHAction::Catch(lpad) | EHAction::Filter(lpad) => {
                         uw::_Unwind_SetGR(
                             context,
                             UNWIND_DATA_REG.0,
@@ -197,13 +202,15 @@ cfg_if::cfg_if! {
             if actions as i32 & uw::_UA_SEARCH_PHASE as i32 != 0 {
                 match eh_action {
                     EHAction::None | EHAction::Cleanup(_) => uw::_URC_CONTINUE_UNWIND,
-                    EHAction::Catch(_) => uw::_URC_HANDLER_FOUND,
+                    EHAction::Catch(_) | EHAction::Filter(_) => uw::_URC_HANDLER_FOUND,
                     EHAction::Terminate => uw::_URC_FATAL_PHASE1_ERROR,
                 }
             } else {
                 match eh_action {
                     EHAction::None => uw::_URC_CONTINUE_UNWIND,
-                    EHAction::Cleanup(lpad) | EHAction::Catch(lpad) => {
+                    // Forced unwinding hits a terminate action.
+                    EHAction::Filter(_) if actions as i32 & uw::_UA_FORCE_UNWIND as i32 != 0 => uw::_URC_CONTINUE_UNWIND,
+                    EHAction::Cleanup(lpad) | EHAction::Catch(lpad) | EHAction::Filter(lpad) => {
                         uw::_Unwind_SetGR(
                             context,
                             UNWIND_DATA_REG.0,
