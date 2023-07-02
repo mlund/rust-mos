@@ -192,7 +192,12 @@ enum class LLVMRustCodeModel {
   None,
 };
 
-static Optional<CodeModel::Model> fromRust(LLVMRustCodeModel Model) {
+#if LLVM_VERSION_LT(16, 0)
+static Optional<CodeModel::Model>
+#else
+static std::optional<CodeModel::Model>
+#endif
+fromRust(LLVMRustCodeModel Model) {
   switch (Model) {
   case LLVMRustCodeModel::Tiny:
     return CodeModel::Tiny;
@@ -205,7 +210,11 @@ static Optional<CodeModel::Model> fromRust(LLVMRustCodeModel Model) {
   case LLVMRustCodeModel::Large:
     return CodeModel::Large;
   case LLVMRustCodeModel::None:
+#if LLVM_VERSION_LT(16, 0)
     return None;
+#else
+    return std::nullopt;
+#endif
   default:
     report_fatal_error("Bad CodeModel.");
   }
@@ -635,7 +644,11 @@ LLVMRustOptimize(
   bool DebugPassManager = false;
 
   PassInstrumentationCallbacks PIC;
+#if LLVM_VERSION_LT(16, 0)
   StandardInstrumentations SI(DebugPassManager);
+#else
+  StandardInstrumentations SI(TheModule->getContext(), DebugPassManager);
+#endif
   SI.registerCallbacks(PIC);
 
   if (LlvmSelfProfiler){
@@ -1482,3 +1495,4 @@ LLVMRustComputeLTOCacheKey(RustStringRef KeyOut, const char *ModId, LLVMRustThin
 
   LLVMRustStringWriteImpl(KeyOut, Key.c_str(), Key.size());
 }
+
