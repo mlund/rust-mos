@@ -1495,4 +1495,3 @@ LLVMRustComputeLTOCacheKey(RustStringRef KeyOut, const char *ModId, LLVMRustThin
 
   LLVMRustStringWriteImpl(KeyOut, Key.c_str(), Key.size());
 }
-
